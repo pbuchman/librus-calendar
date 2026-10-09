@@ -1,0 +1,122 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "proposals",
+    "decision_reason"
+  ],
+  "properties": {
+    "proposals": {
+      "type": "array",
+      "maxItems": 30,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "kind",
+          "title",
+          "description",
+          "start",
+          "end",
+          "all_day",
+          "confidence",
+          "needs_review",
+          "review_reason",
+          "source_quote",
+          "event_id",
+          "temporal_kind",
+          "due_at",
+          "activity_scope"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": [
+              "create",
+              "update",
+              "cancel",
+              "ignore"
+            ]
+          },
+          "title": {
+            "type": "string",
+            "maxLength": 250
+          },
+          "description": {
+            "type": "string",
+            "maxLength": 3000
+          },
+          "start": {
+            "type": "string",
+            "maxLength": 40
+          },
+          "end": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 40
+          },
+          "all_day": {
+            "type": "boolean"
+          },
+          "confidence": {
+            "type": "string",
+            "enum": [
+              "high",
+              "medium",
+              "low"
+            ]
+          },
+          "needs_review": {
+            "type": "boolean"
+          },
+          "review_reason": {
+            "type": "string",
+            "maxLength": 1000
+          },
+          "source_quote": {
+            "type": "string",
+            "maxLength": 4000
+          },
+          "event_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 256
+          },
+          "temporal_kind": {
+            "type": "string",
+            "enum": [
+              "event",
+              "deadline",
+              "reminder"
+            ]
+          },
+          "due_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "maxLength": 40
+          },
+          "activity_scope": {
+            "type": "string",
+            "enum": [
+              "school",
+              "extracurricular",
+              "unknown"
+            ]
+          }
+        }
+      }
+    },
+    "decision_reason": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1000,
+      "pattern": "\\S"
+    }
+  }
+}

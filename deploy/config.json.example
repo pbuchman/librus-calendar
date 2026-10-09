@@ -1,0 +1,16 @@
+{
+  "calendar_id": "calendar@example.test",
+  "calendar_owner": "owner@example.test",
+  "calendar_connector": "connector_synthetic",
+  "tailscale_owner": "owner@example.test",
+  "allowed_hosts": ["school.example.test:8445"],
+  "allow_local": false,
+  "state_path": "~/.local/share/librus-calendar/state.sqlite3",
+  "credentials_path": "~/.config/librus-calendar/credentials.json",
+  "codex_binary": "codex",
+  "analysis_model": "gpt-6.1-sol",
+  "analysis_effort": "high",
+  "tool_model": "gpt-6-luna",
+  "tool_effort": "medium",
+  "timeout": 300
+}

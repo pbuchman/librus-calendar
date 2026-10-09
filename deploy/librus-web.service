@@ -1,0 +1,18 @@
+[Unit]
+Description=Private school inbox
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/librus-calendar
+EnvironmentFile=%h/.config/librus-calendar/web.env
+ExecStart=%h/librus-calendar/.venv/bin/python -m uvicorn app.web:app_factory --factory --host 127.0.0.1 --port 8795 --no-proxy-headers --no-access-log
+Restart=on-failure
+RestartSec=10
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

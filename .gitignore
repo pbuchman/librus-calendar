@@ -1,0 +1,46 @@
+# Local dependencies and generated Python files.
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+.DS_Store
+
+# Private runtime state, credentials, exports and investigation artifacts.
+# Ignoring a file does not make it safe: the privacy check still scans tracked files.
+.env
+.env.*
+!.env.example
+*.env
+!*.env.example
+private/
+.private/
+runtime/
+state/
+backups/
+exports/
+logs/
+*.sqlite*
+*.db
+*.db-*
+*.log
+*.jsonl
+*.ndjson
+*.har
+*.ics
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+tokens.json
+cookies.json
+auth.json
+private-denylist.json

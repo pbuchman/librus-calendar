@@ -1,0 +1,10 @@
+[Unit]
+Description=Backup private school inbox
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/librus-calendar
+ExecStart=%h/librus-calendar/.venv/bin/python -m app.cli backup
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
