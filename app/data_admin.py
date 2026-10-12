@@ -1,6 +1,6 @@
 """Direct decision transfer, read-only reconstruction, and bounded private state."""
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import json
 import os
 from pathlib import Path
@@ -9,7 +9,7 @@ import sqlite3
 import stat
 
 from .core import WARSAW, as_datetime, digest, has_external_attendees, start_key, utcnow
-from .codex_runtime import event_fingerprint, RuntimeFailure
+from .codex_runtime import event_fingerprint, normalize_event, RuntimeFailure
 from .sync import execution_deadline, safe_error, sync_lock, SyncInterrupted
 
 FLAGS = ('user_approved', 'user_edited', 'user_rejected', 'deletion_approved')
@@ -284,6 +284,30 @@ def event_ownership(event):
     return markers, sources
 
 
+def calendar_boundaries_verified(snapshot, hint):
+    """Reject missing values and midnight projections with an unknown date type."""
+    normalized = normalize_event(snapshot)
+    start, end = normalized['start'], normalized['end']
+    try:
+        if start.get('date') and end.get('date'):
+            return snapshot.get('all_day') is not False and date.fromisoformat(end['date']) > date.fromisoformat(start['date'])
+        if not start.get('dateTime') or not end.get('dateTime'):
+            return False
+        if snapshot.get('all_day') is True:
+            return False
+        first, last = (datetime.fromisoformat(value.replace('Z', '+00:00'))
+                       for value in (start['dateTime'], end['dateTime']))
+        if (first.tzinfo is None) != (last.tzinfo is None):
+            return False
+        if first.tzinfo is None and first.time() == last.time() == datetime.min.time():
+            if not any(type(event.get('all_day')) is bool for event in (snapshot, hint)):
+                return False
+        # The same hard Warsaw checks also reject a naive DST gap or fold.
+        return as_datetime(end['dateTime']) > as_datetime(start['dateTime'])
+    except (ValueError, TypeError, OverflowError):
+        return False
+
+
 class RebuildController:
     """All pages and all cached retries; no Calendar write path exists here."""
     def __init__(self, store, client=None, runtime=None, *, client_factory=None, runtime_factory=None,
@@ -344,7 +368,14 @@ class RebuildController:
         # a modified description. Ownership is never inferred from a title.
         saved = {event['id']: event for event in self.store.list_events(100000, include_cancelled=True)}
         for event_id, row in saved.items():
-            candidates.setdefault(event_id, row['snapshot'])
+            # Search may flatten all-day dates to ambiguous midnight strings.
+            # The verified saved snapshot supplies only the temporal kind; the
+            # read result still supplies every actual date and time value.
+            hint = dict(row['snapshot'])
+            discovered_hint = candidates.get(event_id, {})
+            if type(discovered_hint.get('all_day')) is bool:
+                hint['all_day'] = discovered_hint['all_day']
+            candidates[event_id] = hint
         verified, problems = [], {}
         for event_id, hint in candidates.items():
             try:
@@ -356,12 +387,17 @@ class RebuildController:
                 raise
             if not isinstance(snapshot, dict) or snapshot.get('id') != event_id:
                 raise RuntimeFailure('calendar_event_id_mismatch')
+            if type(snapshot.get('all_day')) is not bool and type(hint.get('all_day')) is bool:
+                snapshot = dict(snapshot, all_day=hint['all_day'])
             markers, sources = event_ownership(snapshot)
             prior = saved.get(event_id)
             if prior and prior['marker'] in markers:
                 sources.add(prior['message_id'])
             if len(markers) != 1 or len(sources) != 1 or has_external_attendees(snapshot, self.store.config.calendar_owner):
                 problems[event_id] = 'Ambiguous application ownership or source identifiers; review required.'
+                continue
+            if not calendar_boundaries_verified(snapshot, hint):
+                problems[event_id] = 'Calendar dates or temporal kind are missing or ambiguous; prior ownership and boundaries retained.'
                 continue
             verified.append((event_id, snapshot, next(iter(markers)), next(iter(sources))))
         marker_counts = Counter(marker for _, _, marker, _ in verified)

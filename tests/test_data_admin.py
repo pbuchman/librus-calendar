@@ -34,6 +34,28 @@ class ReadRuntime(FakeRuntime):
         return found
 
 
+class ProjectionRuntime(CodexRuntime):
+    """Real read normalization around synthetic connector-shaped responses."""
+    def __init__(self, hints, events):
+        super().__init__(TEST_CONFIG, read_only=True)
+        self.hints, self.events, self.calls = hints, events, []
+
+    def probe(self):
+        return {'calendar_id': TEST_CONFIG.calendar_id, 'access_role': 'owner'}
+
+    def discover_events(self):
+        return self.hints
+
+    def analyze(self, source, events):
+        return []
+
+    def _tool(self, name, args):
+        self.calls.append(name)
+        if name != 'read_event':
+            raise AssertionError('Reconstruction must only read existing events.')
+        return {'event': self.events[args['event_id']]}
+
+
 def owned_event(mid='0', eid='calendar-original', marker='operation123'):
     return {'id': eid, 'summary': 'A manually changed Calendar title',
             'description': 'Źródło: Librus, wiadomość ' + mid + '\nlibrus-calendar:' + marker,
@@ -166,6 +188,111 @@ class DataAdminTests(unittest.TestCase):
         self.assertEqual(again['status'], 'rebuilt')
         self.assertEqual(ids, [event['id'] for event in self.store.list_events()])
         self.assertEqual(again['analyzed'], 0)
+
+    def test_saved_all_day_shape_overrides_lossy_discovery_and_survives_interrupted_retry(self):
+        from app.sync import SyncInterrupted
+        original = owned_event()
+        eid = original['id']
+        self.store.db.execute('INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?)',
+            (eid, TEST_CONFIG.calendar_id, '0', 'prior-proposal', json.dumps(original),
+             event_fingerprint(original, TEST_CONFIG.calendar_owner), 'librus-calendar:operation123', NOW.isoformat(), 'active'))
+        self.store.db.commit()
+        raw = dict(original, start='2030-11-10T00:00:00', end='2030-11-11T00:00:00')
+        hint = dict(raw, start={'dateTime':raw['start']}, end={'dateTime':raw['end']})
+        runtime = ProjectionRuntime([hint], {eid:raw})
+        runtime.analyze = lambda source, events: (_ for _ in ()).throw(SyncInterrupted('sync_interrupted'))
+        first = RebuildController(self.store, FakeClient(), runtime).run(current=NOW)
+        self.assertEqual(first['status'], 'interrupted')
+        self.assertEqual(first['calendar_ambiguities'], 0)
+        self.assertEqual(self.store.list_events()[0]['snapshot']['start'], original['start'])
+        runtime.analyze = lambda source, events: []
+        resumed = RebuildController(self.store, FakeClient(), runtime).run(current=NOW)
+        self.assertEqual(resumed['status'], 'rebuilt')
+        self.assertEqual(resumed['calendar_ambiguities'], 0)
+        self.assertEqual(self.store.list_events()[0]['fingerprint'], event_fingerprint(original, TEST_CONFIG.calendar_owner))
+        self.assertEqual(runtime.calls, ['read_event', 'read_event'])
+
+    def test_discovered_all_day_hint_converts_actual_remote_dates_without_filling_hint_values(self):
+        hint = owned_event()
+        raw = dict(hint, start='2030-11-12T00:00:00', end='2030-11-13T00:00:00')
+        runtime = ProjectionRuntime([hint], {hint['id']:raw})
+        result = RebuildController(self.store, FakeClient(count=0), runtime).run(current=NOW)
+        self.assertEqual(result['status'], 'rebuilt')
+        snapshot = self.store.list_events()[0]['snapshot']
+        self.assertEqual(snapshot['start'], {'date':'2030-11-12'})
+        self.assertEqual(snapshot['end'], {'date':'2030-11-13'})
+
+    def test_discovered_midnight_without_temporal_kind_is_blocking_review(self):
+        raw = dict(owned_event(), start='2030-11-10T00:00:00', end='2030-11-11T00:00:00')
+        runtime = ProjectionRuntime([raw], {raw['id']:raw})
+        result = RebuildController(self.store, FakeClient(count=0), runtime).run(current=NOW)
+        self.assertEqual(result['status'], 'review')
+        self.assertEqual(result['calendar_blocking_ambiguities'], 1)
+        self.assertEqual(self.store.list_events(), [])
+
+    def test_explicit_remote_timed_kind_overrides_prior_all_day_hint(self):
+        from app.data_admin import minimal_snapshot
+        original = owned_event()
+        self.store.db.execute('INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?)',
+            (original['id'], TEST_CONFIG.calendar_id, '0', 'prior-proposal', json.dumps(minimal_snapshot(original, 'librus-calendar:operation123')),
+             event_fingerprint(original, TEST_CONFIG.calendar_owner), 'librus-calendar:operation123', NOW.isoformat(), 'active'))
+        self.store.db.commit()
+        raw = dict(original, all_day=False, start='2030-11-10T00:00:00', end='2030-11-11T00:00:00')
+        runtime = ProjectionRuntime([raw], {raw['id']:raw})
+        result = RebuildController(self.store, FakeClient(count=0), runtime).run(current=NOW)
+        self.assertEqual(result['status'], 'review')
+        self.assertEqual(result['calendar_blocking_ambiguities'], 0)
+        self.assertEqual(self.store.list_events()[0]['snapshot']['start'], raw['start'])
+
+    def test_explicit_discovery_timed_kind_overrides_saved_date_hint_when_read_omits_flag(self):
+        original = owned_event()
+        self.store.db.execute('INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?)',
+            (original['id'], TEST_CONFIG.calendar_id, '0', 'prior-proposal', json.dumps(original),
+             event_fingerprint(original, TEST_CONFIG.calendar_owner), 'librus-calendar:operation123', NOW.isoformat(), 'active'))
+        self.store.db.commit()
+        raw = dict(original, start='2030-11-10T00:00:00', end='2030-11-11T00:00:00')
+        hint = dict(raw, all_day=False)
+        runtime = ProjectionRuntime([hint], {raw['id']:raw})
+        result = RebuildController(self.store, FakeClient(count=0), runtime).run(current=NOW)
+        self.assertEqual(result['status'], 'review')
+        self.assertEqual(result['calendar_blocking_ambiguities'], 0)
+        self.assertEqual(self.store.list_events()[0]['snapshot']['start'], raw['start'])
+
+    def test_explicit_all_day_flag_with_unconverted_datetime_is_blocking_review(self):
+        raw = dict(owned_event(), all_day=True, start='2030-11-10T00:00:00+01:00', end='2030-11-11T00:00:00+01:00')
+        runtime = ProjectionRuntime([raw], {raw['id']:raw})
+        result = RebuildController(self.store, FakeClient(count=0), runtime).run(current=NOW)
+        self.assertEqual(result['status'], 'review')
+        self.assertEqual(result['calendar_blocking_ambiguities'], 1)
+        self.assertEqual(self.store.list_events(), [])
+
+    def test_missing_remote_boundary_is_blocking_and_preserves_saved_operational_dates(self):
+        original = owned_event()
+        self.store.db.execute('INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?)',
+            (original['id'], TEST_CONFIG.calendar_id, '0', 'prior-proposal', json.dumps(original),
+             event_fingerprint(original, TEST_CONFIG.calendar_owner), 'librus-calendar:operation123', NOW.isoformat(), 'active'))
+        self.store.db.commit()
+        raw = dict(original, start='', end='')
+        runtime = ProjectionRuntime([raw], {raw['id']:raw})
+        result = RebuildController(self.store, FakeClient(count=0), runtime).run(current=NOW)
+        self.assertEqual(result['status'], 'review')
+        self.assertEqual(result['calendar_blocking_ambiguities'], 1)
+        self.assertEqual(self.store.list_events()[0]['snapshot'], original)
+
+    def test_new_explicit_all_day_read_is_authoritative_despite_weak_search_projection(self):
+        raw = dict(owned_event(), all_day=True, start='2030-11-10T00:00:00', end='2030-11-11T00:00:00')
+        hint = {key:value for key,value in raw.items() if key != 'all_day'}
+        runtime = ProjectionRuntime([hint], {raw['id']:raw})
+        result = RebuildController(self.store, FakeClient(count=0), runtime).run(current=NOW)
+        self.assertEqual(result['status'], 'rebuilt')
+        self.assertEqual(self.store.list_events()[0]['snapshot']['start'], {'date':'2030-11-10'})
+
+    def test_new_aware_midnight_event_keeps_timed_kind(self):
+        raw = dict(owned_event(), start='2030-11-10T00:00:00+01:00', end='2030-11-11T00:00:00+01:00')
+        runtime = ProjectionRuntime([raw], {raw['id']:raw})
+        result = RebuildController(self.store, FakeClient(count=0), runtime).run(current=NOW)
+        self.assertEqual(result['status'], 'rebuilt')
+        self.assertEqual(self.store.list_events()[0]['snapshot']['start'], raw['start'])
 
     def test_partial_inbox_fetch_resumes_and_inconsistent_pagination_cannot_claim_success(self):
         client, runtime = FakeClient(count=125, fail_ids={'111'}), ReadRuntime(propose=False)

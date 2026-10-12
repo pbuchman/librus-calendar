@@ -469,8 +469,10 @@ class CodexRuntime:
         if event.get("id") != event_id:
             raise RuntimeFailure("calendar_event_id_mismatch")
         expected = normalize_event(expected_event, owner_email=self.config.calendar_owner) if expected_event else {}
-        if expected_event and (expected_event.get('all_day') is True or
-                               (expected.get('start', {}).get('date') and expected.get('end', {}).get('date'))):
+        all_day_context = (event.get('all_day') is True or (expected_event and expected_event.get('all_day') is not False and
+                           (expected_event.get('all_day') is True or
+                            (expected.get('start', {}).get('date') and expected.get('end', {}).get('date')))))
+        if event.get('all_day') is not False and all_day_context:
             event = copy.deepcopy(event)
             for boundary in ("start", "end"):
                 value = event.get(boundary)
