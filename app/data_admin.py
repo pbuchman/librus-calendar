@@ -42,13 +42,29 @@ def minimal_snapshot(snapshot, marker):
     return {**{key: snapshot[key] for key in keys if key in snapshot}, 'description': marker, '_content_pruned': True}
 
 
+def decision_event_ids(db, proposal_id, item, calendar_id):
+    """Minimal exact ownership links, including a create's settled result."""
+    event_ids = {row['id'] for row in db.execute('SELECT id FROM events WHERE proposal_id=? AND calendar_id=?',
+                                               (proposal_id, calendar_id))}
+    if item.get('event_id'):
+        event_ids.add(str(item['event_id']))
+    for row in db.execute("SELECT payload,result FROM operations WHERE proposal_id=? AND status='applied'", (proposal_id,)):
+        operation = json.loads(row['payload'])
+        result = json.loads(row['result']) if row['result'] else {}
+        if operation.get('calendar_id') == calendar_id and result.get('event_id'):
+            event_ids.add(str(result['event_id']))
+    return event_ids
+
+
 def remember_decision(store, row, item, original=None):
     if not any(item.get(flag) is True for flag in FLAGS):
         return
     existing = store.db.execute('SELECT payload FROM decision_intents WHERE id=?', (row['id'],)).fetchone()
     previous = json.loads(existing[0]) if existing else {}
     record = {'proposal': minimal_proposal(item),
-              'signature': previous.get('signature') or intent_signature(original or item)}
+              'signature': previous.get('signature') or intent_signature(original or item),
+              'event_ids': sorted(set(previous.get('event_ids', ()))
+                                  | decision_event_ids(store.db, row['id'], item, store.calendar_id))}
     store.db.execute('INSERT INTO decision_intents VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at',
                      (row['id'], row['message_id'], row['source_hash'], json.dumps(record, ensure_ascii=False), utcnow()))
 
@@ -82,6 +98,71 @@ def protect_decision(store, message, item):
     # An uncertain match must never silently resurrect a rejected/chosen action.
     return dict(item, status='review', needs_review=True,
                 review_reason='Prior human decision for this source requires an explicit match; no automatic replay.')
+
+
+def human_event_review_reason(store, item):
+    """Require fresh approval before changing an event governed by human intent.
+
+    Callers supply normalized model output or the trusted persisted proposal.
+    A source may own several events: association, explicit target IDs and applied
+    operation evidence take precedence over the conservative date fallback.
+    """
+    if item.get('kind') not in ('update', 'cancel') or item.get('status') not in ('pending', 'review'):
+        return None
+    if (item.get('user_approved') is True and item.get('user_rejected') is not True
+            and (item['kind'] != 'cancel' or item.get('deletion_approved') is True)):
+        return None
+    target = store.db.execute('SELECT * FROM events WHERE id=? AND calendar_id=?',
+                              (item.get('event_id'), store.calendar_id)).fetchone()
+    if not target:
+        return None
+    records = {}
+    for row in store.db.execute('SELECT * FROM proposals'):
+        chosen = store._proposal(row)
+        if any(chosen.get(flag) is True for flag in FLAGS):
+            records[row['id']] = chosen
+    for row in store.db.execute('SELECT * FROM decision_intents'):
+        chosen = json.loads(row['payload'])['proposal']
+        if any(chosen.get(flag) is True for flag in FLAGS):
+            records[row['id']] = {**chosen, 'id': row['id'], 'message_id': row['message_id'],
+                                  '_decision_event_ids': json.loads(row['payload']).get('event_ids', ())}
+    reason = 'A prior human decision governs this Calendar event; explicitly approve this new change.'
+    source_events = None
+    for chosen in records.values():
+        known_ids = chosen.get('_decision_event_ids')
+        if known_ids:
+            if target['id'] in known_ids:
+                return reason
+            continue
+        if chosen.get('event_id'):
+            if chosen['event_id'] == target['id']:
+                return reason
+            continue
+        if chosen['id'] == target['proposal_id']:
+            return reason
+        if chosen.get('kind') != 'create' or chosen.get('message_id') != target['message_id']:
+            continue
+        if source_events is None:
+            source_events = list(store.db.execute('SELECT * FROM events WHERE message_id=? AND calendar_id=?',
+                                                 (target['message_id'], store.calendar_id)))
+        linked = {event['id'] for event in source_events if event['proposal_id'] == chosen['id']}
+        for operation in store.db.execute("SELECT result FROM operations WHERE proposal_id=? AND status='applied'", (chosen['id'],)):
+            result = json.loads(operation['result']) if operation['result'] else {}
+            if result.get('event_id'):
+                linked.add(str(result['event_id']))
+        if linked:
+            if target['id'] in linked:
+                return reason
+            continue
+        chosen_start = start_key(chosen)
+        matches = {event['id'] for event in source_events if chosen_start is not None
+                   and start_key(json.loads(event['snapshot'])) == chosen_start}
+        if matches:
+            if target['id'] in matches:
+                return reason
+            continue
+        return 'Prior human event ownership cannot be matched unambiguously; explicitly review this change.'
+    return None
 
 
 def migrate_decisions(store, source_path, *, allow_legacy_binding=False, verified_calendar=None):
@@ -124,8 +205,14 @@ def migrate_decisions(store, source_path, *, allow_legacy_binding=False, verifie
             item.update(id=row['id'], message_id=row['message_id'], status=row['status'])
             if any(item.get(flag) is True for flag in FLAGS):
                 previous = json.loads(decisions[row['id']]['payload']) if row['id'] in decisions else {}
-                record = {'proposal': minimal_proposal(item), 'signature': previous.get('signature') or intent_signature(item)}
+                record = {'proposal': minimal_proposal(item), 'signature': previous.get('signature') or intent_signature(item),
+                          'event_ids': previous.get('event_ids', [])}
                 decisions[row['id']] = {**dict(row), 'payload': json.dumps(record, ensure_ascii=False)}
+        for row in decisions.values():
+            record = json.loads(row['payload'])
+            record['event_ids'] = sorted(set(record.get('event_ids', ()))
+                                         | decision_event_ids(source, row['id'], record['proposal'], store.calendar_id))
+            row['payload'] = json.dumps(record, ensure_ascii=False)
         if any(row['calendar_id'] != store.calendar_id for row in events):
             raise ValueError('Foreign Calendar event ownership in decision source.')
         unresolved = list(source.execute("SELECT * FROM operations WHERE status IN ('pending','review','inflight','unknown')"))
@@ -143,9 +230,14 @@ def migrate_decisions(store, source_path, *, allow_legacy_binding=False, verifie
             store.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('librus_account_hash', account))
             for row in decisions.values():
                 current = store.db.execute('SELECT payload,source_hash FROM decision_intents WHERE id=?', (row['id'],)).fetchone()
-                if current and (current['payload'] != row['payload'] or current['source_hash'] != row['source_hash']):
-                    raise ValueError('Target contains a conflicting human decision.')
-                store.db.execute('INSERT OR IGNORE INTO decision_intents VALUES (?,?,?,?,?)',
+                if current:
+                    prior, transferred = json.loads(current['payload']), json.loads(row['payload'])
+                    if (current['source_hash'] != row['source_hash']
+                            or {k:v for k,v in prior.items() if k != 'event_ids'} != {k:v for k,v in transferred.items() if k != 'event_ids'}):
+                        raise ValueError('Target contains a conflicting human decision.')
+                    transferred['event_ids'] = sorted(set(prior.get('event_ids', ())) | set(transferred['event_ids']))
+                    row['payload'] = json.dumps(transferred, ensure_ascii=False)
+                store.db.execute('INSERT INTO decision_intents VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload',
                                  (row['id'], row['message_id'], row['source_hash'], row['payload'], row['updated_at']))
                 item = json.loads(row['payload'])['proposal']
                 item['status'] = 'applied' if item.get('status') == 'applied' else ('ignored' if item.get('user_rejected') else item.get('status', 'review'))

@@ -341,7 +341,7 @@ class SyncController:
                         except Exception:
                             self.store.record_result(operation['operation_id'], {'status': 'failed', 'error': 'Cancellation baseline could not be verified; no write attempted.'})
                             continue
-                    if not self.store.claim_operation(operation['operation_id']):
+                    if not self.store.claim_operation(operation['operation_id'], expected_operation=operation):
                         continue
                     try:
                         outcome = self.runtime.execute(operation)

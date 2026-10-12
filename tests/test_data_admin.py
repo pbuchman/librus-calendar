@@ -359,6 +359,9 @@ class DataAdminTests(unittest.TestCase):
         result = RebuildController(self.store, FakeClient(count=2), runtime).run(current=NOW)
         self.assertEqual(result['status'], 'review')
         self.assertEqual(result['calendar_blocking_ambiguities'], 0)
+        pending_change = next(item for item in self.store.list_proposals('review') if item['kind'] == 'update')
+        self.assertEqual(self.store.queue_operations(NOW), [])
+        self.store.resolve_proposal(pending_change['id'], 'approve')
         operation = self.store.queue_operations(NOW)[0]
         executor = CodexRuntime(TEST_CONFIG)
         calls = []

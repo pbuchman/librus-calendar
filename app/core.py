@@ -467,8 +467,11 @@ class AppStore:
                         break
                     proposal_id = digest([proposal_id, 'replacement', retired['updated_at']])[:32]
             item.update(id=proposal_id, message_id=str(message_id))
-            from .data_admin import protect_decision
+            from .data_admin import human_event_review_reason, protect_decision
             item = protect_decision(self, message, item)
+            reason = human_event_review_reason(self, item)
+            if reason:
+                item.update(status='review', needs_review=True, review_reason=reason)
             normalized.append(item)
         return normalized
 
@@ -648,74 +651,86 @@ class AppStore:
         return {'requested': True, 'requested_at': stamp}
 
     def _review_unwritten(self, item, reason):
-        item.update(status='review', needs_review=True, review_reason=reason)
         with self.lock, self.db:
-            self.db.execute("UPDATE proposals SET payload=?,status='review',updated_at=? WHERE id=?", (json.dumps(item, ensure_ascii=False), utcnow(), item['id']))
-            self.db.execute("UPDATE operations SET status='review',last_error=?,updated_at=? WHERE proposal_id=? AND status='pending'", (reason, utcnow(), item['id']))
+            self._review_unwritten_locked(item, reason)
+
+    def _review_unwritten_locked(self, item, reason):
+        item.update(status='review', needs_review=True, review_reason=reason)
+        self.db.execute("UPDATE proposals SET payload=?,status='review',updated_at=? WHERE id=?", (json.dumps(item, ensure_ascii=False), utcnow(), item['id']))
+        self.db.execute("UPDATE operations SET status='review',last_error=?,updated_at=? WHERE proposal_id=? AND status='pending'", (reason, utcnow(), item['id']))
 
     def queue_operations(self, current=None):
         queued = []
-        discovery_unsafe = (self._setting('rebuild_status') in ('required', 'running', 'partial', 'interrupted')
-                            or self.db.execute('SELECT 1 FROM calendar_discovery_review WHERE blocking=1 LIMIT 1').fetchone())
-        for item in self.list_proposals('pending', 500):
-            if discovery_unsafe:
-                self._review_unwritten(item, 'Calendar reconstruction is incomplete or ambiguous; no new write is permitted.')
-                continue
-            try:
-                checked = normalize_proposal(item, current)
-            except (ValueError, TypeError, OverflowError):
-                self._review_unwritten(item, 'Invalid or ambiguous event date; manual correction required.')
-                continue
-            if checked['status'] != 'pending':
-                with self.lock, self.db:
+        for listed in self.list_proposals('pending', 500):
+            from .data_admin import human_event_review_reason
+            # Serialize the full local preparation against UI decisions. Nothing
+            # in this transaction contacts Calendar or another external service.
+            with self.lock, self.db:
+                if not self.db.in_transaction:
+                    self.db.execute('BEGIN IMMEDIATE')
+                row = self.db.execute("SELECT * FROM proposals WHERE id=? AND status='pending'", (listed['id'],)).fetchone()
+                if not row:
+                    continue
+                item = self._proposal(row)
+                discovery_unsafe = (self._setting('rebuild_status') in ('required', 'running', 'partial', 'interrupted')
+                                    or self.db.execute('SELECT 1 FROM calendar_discovery_review WHERE blocking=1 LIMIT 1').fetchone())
+                if discovery_unsafe:
+                    self._review_unwritten_locked(item, 'Calendar reconstruction is incomplete or ambiguous; no new write is permitted.')
+                    continue
+                reason = human_event_review_reason(self, item)
+                if reason:
+                    self._review_unwritten_locked(item, reason)
+                    continue
+                try:
+                    checked = normalize_proposal(item, current)
+                except (ValueError, TypeError, OverflowError):
+                    self._review_unwritten_locked(item, 'Invalid or ambiguous event date; manual correction required.')
+                    continue
+                if checked['status'] != 'pending':
                     self.db.execute('UPDATE proposals SET status=?,updated_at=? WHERE id=?', (checked['status'], utcnow(), item['id']))
                     self.db.execute("UPDATE operations SET status='review',last_error=?,updated_at=? WHERE proposal_id=? AND status='pending'", (checked.get('review_reason') or 'Proposal no longer eligible for a calendar write.', utcnow(), item['id']))
-                continue
-            item = {**checked, 'id': item['id'], 'message_id': item['message_id']}
-            # In particular, an old one-hour deadline payload must never reach the
-            # calendar when the hard checks normalized it to one all-day entry.
-            with self.lock, self.db:
+                    continue
+                item = {**checked, 'id': item['id'], 'message_id': item['message_id']}
+                # An old one-hour deadline payload must never reach Calendar when
+                # the hard checks normalized it to one all-day entry.
                 self.db.execute('UPDATE proposals SET payload=?,updated_at=? WHERE id=?', (json.dumps(item, ensure_ascii=False), utcnow(), item['id']))
-            if item['kind'] not in ('create','update','cancel') or (item['kind'] == 'cancel' and not item.get('deletion_approved')):
-                continue
-            message = self.get_message(item['message_id'])
-            if item['kind'] == 'create' and not item.get('user_approved'):
-                other_proposals = self.list_proposals(limit=500)
-                duplicate = any(p['id'] != item['id'] and p.get('kind') != 'ignore' and p.get('status') in ('pending','review','applied') and start_key(p) == start_key(item) for p in other_proposals)
-                duplicate = duplicate or any(start_key(saved['snapshot']) == start_key(item) for saved in self.list_events(500, include_cancelled=True))
-                if duplicate:
-                    self._review_unwritten(item, 'Another school event starts at the same time; confirm duplicate, overlap, or update.')
+                if item['kind'] not in ('create','update','cancel') or (item['kind'] == 'cancel' and not item.get('deletion_approved')):
                     continue
-                if item['activity_scope'] == 'unknown' and requires_registration(message):
-                    self._review_unwritten(item, 'This message offers an optional activity or requires sign-up; participation must be confirmed.')
-                    continue
-            operation_id = digest(['operation', item['id']])[:32]
-            marker = PREFIX + operation_id
-            existing = self.db.execute('SELECT * FROM operations WHERE proposal_id=?', (item['id'],)).fetchone()
-            existing_payload = json.loads(existing['payload']) if existing else {}
-            if existing and (existing['attempts'] > 0 or existing['result'] is not None):
-                # An external attempt freezes its intent, including preparation time.
-                continue
-            synchronization_started_at = existing_payload.get('synchronization_started_at') or utcnow()
-            message = self.get_message(item['message_id'])
-            event = next((event for event in self.list_events(500) if event['id'] == item.get('event_id')), None)
-            if item['kind'] in ('update','cancel') and not event:
-                continue
-            body = event_body(item, message, marker, synchronization_started_at)
-            operation = {'operation_id': operation_id, 'proposal_id': item['id'], 'message_id': item['message_id'],
-                         'action': item['kind'], 'calendar_id': self.calendar_id, 'marker': marker, 'event_id': item.get('event_id'),
-                         'expected_fingerprint': event.get('fingerprint') if event else None, 'event': body, 'source_message_ids': [item['message_id']],
-                         'deletion_approved': item.get('deletion_approved') is True,
-                         'synchronization_started_at': synchronization_started_at}
-            if item['kind'] == 'cancel':
-                operation.update(prior_snapshot=event['snapshot'], prior_fingerprint=event['fingerprint'], prior_marker=event['marker'])
-            with self.lock, self.db:
+                message = self.get_message(item['message_id'])
+                if item['kind'] == 'create' and not item.get('user_approved'):
+                    other_proposals = self.list_proposals(limit=500)
+                    duplicate = any(p['id'] != item['id'] and p.get('kind') != 'ignore' and p.get('status') in ('pending','review','applied') and start_key(p) == start_key(item) for p in other_proposals)
+                    duplicate = duplicate or any(start_key(saved['snapshot']) == start_key(item) for saved in self.list_events(500, include_cancelled=True))
+                    if duplicate:
+                        self._review_unwritten_locked(item, 'Another school event starts at the same time; confirm duplicate, overlap, or update.')
+                        continue
+                    if item['activity_scope'] == 'unknown' and requires_registration(message):
+                        self._review_unwritten_locked(item, 'This message offers an optional activity or requires sign-up; participation must be confirmed.')
+                        continue
+                operation_id = digest(['operation', item['id']])[:32]
+                marker = PREFIX + operation_id
                 existing = self.db.execute('SELECT * FROM operations WHERE proposal_id=?', (item['id'],)).fetchone()
+                existing_payload = json.loads(existing['payload']) if existing else {}
+                if existing and (existing['attempts'] > 0 or existing['result'] is not None):
+                    # An external attempt freezes its intent, including preparation time.
+                    continue
+                synchronization_started_at = existing_payload.get('synchronization_started_at') or utcnow()
+                event = next((event for event in self.list_events(500) if event['id'] == item.get('event_id')), None)
+                if item['kind'] in ('update','cancel') and not event:
+                    continue
+                body = event_body(item, message, marker, synchronization_started_at)
+                operation = {'operation_id': operation_id, 'proposal_id': item['id'], 'message_id': item['message_id'],
+                             'action': item['kind'], 'calendar_id': self.calendar_id, 'marker': marker, 'event_id': item.get('event_id'),
+                             'expected_fingerprint': event.get('fingerprint') if event else None, 'event': body, 'source_message_ids': [item['message_id']],
+                             'deletion_approved': item.get('deletion_approved') is True,
+                             'synchronization_started_at': synchronization_started_at}
+                if item['kind'] == 'cancel':
+                    operation.update(prior_snapshot=event['snapshot'], prior_fingerprint=event['fingerprint'], prior_marker=event['marker'])
                 if existing and json.loads(existing['payload']) != operation:
                     if existing['status'] == 'pending' and existing['attempts'] == 0 and existing['result'] is None:
                         self.db.execute('UPDATE operations SET payload=?,updated_at=? WHERE id=?', (json.dumps(operation, ensure_ascii=False), utcnow(), existing['id']))
                     else:
-                        self._review_unwritten(item, 'Previously attempted deadline operation needs manual review before changing its calendar representation.')
+                        self._review_unwritten_locked(item, 'Previously attempted deadline operation needs manual review before changing its calendar representation.')
                         continue
                 cursor = self.db.execute('INSERT OR IGNORE INTO operations(id,proposal_id,payload,status,created_at,updated_at) VALUES (?,?,?,?,?,?)', (operation_id, item['id'], json.dumps(operation, ensure_ascii=False), 'pending', utcnow(), utcnow()))
                 if cursor.rowcount:
@@ -748,8 +763,35 @@ class AppStore:
             metadata = self.db.execute("UPDATE metadata_refresh SET status='unknown',last_error='Interrupted metadata update; read-only reconciliation required.',updated_at=? WHERE status='inflight'", (utcnow(),))
             return cursor.rowcount + metadata.rowcount
 
-    def claim_operation(self, operation_id):
+    def claim_operation(self, operation_id, expected_operation=None):
         with self.lock, self.db:
+            # A web approval uses another connection. Reserve the write lock
+            # before reading either intent so stale approval cannot authorize a
+            # different target, and legacy queued AI changes cannot bypass review.
+            if not self.db.in_transaction:
+                self.db.execute('BEGIN IMMEDIATE')
+            operation_row = self.db.execute("SELECT * FROM operations WHERE id=? AND status='pending'", (operation_id,)).fetchone()
+            if not operation_row:
+                return False
+            proposal_row = self.db.execute("SELECT * FROM proposals WHERE id=? AND status='pending'", (operation_row['proposal_id'],)).fetchone()
+            if not proposal_row:
+                return False
+            item = self._proposal(proposal_row)
+            operation = json.loads(operation_row['payload'])
+            if expected_operation is not None and operation != expected_operation:
+                # A newer explicit edit keeps its pending intent. The caller's
+                # stale cached body cannot be executed under the reused ID.
+                return False
+            if (operation.get('operation_id') != operation_id or operation.get('proposal_id') != item['id']
+                    or operation.get('calendar_id') != self.calendar_id or operation.get('action') != item.get('kind')
+                    or operation.get('event_id') != item.get('event_id')):
+                self._review_unwritten_locked(item, 'Queued operation no longer matches the current action and target; review required.')
+                return False
+            from .data_admin import human_event_review_reason
+            reason = human_event_review_reason(self, item)
+            if reason:
+                self._review_unwritten_locked(item, reason)
+                return False
             if self._setting('writes_paused', 'true') == 'true':
                 return False
             cursor = self.db.execute("""UPDATE operations SET status='inflight',attempts=attempts+1,updated_at=?
