@@ -19,6 +19,15 @@ from test_support import TEST_CONFIG
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_backup_policy_defaults_off_and_requires_explicit_boolean(self):
+        self.assertFalse(AppConfig().backup_enabled)
+        self.assertTrue(load_config(environ={'LIBRUS_CONFIG_FILE': '', 'LIBRUS_BACKUP_ENABLED': '1'}).backup_enabled)
+        for value in ('true', 'yes', '2'):
+            with self.assertRaises(ConfigurationError):
+                load_config(environ={'LIBRUS_CONFIG_FILE': '', 'LIBRUS_BACKUP_ENABLED': value})
+        with self.assertRaises(ConfigurationError):
+            AppConfig(backup_enabled='false')
+
     def test_unconfigured_runtime_refuses_tools_before_process(self):
         process = Mock(side_effect=AssertionError('No process may run'))
         runtime = CodexRuntime(AppConfig(), run_process=process)

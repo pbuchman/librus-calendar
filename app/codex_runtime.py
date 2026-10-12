@@ -138,7 +138,10 @@ def _result(status, *, event=None, error=None, owner_email=""):
 
 
 class CodexRuntime:
-    def __init__(self, config=None, *, run_process=None):
+    READ_TOOLS = frozenset({'list_calendars', 'search_events', 'list_events', 'read_event', 'fetch'})
+
+    def __init__(self, config=None, *, run_process=None, read_only=False):
+        self.read_only = bool(read_only)
         if isinstance(config, dict):
             values = dict(config)
             configured_runner = values.pop('run_process', None)
@@ -160,6 +163,8 @@ class CodexRuntime:
         self.last_analysis_metadata = None
 
     def _args(self, directory, schema, tools):
+        if self.read_only and set(tools) - self.READ_TOOLS:
+            raise RuntimeFailure('calendar_read_only')
         try:
             self.config.require_calendar() if tools else self.config.require_analysis()
         except ConfigurationError as error:
@@ -187,8 +192,9 @@ class CodexRuntime:
         if tools:
             overrides[f"apps.{self.config.calendar_connector}.enabled"] = True
             overrides[f"apps.{self.config.calendar_connector}.default_tools_enabled"] = False
-            overrides[f"apps.{self.config.calendar_connector}.destructive_enabled"] = True
-            overrides[f"apps.{self.config.calendar_connector}.open_world_enabled"] = True
+            writing = bool(set(tools) & {'create_event', 'update_event', 'delete_event'})
+            overrides[f"apps.{self.config.calendar_connector}.destructive_enabled"] = writing
+            overrides[f"apps.{self.config.calendar_connector}.open_world_enabled"] = writing
             overrides[f"apps.{self.config.calendar_connector}.default_tools_approval_mode"] = "approve"
             for tool in tools:
                 overrides[f"apps.{self.config.calendar_connector}.tools.{tool}.enabled"] = True
@@ -386,6 +392,8 @@ class CodexRuntime:
             raise RuntimeFailure(str(error)) from None
 
     def _tool(self, name, arguments):
+        if self.read_only and name not in self.READ_TOOLS:
+            raise RuntimeFailure('calendar_read_only')
         self._require_calendar()
         prompt = (
             "Call exactly one Google Calendar tool with the exact arguments specified in JSON below. "
@@ -402,7 +410,8 @@ class CodexRuntime:
         data = self._tool("list_calendars", {"max_results": 100})
         calendars = data.get("calendars", [])
         target = next((x for x in calendars if x.get("id") == self.config.calendar_id), None)
-        if not target or target.get("access_role", target.get("accessRole")) not in {"owner", "writer"}:
+        roles = {'owner', 'writer', 'reader'} if self.read_only else {'owner', 'writer'}
+        if not target or target.get("access_role", target.get("accessRole")) not in roles:
             raise RuntimeFailure("calendar_write_access_missing")
         return {"calendar_id": self.config.calendar_id, "access_role": target.get("access_role", target.get("accessRole")),
                 "model": self.config.tool_model, "effort": self.config.tool_effort, "evidence": self.last_evidence}
@@ -418,6 +427,38 @@ class CodexRuntime:
                 return data
         return None
 
+    def read_event(self, event_id, expected_event=None):
+        return self._fetch(event_id, expected_event)
+
+    def discover_events(self):
+        """Search all dates by ownership metadata, consuming every verified page."""
+        found = {}
+        for query in ('librus-calendar:', 'Źródło: Librus'):
+            args = {'calendar_id': self.config.calendar_id, 'query': query,
+                    'timezone_str': 'Europe/Warsaw', 'max_results': 100}
+            tokens = set()
+            for _ in range(1000):
+                data = self._tool('search_events', args)
+                events = data.get('events', data.get('items')) if isinstance(data, dict) else None
+                if not isinstance(events, list) or any(not isinstance(event, dict) or not event.get('id') for event in events):
+                    raise RuntimeFailure('calendar_search_incomplete')
+                for event in events:
+                    found[str(event['id'])] = event
+                token = data.get('next_page_token', data.get('nextPageToken'))
+                if not token:
+                    # A connector's full-size page without a continuation contract
+                    # cannot prove that all matching ownership state was discovered.
+                    if len(events) >= 100 and not any(key in data for key in ('next_page_token', 'nextPageToken')):
+                        raise RuntimeFailure('calendar_search_incomplete')
+                    break
+                if str(token) in tokens:
+                    raise RuntimeFailure('calendar_search_incomplete')
+                tokens.add(str(token))
+                args = dict(args, next_page_token=token)
+            else:
+                raise RuntimeFailure('calendar_search_incomplete')
+        return list(found.values())
+
     def _fetch(self, event_id, expected_event=None):
         # fetch's current all-day projection loses dates. read_event preserves
         # them as naive midnight strings; interpret those only with all-day context.
@@ -427,7 +468,9 @@ class CodexRuntime:
             raise RuntimeFailure("calendar_event_missing")
         if event.get("id") != event_id:
             raise RuntimeFailure("calendar_event_id_mismatch")
-        if expected_event and _boundary(expected_event.get("start")).get("date") and _boundary(expected_event.get("end")).get("date"):
+        expected = normalize_event(expected_event, owner_email=self.config.calendar_owner) if expected_event else {}
+        if expected_event and (expected_event.get('all_day') is True or
+                               (expected.get('start', {}).get('date') and expected.get('end', {}).get('date'))):
             event = copy.deepcopy(event)
             for boundary in ("start", "end"):
                 value = event.get(boundary)
@@ -542,6 +585,8 @@ class CodexRuntime:
 
     def execute(self, operation):
         self.last_evidence = []
+        if self.read_only:
+            return _result('failed', error='calendar_read_only', owner_email=self.config.calendar_owner)
         try:
             self._validate_operation(operation)
         except (RuntimeFailure, TypeError, ValueError, KeyError) as exc:

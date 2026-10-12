@@ -22,7 +22,7 @@ Message analysis stores the actual runtime-reported model, reasoning effort, pro
 
 Full sync success is distinct from last attempt, dry-run, paused state and partial progress. The hourly worker persists sanitized technical stages, durations and error codes; a full success requires no automatic pending work or unknown outcomes. Proposals awaiting parent review do not necessarily block technical sync success. The read-only Netdata export contains aggregate health metadata, not message contents; a green health indicator is not proof that the model understood a message correctly.
 
-Backups use SQLite's backup API, integrity checks and restricted permissions, with the newest seven default copies retained. Both primary state and backups contain private school data. Audit evidence and tombstones remain local; there is no automatic history-wide reanalysis or irreversible blanket calendar repair.
+Automatic database backups are intentionally disabled. Deployment does not create a database copy; forward recovery preserves the current operation journal. Both primary state and backups contain private school data. Audit evidence and tombstones remain local; there is no automatic history-wide reanalysis or irreversible blanket calendar repair.
 
 ## Private data boundaries
 

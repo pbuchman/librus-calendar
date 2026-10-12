@@ -5,6 +5,7 @@
   "tailscale_owner": "owner@example.test",
   "allowed_hosts": ["school.example.test:8445"],
   "allow_local": false,
+  "backup_enabled": false,
   "state_path": "~/.local/share/librus-calendar/state.sqlite3",
   "credentials_path": "~/.config/librus-calendar/credentials.json",
   "codex_binary": "codex",

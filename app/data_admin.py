@@ -1,0 +1,469 @@
+"""Direct decision transfer, read-only reconstruction, and bounded private state."""
+from collections import Counter
+from datetime import datetime, timedelta
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import stat
+
+from .core import WARSAW, as_datetime, digest, has_external_attendees, start_key, utcnow
+from .codex_runtime import event_fingerprint, RuntimeFailure
+from .sync import execution_deadline, safe_error, sync_lock, SyncInterrupted
+
+FLAGS = ('user_approved', 'user_edited', 'user_rejected', 'deletion_approved')
+UNRESOLVED = ('pending', 'review', 'inflight', 'unknown')
+
+
+def intent_signature(item):
+    quote = re.sub(r'\s+', ' ', str(item.get('source_quote') or '')).strip()
+    return {'kind': item.get('kind'), 'start': start_key(item),
+            'temporal_kind': item.get('temporal_kind', 'event'),
+            'quote_hash': digest(quote) if quote else None, 'event_id': item.get('event_id')}
+
+
+def minimal_proposal(item):
+    """Keep a chosen action, never the original teacher quote or AI reasoning."""
+    keep = ('id', 'message_id', 'kind', 'title', 'start', 'end', 'all_day', 'temporal_kind',
+            'due_at', 'activity_scope', 'event_id', 'default_duration', *FLAGS)
+    result = {key: item[key] for key in keep if key in item}
+    result.update(description=item.get('description', '') if item.get('user_approved') or item.get('user_edited') else '',
+                  source_quote='', confidence='high' if item.get('user_approved') else 'low',
+                  needs_review=False, review_reason='', status=item.get('status', 'review'))
+    return result
+
+
+def minimal_snapshot(snapshot, marker):
+    # The original writable-field fingerprint remains the conflict baseline. The
+    # source quote in a Calendar description is unnecessary local history.
+    keys = ('id', 'summary', 'title', 'start', 'end', 'all_day', 'status', 'htmlLink', 'html_link',
+            'web_link', 'url', 'reminders', 'location', 'recurrence', 'attendees')
+    return {**{key: snapshot[key] for key in keys if key in snapshot}, 'description': marker, '_content_pruned': True}
+
+
+def remember_decision(store, row, item, original=None):
+    if not any(item.get(flag) is True for flag in FLAGS):
+        return
+    existing = store.db.execute('SELECT payload FROM decision_intents WHERE id=?', (row['id'],)).fetchone()
+    previous = json.loads(existing[0]) if existing else {}
+    record = {'proposal': minimal_proposal(item),
+              'signature': previous.get('signature') or intent_signature(original or item)}
+    store.db.execute('INSERT INTO decision_intents VALUES (?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,updated_at=excluded.updated_at',
+                     (row['id'], row['message_id'], row['source_hash'], json.dumps(record, ensure_ascii=False), utcnow()))
+
+
+def protect_decision(store, message, item):
+    rows = store.db.execute('SELECT * FROM decision_intents WHERE message_id=?', (message['id'],)).fetchall()
+    rows = [row for row in rows if json.loads(row['payload'])['proposal'].get('kind') == item.get('kind')
+            and (item.get('kind') == 'create' or json.loads(row['payload'])['proposal'].get('event_id') == item.get('event_id'))]
+    if not rows:
+        return item
+    signature = json.loads(json.dumps(intent_signature(item)))
+    matches = [row for row in rows if json.loads(row['payload']).get('signature') == signature]
+    if len(matches) == 1 and matches[0]['source_hash'] == message['payload_hash']:
+        decision = json.loads(matches[0]['payload'])['proposal']
+        if decision.get('user_rejected'):
+            return dict(item, status='ignored', user_rejected=True, review_reason='Explicit prior user rejection retained.')
+        # A previously applied approval is never a new operation, regardless of
+        # current model wording. Unwritten approvals retain the edited action.
+        retained_status = decision.get('status', 'review')
+        retained_status = retained_status if retained_status in ('pending', 'applied') else 'review'
+        # Calendar reconstruction can discover a matching event whose previous
+        # write was never recorded locally. Approval does not permit duplicating it.
+        if retained_status == 'pending' and any(start_key(event['snapshot']) == start_key(decision)
+                for event in store.list_events(100000, include_cancelled=True) if event['message_id'] == message['id']):
+            retained_status = 'review'
+        return {**item, **decision, 'id': matches[0]['id'], 'message_id': message['id'],
+                'source_quote': item.get('source_quote', ''),
+                'status': retained_status, 'needs_review': retained_status == 'review',
+                'review_reason': 'Prior approval retained; reconstructed state needs confirmation before execution.' if retained_status == 'review' else ''}
+    # AI output IDs include wording, and edits may have changed the chosen date.
+    # An uncertain match must never silently resurrect a rejected/chosen action.
+    return dict(item, status='review', needs_review=True,
+                review_reason='Prior human decision for this source requires an explicit match; no automatic replay.')
+
+
+def migrate_decisions(store, source_path, *, allow_legacy_binding=False, verified_calendar=None):
+    """Read the old database directly; no export, database copy, or source write."""
+    source_path = Path(source_path).expanduser().resolve(strict=True)
+    if source_path == store.path.resolve() or os.path.samefile(source_path, store.path):
+        raise ValueError('Decision transfer requires distinct databases.')
+    info = source_path.stat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+        raise ValueError('Decision source must be an owned regular database.')
+    source = sqlite3.connect(source_path.as_uri() + '?mode=ro', uri=True)
+    source.row_factory = sqlite3.Row
+    try:
+        source.execute('PRAGMA query_only=ON')
+        source.execute('BEGIN')
+        if source.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
+            raise ValueError('Decision source failed integrity verification.')
+        settings = dict(source.execute('SELECT key,value FROM settings'))
+        events = list(source.execute('SELECT * FROM events'))
+        binding, owner_binding = settings.get('calendar_binding'), settings.get('calendar_owner_binding')
+        legacy = not binding and not owner_binding
+        if legacy:
+            probe = verified_calendar or {}
+            if (not allow_legacy_binding or not events or not store.config.calendar_owner
+                    or probe.get('calendar_id') != store.calendar_id or probe.get('access_role') != 'owner'
+                    or any(row['calendar_id'] != store.calendar_id for row in events)):
+                raise ValueError('Legacy decision source requires explicit authorization, matching event ownership, and a verified Calendar owner probe.')
+        elif binding != store.calendar_id or owner_binding != store.config.calendar_owner:
+            raise ValueError('Decision source calendar identity does not match.')
+        account = settings.get('librus_account_hash')
+        if not account or (store._setting('librus_account_hash') and store._setting('librus_account_hash') != account):
+            raise ValueError('Decision source Librus account identity does not match.')
+        tables = {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        decisions = {}
+        if 'decision_intents' in tables:
+            decisions = {row['id']: dict(row) for row in source.execute('SELECT * FROM decision_intents')}
+        proposals = list(source.execute('SELECT * FROM proposals'))
+        for row in proposals:
+            item = json.loads(row['payload'])
+            item.update(id=row['id'], message_id=row['message_id'], status=row['status'])
+            if any(item.get(flag) is True for flag in FLAGS):
+                previous = json.loads(decisions[row['id']]['payload']) if row['id'] in decisions else {}
+                record = {'proposal': minimal_proposal(item), 'signature': previous.get('signature') or intent_signature(item)}
+                decisions[row['id']] = {**dict(row), 'payload': json.dumps(record, ensure_ascii=False)}
+        if any(row['calendar_id'] != store.calendar_id for row in events):
+            raise ValueError('Foreign Calendar event ownership in decision source.')
+        unresolved = list(source.execute("SELECT * FROM operations WHERE status IN ('pending','review','inflight','unknown')"))
+        # A reviewed operation left behind by user rejection has no external
+        # uncertainty; transferring it would falsely report an unresolved write.
+        unresolved = [row for row in unresolved if row['attempts'] > 0 or row['status'] in ('inflight', 'unknown')]
+        unresolved_ids = {row['proposal_id'] for row in unresolved}
+        metadata = list(source.execute("SELECT * FROM metadata_refresh WHERE status IN ('pending','review','inflight','unknown')")) if 'metadata_refresh' in tables else []
+        stamp = utcnow()
+        with store.lock, store.db:
+            store.db.execute('BEGIN IMMEDIATE')
+            old_account = store._setting('librus_account_hash')
+            if old_account and old_account != account:
+                raise ValueError('Target account changed during transfer.')
+            store.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('librus_account_hash', account))
+            for row in decisions.values():
+                current = store.db.execute('SELECT payload,source_hash FROM decision_intents WHERE id=?', (row['id'],)).fetchone()
+                if current and (current['payload'] != row['payload'] or current['source_hash'] != row['source_hash']):
+                    raise ValueError('Target contains a conflicting human decision.')
+                store.db.execute('INSERT OR IGNORE INTO decision_intents VALUES (?,?,?,?,?)',
+                                 (row['id'], row['message_id'], row['source_hash'], row['payload'], row['updated_at']))
+                item = json.loads(row['payload'])['proposal']
+                item['status'] = 'applied' if item.get('status') == 'applied' else ('ignored' if item.get('user_rejected') else item.get('status', 'review'))
+                store.db.execute('INSERT OR IGNORE INTO proposals VALUES (?,?,?,?,?,?,?)',
+                                 (row['id'], row['message_id'], row['source_hash'], json.dumps(item, ensure_ascii=False), item['status'], stamp, row['updated_at']))
+            for row in events:
+                snapshot = json.loads(row['snapshot'])
+                if not row['marker'] or not snapshot.get('id') or snapshot['id'] != row['id']:
+                    raise ValueError('Decision source ownership lacks an exact event identity.')
+                existing = store.db.execute('SELECT marker,message_id FROM events WHERE id=?', (row['id'],)).fetchone()
+                if existing and (existing['marker'] != row['marker'] or existing['message_id'] != row['message_id']):
+                    raise ValueError('Target contains conflicting event ownership.')
+                kept = snapshot if row['proposal_id'] in unresolved_ids else minimal_snapshot(snapshot, row['marker'])
+                state = row['state'] if 'state' in row.keys() else 'active'
+                store.db.execute('INSERT OR IGNORE INTO events VALUES (?,?,?,?,?,?,?,?,?)',
+                                 (row['id'], row['calendar_id'], row['message_id'], row['proposal_id'], json.dumps(kept, ensure_ascii=False),
+                                  row['fingerprint'], row['marker'], row['updated_at'], state))
+            for row in unresolved:
+                original = next((p for p in proposals if p['id'] == row['proposal_id']), None)
+                if not original:
+                    raise ValueError('Unresolved operation has no proposal evidence.')
+                store.db.execute('INSERT OR IGNORE INTO proposals VALUES (?,?,?,?,?,?,?)', tuple(original))
+                existing = store.db.execute('SELECT payload FROM operations WHERE id=?', (row['id'],)).fetchone()
+                if existing and existing[0] != row['payload']:
+                    raise ValueError('Target contains conflicting operation intent.')
+                values = dict(row)
+                if values['status'] == 'inflight':
+                    values['status'] = 'unknown'
+                store.db.execute('INSERT OR IGNORE INTO operations(id,proposal_id,payload,status,attempts,result,last_error,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)',
+                                 tuple(values[key] for key in ('id','proposal_id','payload','status','attempts','result','last_error','created_at','updated_at')))
+            for row in metadata:
+                existing = store.db.execute('SELECT payload FROM metadata_refresh WHERE id=?', (row['id'],)).fetchone()
+                if existing and existing[0] != row['payload']:
+                    raise ValueError('Target contains conflicting metadata operation intent.')
+                values = dict(row)
+                if values['status'] == 'inflight':
+                    values['status'] = 'unknown'
+                store.db.execute('INSERT OR IGNORE INTO metadata_refresh VALUES (?,?,?,?,?,?,?,?,?,?)',
+                    tuple(values[key] for key in ('id','event_id','version','payload','status','attempts','result','last_error','created_at','updated_at')))
+            store.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('decision_transfer_verified_at', stamp))
+            store.db.execute("INSERT OR IGNORE INTO settings VALUES ('rebuild_status','required')")
+        items = [json.loads(row['payload'])['proposal'] for row in decisions.values()]
+        return {'status': 'migrated', 'decisions': len(items), 'approved': sum(item.get('user_approved') is True for item in items),
+                'edited': sum(item.get('user_edited') is True for item in items),
+                'rejected': sum(item.get('user_rejected') is True for item in items),
+                'events': len(events), 'unresolved_operations': len(unresolved), 'unresolved_metadata_operations': len(metadata),
+                'legacy_binding_verified': legacy, 'calendar_writes': 0, 'message_bodies_copied': 0}
+    finally:
+        source.close()
+
+
+def prune_state(store, *, days=30, apply=False, current=None):
+    if type(days) is not int or not 1 <= days <= 30:
+        raise ValueError('Retention must be between one and thirty days.')
+    current = current or datetime.now(WARSAW)
+    cutoff = current - timedelta(days=days)
+    old = []
+    for row in store.db.execute('SELECT id,sent_at,status,payload FROM messages'):
+        try:
+            if row['sent_at'] and as_datetime(row['sent_at']) < cutoff:
+                old.append(row)
+        except (ValueError, TypeError):
+            # Unknown dates may be unresolved evidence; never guess their age.
+            continue
+    ids = [row['id'] for row in old]
+    dirty_ids = [row['id'] for row in old if row['status'] != 'retained' or json.loads(row['payload']).get('text')]
+    result = {'status': 'applied' if apply else 'preview', 'days': days, 'messages_pruned': len(dirty_ids),
+              'analysis_records_pruned': 0, 'calendar_writes': 0}
+    if ids:
+        result['analysis_records_pruned'] = sum(store.db.execute('SELECT COUNT(*) FROM analysis_audit WHERE message_id=?', (mid,)).fetchone()[0] for mid in ids)
+    if not apply:
+        return result
+    with store.lock:
+        store.db.execute('PRAGMA secure_delete=ON')
+        with store.db:
+            for row in old:
+                mid = row['id']
+                for proposal in store.db.execute('SELECT * FROM proposals WHERE message_id=?', (mid,)).fetchall():
+                    item = store._proposal(proposal)
+                    remember_decision(store, proposal, item)
+                    operation = store.db.execute('SELECT * FROM operations WHERE proposal_id=?', (proposal['id'],)).fetchone()
+                    if operation and operation['status'] in ('inflight', 'unknown'):
+                        continue
+                    if operation and operation['status'] in ('pending', 'review'):
+                        # Unwritten old-source operations cannot remain executable
+                        # after their supporting quote is removed.
+                        store.db.execute("UPDATE operations SET status='review',last_error='Source content retention expired; explicit review required.',updated_at=? WHERE id=?", (utcnow(), operation['id']))
+                    item = minimal_proposal(item)
+                    # Retire obsolete automatic analysis while retaining future
+                    # actions, human choices, ownership and every journal record.
+                    try:
+                        future = item.get('start') and as_datetime(item['end'] or item['start']) >= current
+                    except (ValueError, TypeError, KeyError):
+                        future = True
+                    linked = store.db.execute('SELECT 1 FROM events WHERE proposal_id=?', (proposal['id'],)).fetchone()
+                    if not operation and not linked and not future and not any(item.get(flag) for flag in FLAGS):
+                        store.db.execute('DELETE FROM proposals WHERE id=?', (proposal['id'],))
+                        continue
+                    if item['status'] == 'pending':
+                        item.update(status='review', needs_review=True, review_reason='Source content retention expired; explicit review required.')
+                    store.db.execute('UPDATE proposals SET payload=?,status=? WHERE id=?', (json.dumps(item, ensure_ascii=False), item['status'], proposal['id']))
+                    if operation and (operation['status'] in ('applied', 'superseded')
+                                      or (operation['status'] in ('pending', 'review') and operation['attempts'] == 0)):
+                        payload = json.loads(operation['payload'])
+                        kept = {key: payload.get(key) for key in ('operation_id','proposal_id','message_id','action','calendar_id','marker','event_id','source_message_ids')}
+                        result_data = json.loads(operation['result']) if operation['result'] else {}
+                        store.db.execute('UPDATE operations SET payload=?,result=?,last_error=NULL WHERE id=?',
+                            (json.dumps(kept), json.dumps({key: result_data.get(key) for key in ('status','event_id','fingerprint')}), operation['id']))
+                clean = {'id': mid, 'sent_at': row['sent_at'], 'text': '', 'retained': True}
+                if mid in dirty_ids:
+                    store.db.execute("UPDATE messages SET payload=?,status='retained',last_error=NULL,pending_since=NULL,analysis_metadata=NULL,analyzed_at=NULL WHERE id=?", (json.dumps(clean), mid))
+                store.db.execute('DELETE FROM analysis_audit WHERE message_id=?', (mid,))
+                for event in store.db.execute('SELECT * FROM events WHERE message_id=?', (mid,)).fetchall():
+                    if store.db.execute("SELECT 1 FROM operations WHERE proposal_id=? AND status IN ('inflight','unknown')", (event['proposal_id'],)).fetchone():
+                        continue
+                    store.db.execute('UPDATE events SET snapshot=? WHERE id=?',
+                        (json.dumps(minimal_snapshot(json.loads(event['snapshot']), event['marker']), ensure_ascii=False), event['id']))
+                    for journal in store.db.execute("SELECT * FROM metadata_refresh WHERE event_id=? AND status IN ('applied','superseded')", (event['id'],)).fetchall():
+                        payload = json.loads(journal['payload'])
+                        outcome = json.loads(journal['result']) if journal['result'] else {}
+                        kept = {key: payload.get(key) for key in ('operation_id','action','calendar_id','marker','event_id',
+                            'expected_fingerprint','message_id','proposal_id','source_message_ids','synchronization_started_at')}
+                        store.db.execute('UPDATE metadata_refresh SET payload=?,result=?,last_error=NULL WHERE id=?',
+                            (json.dumps(kept), json.dumps({key: outcome.get(key) for key in ('status','event_id','fingerprint')}), journal['id']))
+            store.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('retention_last_applied_at', utcnow()))
+        if dirty_ids or result['analysis_records_pruned']:
+            # Erase freed SQLite pages too; this is an in-place rewrite, no backup.
+            store.db.execute('VACUUM')
+    return result
+
+
+def event_ownership(event):
+    text = str(event.get('description') or '')
+    markers = set(re.findall(r'librus-calendar:[A-Za-z0-9_-]{8,128}', re.sub(r'\s+', '', text)))
+    sources = set(re.findall(r'Źródło\s*:\s*Librus\s*,\s*wiadomość\s+([A-Za-z0-9_-]{1,200})', text, re.IGNORECASE))
+    return markers, sources
+
+
+class RebuildController:
+    """All pages and all cached retries; no Calendar write path exists here."""
+    def __init__(self, store, client=None, runtime=None, *, client_factory=None, runtime_factory=None,
+                 days=30, timeout_seconds=45*60):
+        if type(days) is not int or not 1 <= days <= 30:
+            raise ValueError('Rebuild history must be between one and thirty days.')
+        self.store, self.client, self.runtime = store, client, runtime
+        self.client_factory, self.runtime_factory = client_factory, runtime_factory
+        self.days, self.timeout_seconds = days, min(float(timeout_seconds), 45*60)
+
+    def run(self, current=None):
+        current = current or datetime.now(WARSAW)
+        with sync_lock(self.store.path) as acquired:
+            if not acquired:
+                return {'status': 'already_running', 'calendar_writes': 0}
+            result = {'status': 'rebuilt', 'calendar_writes': 0, 'listed': 0, 'fetched': 0, 'analyzed': 0,
+                      'fetch_failures': 0, 'analysis_failures': 0, 'events': 0, 'calendar_ambiguities': 0}
+            try:
+                self.store.set_setting('rebuild_last_attempt_at', utcnow())
+                self.store.set_setting('rebuild_status', 'running')
+                with execution_deadline(self.timeout_seconds):
+                    if self.client_factory:
+                        self.client = self.client_factory(lambda stage: None)
+                    if self.runtime_factory:
+                        self.runtime = self.runtime_factory()
+                    if getattr(self.runtime, 'read_only', False) is not True:
+                        raise RuntimeFailure('calendar_read_only_required')
+                    probe = self.runtime.probe()
+                    if not isinstance(probe, dict) or probe.get('calendar_id') != self.store.calendar_id:
+                        raise RuntimeFailure('calendar_not_allowed')
+                    self._calendar(result)
+                    self._messages(result, current)
+                    prune_state(self.store, days=self.days, apply=True, current=current)
+                    if result['fetch_failures'] or result['analysis_failures']:
+                        result['status'] = 'partial'
+                    elif result['calendar_ambiguities']:
+                        result['status'] = 'review'
+                    if result['status'] == 'rebuilt':
+                        self.store.set_setting('rebuild_completed_at', utcnow())
+                    self.store.set_setting('rebuild_status', result['status'])
+            except SyncInterrupted as error:
+                result.update(status='interrupted', error_code=error.code)
+                self.store.set_setting('rebuild_status', 'interrupted')
+            except Exception as error:
+                # Never emit an API response, private ID, or message body.
+                result.update(status='partial', error_code=getattr(error, 'code', 'rebuild_failed'))
+                self.store.set_setting('rebuild_status', 'partial')
+            return result
+
+    def _calendar(self, result):
+        discovered = self.runtime.discover_events()
+        if not isinstance(discovered, list):
+            raise RuntimeFailure('calendar_search_incomplete')
+        candidates = {str(event['id']): event for event in discovered if isinstance(event, dict) and event.get('id')}
+        if len(candidates) != len(discovered):
+            raise RuntimeFailure('calendar_search_incomplete')
+        # Exact transferred IDs are verified even when connector search omitted
+        # a modified description. Ownership is never inferred from a title.
+        saved = {event['id']: event for event in self.store.list_events(100000, include_cancelled=True)}
+        for event_id, row in saved.items():
+            candidates.setdefault(event_id, row['snapshot'])
+        verified, problems = [], {}
+        for event_id, hint in candidates.items():
+            try:
+                snapshot = self.runtime.read_event(event_id, hint)
+            except RuntimeFailure as error:
+                if error.code == 'calendar_event_not_found' and event_id in saved:
+                    problems[event_id] = 'Transferred event deleted or unavailable; ownership retained.'
+                    continue
+                raise
+            if not isinstance(snapshot, dict) or snapshot.get('id') != event_id:
+                raise RuntimeFailure('calendar_event_id_mismatch')
+            markers, sources = event_ownership(snapshot)
+            prior = saved.get(event_id)
+            if prior and prior['marker'] in markers:
+                sources.add(prior['message_id'])
+            if len(markers) != 1 or len(sources) != 1 or has_external_attendees(snapshot, self.store.config.calendar_owner):
+                problems[event_id] = 'Ambiguous application ownership or source identifiers; review required.'
+                continue
+            verified.append((event_id, snapshot, next(iter(markers)), next(iter(sources))))
+        marker_counts = Counter(marker for _, _, marker, _ in verified)
+        with self.store.lock, self.store.db:
+            self.store.db.execute('DELETE FROM calendar_discovery_review')
+            for event_id, snapshot, marker, mid in verified:
+                if marker_counts[marker] > 1:
+                    problems[event_id] = 'Multiple Calendar event IDs share one operation marker; review required.'
+                    continue
+                prior = saved.get(event_id)
+                fingerprint = event_fingerprint(snapshot, self.store.config.calendar_owner)
+                if prior and prior['fingerprint'] and prior['fingerprint'] != fingerprint:
+                    # Keep the pre-edit baseline; future write checks still detect
+                    # a manual Calendar change until a user explicitly accepts it.
+                    problems[event_id] = 'Manual Calendar edit preserved; explicit review required before updates.'
+                    fingerprint = prior['fingerprint']
+                pid = prior['proposal_id'] if prior else digest(['discovered-calendar', self.store.calendar_id, event_id, marker])[:32]
+                # Read full remote content to verify ownership and its conflict
+                # baseline, then retain only the event's operational fields.
+                kept_snapshot = minimal_snapshot(snapshot, marker)
+                self.store.db.execute('INSERT INTO events VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET snapshot=excluded.snapshot,updated_at=excluded.updated_at,state=excluded.state',
+                    (event_id, self.store.calendar_id, mid, pid, json.dumps(kept_snapshot, ensure_ascii=False), fingerprint,
+                     marker, utcnow(), 'cancelled' if snapshot.get('status') == 'cancelled' else 'active'))
+                result['events'] += 1
+            for event_id, reason in problems.items():
+                blocking = not reason.startswith('Manual Calendar edit preserved;')
+                self.store.db.execute('INSERT INTO calendar_discovery_review VALUES (?,?,?,?)', (digest(event_id), reason, utcnow(), int(blocking)))
+            self.store.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('calendar_discovery_verified_at', utcnow()))
+        result['calendar_ambiguities'] = len(problems)
+        result['calendar_blocking_ambiguities'] = sum(not reason.startswith('Manual Calendar edit preserved;') for reason in problems.values())
+
+    def _messages(self, result, current):
+        cutoff = current - timedelta(days=self.days)
+        page, page_size, seen_pages, seen_ids = 1, 100, set(), set()
+        selected = []
+        total_seen = 0
+        while page <= 10000:
+            snippets, total = self.client.messages(limit=page_size, page=page)
+            if not isinstance(snippets, list) or len(snippets) > page_size or (total is not None and (type(total) is not int or total < 0)):
+                raise RuntimeFailure('discovery_incomplete')
+            signature = digest(snippets)
+            if snippets and signature in seen_pages:
+                raise RuntimeFailure('discovery_incomplete')
+            seen_pages.add(signature)
+            if not snippets:
+                if isinstance(total, int) and total_seen < total:
+                    raise RuntimeFailure('discovery_incomplete')
+                break
+            total_seen += len(snippets)
+            result['listed'] += len(snippets)
+            in_window = 0
+            for snippet in snippets:
+                mid = str(snippet.get('messageId') or snippet.get('id') or '').strip()
+                if not mid or mid in seen_ids:
+                    raise RuntimeFailure('discovery_incomplete')
+                seen_ids.add(mid)
+                try:
+                    recent = not snippet.get('sendDate') or as_datetime(snippet['sendDate']) >= cutoff
+                except (ValueError, TypeError):
+                    recent = True
+                if not recent:
+                    continue
+                in_window += 1
+                self.store.note_discovered(snippet)
+                selected.append(mid)
+            self.store.set_setting('rebuild_discovery_page', str(page + 1))
+            # Complete pagination even if an old page appears in the middle;
+            # the connector has no explicit guaranteed chronological contract.
+            if isinstance(total, int) and total_seen >= total:
+                if total_seen != total:
+                    raise RuntimeFailure('discovery_incomplete')
+                break
+            if len(snippets) < page_size:
+                if isinstance(total, int) and total_seen < total:
+                    raise RuntimeFailure('discovery_incomplete')
+                break
+            page += 1
+        else:
+            raise RuntimeFailure('discovery_incomplete')
+        # Re-read all current source hashes, while already analyzed hashes prevent
+        # repeat AI calls. A failure queue persists across interrupted runs.
+        for mid in selected:
+            try:
+                self.store.save_message(self.client.message(mid))
+                result['fetched'] += 1
+            except Exception as error:
+                self.store.fail_message(mid, 'fetch', safe_error(error))
+                result['fetch_failures'] += 1
+        ambiguity = bool(result['calendar_blocking_ambiguities'])
+        for message in self.store.analysis_messages(100000):
+            try:
+                if message.get('sent_at') and as_datetime(message['sent_at']) < cutoff:
+                    continue
+                self.runtime.last_analysis_metadata = None
+                proposals = self.runtime.analyze(message, self.store.list_events(100000))
+                if not isinstance(proposals, list) or len(proposals) > 30:
+                    raise ValueError('Unexpected analysis result shape.')
+                if ambiguity:
+                    proposals = [{**item, 'needs_review': True,
+                                  'review_reason': 'Calendar discovery has ambiguous ownership; confirm before creating events.'} for item in proposals]
+                self.store.save_proposals(message['id'], proposals, current, getattr(self.runtime, 'last_analysis_metadata', None))
+                result['analyzed'] += 1
+            except Exception as error:
+                self.store.fail_message(message['id'], 'analysis', safe_error(error))
+                result['analysis_failures'] += 1

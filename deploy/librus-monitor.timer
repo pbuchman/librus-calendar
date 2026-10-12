@@ -1,3 +1,4 @@
+# Managed by librus-calendar deployment v1
 [Unit]
 Description=Export Librus health every minute
 

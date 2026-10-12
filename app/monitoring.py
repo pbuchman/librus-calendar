@@ -120,7 +120,8 @@ def collect_snapshot(database=None, now=None, reader=None, *, config=None):
     if reader is None:
         from app.health_state import read_monitoring_state
         reader = read_monitoring_state
-    snapshot = {'schema_version': 1, 'generated_at': now.isoformat(), 'db_ok': False}
+    snapshot = {'schema_version': 1, 'generated_at': now.isoformat(), 'db_ok': False,
+                'backup_enabled': config.backup_enabled}
     try:
         snapshot['state'] = sanitize_state(reader(database, now=now), now)
         snapshot['db_ok'] = True
@@ -128,9 +129,9 @@ def collect_snapshot(database=None, now=None, reader=None, *, config=None):
         # A sanitized source failure is observable; exception messages may contain private data.
         snapshot['state'] = None
     snapshot['sync_timer_ok'] = timer_available(unit_state('librus-sync.timer'))
-    snapshot['backup_timer_ok'] = timer_available(unit_state('librus-backup.timer'))
+    snapshot['backup_timer_ok'] = not config.backup_enabled or timer_available(unit_state('librus-backup.timer'))
     sync = unit_state('librus-sync.service')
-    backup = unit_state('librus-backup.service')
+    backup = unit_state('librus-backup.service') if config.backup_enabled else None
     snapshot['sync_unit_ok'] = sync is not None
     snapshot['sync_running'] = bool(sync and (sync.get('ActiveState') == 'activating'
         or (sync.get('ActiveState') == 'active' and sync.get('SubState') == 'running')))
@@ -138,9 +139,9 @@ def collect_snapshot(database=None, now=None, reader=None, *, config=None):
         or sync.get('Result', 'success') != 'success'
         or sync.get('ExecMainStatus', '0') != '0'))
     snapshot['sync_timeout'] = bool(sync and sync.get('Result') in {'timeout', 'watchdog', 'signal', 'core-dump'})
-    snapshot['backup_failed'] = bool(backup is None or backup.get('ActiveState') == 'failed'
+    snapshot['backup_failed'] = bool(config.backup_enabled and (backup is None or backup.get('ActiveState') == 'failed'
         or backup.get('Result', 'success') != 'success'
-        or backup.get('ExecMainStatus', '0') != '0')
+        or backup.get('ExecMainStatus', '0') != '0'))
     snapshot['web_ok'] = web_available(config)
     return snapshot
 

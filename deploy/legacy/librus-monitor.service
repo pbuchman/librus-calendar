@@ -1,0 +1,18 @@
+[Unit]
+Description=Export private Librus aggregate health for Netdata
+After=librus-web.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/librus-calendar/monitor.env
+WorkingDirectory=%h/librus-calendar
+ExecStart=%h/librus-calendar/.venv/bin/python -m app.monitoring
+TimeoutStartSec=40s
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/librus-monitor
+ReadOnlyPaths=%h/.local/share/librus-calendar
+InaccessiblePaths=-%h/.config/librus-calendar -%h/.codex
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

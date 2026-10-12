@@ -27,6 +27,7 @@ Use `deploy/config.json.example` as a template for `~/.config/librus-calendar/co
 | `tailscale_owner` | Only allowed Tailscale login identity |
 | `allowed_hosts` | Exact Tailscale hostname and port; no wildcard |
 | `allow_local` | Keep `false` for the private production UI |
+| `backup_enabled` | Keep `false`; automatic database backups are intentionally disabled |
 | `state_path`, `credentials_path` | Private SQLite/credentials locations; default under your home directory |
 | `codex_binary` | Executable path or `codex` on the service's PATH |
 | `analysis_model`, `analysis_effort` | Analysis model and a supported reasoning effort |
@@ -46,55 +47,101 @@ Use the private `credentials_path` and mode 0600. Never put a password in a shel
 
 ## Validate before enabling writes
 
-Run from the repository, with the virtual environment activated or its Python explicitly selected:
+After preparing the reviewed package as described below, select its installed interpreter. Use `-I` for every installed runtime command so the current directory, inherited `PYTHONPATH` and user site cannot override release code:
 
 ```sh
-.venv/bin/python -m app.cli status
-.venv/bin/python -m scripts.probe_runtime
-.venv/bin/python -m app.cli sync --dry-run
+release_python="$HOME/.local/lib/librus-calendar/releases/FULL_SHA/.venv/bin/python"
+"$release_python" -I -m app.cli status
+"$release_python" -I -c 'from app.codex_runtime import CodexRuntime; CodexRuntime(read_only=True).probe()'
+"$release_python" -I -m app.cli sync --dry-run
 ```
 
 The probe is a **real calendar read** and checks access to the configured calendar. Dry-run can fetch private Librus messages and send them to the analysis service; it skips writes. It is not offline. Inspect the local proposals and review queue. New state starts with writes paused. After checking your account, source messages, dates, model and connector behavior:
 
 ```sh
-.venv/bin/python -m app.cli pause-writes --resume
-.venv/bin/python -m app.cli sync
+"$release_python" -I -m app.cli pause-writes --resume
+"$release_python" -I -m app.cli sync
 ```
 
-To stop calendar writes again, run `pause-writes` without `--resume`. This does not stop ingestion or analysis. CLI options include `--state PATH` before the subcommand, `sync --credentials PATH --limit N` (1–100), and `backup --destination PATH`. The private configuration is still used unless explicitly replaced by environment settings.
+To stop calendar writes again, run `pause-writes` without `--resume`. This does not stop ingestion or analysis. CLI options include `--state PATH` before the subcommand, `sync --credentials PATH --limit N` (1–100). The private configuration is still used unless explicitly replaced by environment settings.
 
-## Linux services and private web access
+## Packaged Linux releases and private access
 
-The supplied units expect a checkout at **`~/librus-calendar`** and a virtual environment inside it. Run `bash scripts/install_linux.sh` there. It installs the sync/web/backup units and example configuration, refuses different existing units, and **does not start services**. Prepare the actual `config.json`, `credentials.json` and `web.env` in `~/.config/librus-calendar` before proceeding. Put the correct Codex executable path in `codex_binary`; an interactive shell PATH may differ from systemd's.
+Keep the editable source checkout separate from production. Production imports a wheel installed into `$HOME/.local/lib/librus-calendar/releases/FULL_SHA/.venv`; `$HOME/.local/lib/librus-calendar/current` selects the active release. Templates, CSS and schemas are included in the wheel. Python 3.12+ is required. Install development dependencies and build tools before preparing:
 
-`web.env` sets the exact `LIBRUS_TAILSCALE_OWNER`, `LIBRUS_ALLOWED_HOSTS` and `LIBRUS_ALLOW_LOCAL=0`. The web server binds only to `127.0.0.1:8795`, ignores proxy address forwarding and trusts only the local Tailscale proxy with the exact owner identity. Never expose this port as a public reverse proxy or enable Tailscale Funnel. Tailscale ACLs and account access remain your responsibility.
+```sh
+.venv/bin/python -m pip install -r requirements.lock
+.venv/bin/python scripts/deploy.py prepare --sha FULL_SHA
+```
 
-After configuring and checking the instance, route Tailscale Serve and enable the units:
+Replace `FULL_SHA` with the exact reviewed 40-character SHA at clean checkout HEAD, reachable from a freshly fetched local `origin/main`. Preparation checks source and reachable-history privacy, runs offline tests in an isolated temporary home, builds/installs a wheel, and verifies installed imports/resources outside source. It never stops services, reads production state, makes a backup or changes the calendar. Release manifests record checked SHA and artifact/application hashes. Preparation must finish before a production outage. Re-running it reuses a verified existing release.
+
+Private production files remain under `$HOME/.config/librus-calendar` and `$HOME/.local/share/librus-calendar`. Configure actual `config.json`, `credentials.json`, `web.env` and `monitor.env` before activation. The installer preserves existing values and refuses symlinks, unsafe paths and unrelated units before writing. `bash scripts/install_linux.sh --sha FULL_SHA` installs packaged units only and does not start them.
+
+```sh
+.venv/bin/python scripts/deploy.py activate --sha FULL_SHA
+.venv/bin/python scripts/deploy.py verify
+```
+
+Activation first stops the sync timer and refuses to switch while a sync worker is running; it never terminates a calendar writer. Retry after the worker completes. Then it installs known units, switches `current`, and enables web, hourly sync and minute monitoring. The sync timer uses Europe/Warsaw, is persistent and limits each worker to 45 minutes. Every deployment validates the prepared package before stopping services.
+
+For an explicitly planned migration from the exact known legacy units, build and validate the new private target state first, then run:
+
+```sh
+.venv/bin/python scripts/deploy.py activate --sha FULL_SHA --migrate-legacy --no-sync
+.venv/bin/python scripts/deploy.py verify --no-sync
+```
+
+This starts web/monitor only. Keep writes paused until first-run acceptance, then enable the hourly timer and run normal verification. Only explicit migration replaces known legacy units and disables/removes their backup service/timer; unrelated administrator units are refused. No installer or deployment creates a database copy. Backups are intentionally disabled by `backup_enabled=false` and `LIBRUS_BACKUP_ENABLED=0`.
+
+The web server binds to `127.0.0.1:8795`. `web.env` holds the exact `LIBRUS_TAILSCALE_OWNER`, `LIBRUS_ALLOWED_HOSTS` and `LIBRUS_ALLOW_LOCAL=0`. Preserve an existing private Tailscale Serve route on HTTPS 8445 and any other routes. For a newly configured host the route is:
 
 ```sh
 tailscale serve --bg --https=8445 --yes http://127.0.0.1:8795
-systemctl --user enable --now librus-web.service librus-sync.timer librus-backup.timer
-systemctl --user list-timers
 ```
 
-The sync timer runs at every full hour in Europe/Warsaw; missed scheduled runs are persistent. The whole worker is limited to 45 minutes. The backup timer runs daily at 03:15 in Europe/Warsaw. Default backups retain the newest seven files; each SQLite copy receives an integrity check. Backups contain private messages and event details. Arrange host security, encrypted storage/offsite backups and systemd user-session persistence as needed.
+Restrict access to the configured owner, never enable Funnel, and use a separate port for development. Service Codex executable/model/connector configuration must match the authenticated runtime available on that host.
 
-## Optional Netdata monitoring
+## Netdata monitoring
 
-`deploy/install-librus-monitor.sh APP_USER` installs the collector and health rules as root; it requires an existing `netdata` group and Python collector directory. It does not restart Netdata or enable the user monitor. Read it before running with administrator rights.
+As root, `deploy/install-librus-monitor.sh APP_USER` installs only owned collector/health files after full preflight. `--migrate-legacy` permits only exact known prior file hashes. A root-owned installed-file hash registry permits later managed upgrades and compatible rollback; arbitrary differences are refused. The script does not restart Netdata. After collector changes, restart the Python worker or Netdata through a controlled host maintenance procedure; reloading health rules alone does not reload Python code.
 
-Copy the monitor service/timer to the application's user-unit directory and the `deploy/monitor.env.example` to that user's `~/.config/librus-calendar/monitor.env`, mode 0600. Replace the synthetic Tailscale identity/host with the same values used by the web proxy. Keep `LIBRUS_CONFIG_FILE=` empty in this file: the monitor exports aggregate read-only database health and cannot access private credentials/configuration directories. Enable `librus-monitor.timer`, then reload Netdata through your installation's normal procedure.
+The minute monitor uses nonsensitive `monitor.env`, with `LIBRUS_CONFIG_FILE=` empty and the same identity/host as `web.env`. Its sandbox cannot read private credentials/configuration. Set `LIBRUS_STATE_PATH` to the same private database path as production config; use a literal private absolute path or `~` because systemd environment files do not expand `$HOME`. Set `LIBRUS_BACKUP_ENABLED=0` explicitly.
 
-The exporter runs every minute and writes aggregate timestamps, queue counts, technical states and local service health to `/var/lib/librus-monitor/status.json`. It does not export message bodies or credentials. Failure/queue-age/backup alarms indicate health signals; they do not establish calendar accuracy or prove live writes succeeded.
+The exporter reads SQLite aggregates without initializing/migrating the DB and writes `/var/lib/librus-monitor/status.json`. Its closed schema includes `backup_enabled`; disabled backups produce no backup outage/staleness/failure alarms. Sync, queue, web, database and collector freshness alerts remain active. It never exports message bodies or credentials. If maintenance notifications are muted, preserve the prior silence rules, use a bounded Librus-only mute with guaranteed cleanup, and restore the exact previous rules afterward.
 
-## Diagnose problems and restore backups
+## Isolated development and evaluation
 
-Check `.venv/bin/python -m app.cli status`, `systemctl --user list-timers`, and `systemctl --user status librus-sync.service librus-web.service`. `journalctl --user -u librus-sync.service -n 50` shows recent worker logs. Treat status and logs as private; redact account identifiers before sharing. Compare last full success with last attempt, pending queues and unknown operations. A paused write state or completed timer invocation alone does not prove synchronization succeeded.
+The UI fixture uses temporary synthetic state and no accounts. Real-message evaluation requires an explicit private evaluation config and cases file outside Git:
 
-Run `.venv/bin/python -m app.cli backup` to create an integrity-checked private copy, or supply `backup --destination /PRIVATE/NEW-BACKUP.sqlite3`. Existing destination files are never overwritten. Check a selected backup with `sqlite3 /PRIVATE/BACKUP.sqlite3 'PRAGMA integrity_check;'`; the expected result is `ok`. This confirms SQLite integrity, not consistency with the current external calendar.
+```sh
+.venv/bin/python -m scripts.evaluate_analysis --config PRIVATE_EVAL_CONFIG PRIVATE_CASES_JSON
+```
 
-Before restoring, pause writes and stop the sync timer, worker, web service and backup timer. Preserve the current database **and its operation journal** as a separate checked copy. Restore only while no process can write the database; preserve ownership and mode 0600. Run `pause-writes` on the restored state before restarting services because the backup may contain enabled writes. Compare its event/operation evidence with the current calendar and reconcile unknown outcomes before resuming writes. Blindly rolling SQLite back after external writes can discard idempotency evidence and cause duplicate or conflicting calendar operations; a backup is not a calendar rollback.
+Evaluation does not discover production config, opens no state DB, invokes an explicitly read-only runtime, and emits a bounded report without message bodies, quotes, titles or model free text. Real analysis still sends supplied messages to the configured AI service. For other real-data development, select a separate private state path and port, use read-only calendar runtime permissions, and never point developer commands at production state. Offline tests and preparation isolate HOME and configuration; they must not access live Librus, credentials or calendar APIs.
 
-## Administrative commands
+## Diagnose and recover
 
-`reanalyze --message-id ID` previews selected cached messages with the analysis service; `--apply` replaces only untouched eligible proposals. It does not log into Librus or write the calendar. `metadata-refresh --event-id ID` previews branding/timestamp updates; `--apply` can update those existing external events. Both require explicit IDs and preserve the operation journal. Read [the application contract](../app/CONTRACT.md) before maintenance. Unknown outcomes require reconciliation, not blind retries or database rollback.
+Check installed package status through `$HOME/.local/lib/librus-calendar/current/.venv/bin/python -I -m app.cli status`, user service status/timers, private logs and the read-only monitoring aggregates. Redact private identifiers before sharing. Full success, attempts, pending queues and unknown operations have different meanings; a completed timer does not prove successful synchronization.
+
+Prefer forward recovery: stop new scheduled runs, let a writer finish, preserve the current DB and operation journal, prepare a reviewed fix SHA, and activate/verify it. A compatible prior packaged release can be selected only after checking it supports the current schema/journal: check out that reviewed previous SHA cleanly and use `activate --sha PREVIOUS_FULL_SHA`. Do not roll SQLite backward or create a safety backup automatically. Database rollback can discard idempotency evidence after external calendar writes. Keep writes paused until unknown outcomes are reconciled.
+
+## Decision migration, reconstruction and retention
+
+Quiesce the old sync timer and let its worker finish before changing state. Use the prepared release Python before switching `current`; the target must be distinct from the old database. Configure the target private state path and keep writes paused:
+
+```sh
+release_python="$HOME/.local/lib/librus-calendar/releases/FULL_SHA/.venv/bin/python"
+"$release_python" -I -m app.cli --config "$HOME/.config/librus-calendar/config.json" --state "$HOME/.local/share/librus-calendar/current.sqlite3" pause-writes
+"$release_python" -I -m app.cli --config "$HOME/.config/librus-calendar/config.json" --state "$HOME/.local/share/librus-calendar/current.sqlite3" migrate-decisions --from "$HOME/.local/share/librus-calendar/state.sqlite3"
+"$release_python" -I -m app.cli --config "$HOME/.config/librus-calendar/config.json" --state "$HOME/.local/share/librus-calendar/current.sqlite3" rebuild --days 30
+"$release_python" -I -m app.cli --config "$HOME/.config/librus-calendar/config.json" --state "$HOME/.local/share/librus-calendar/current.sqlite3" prune --days 30
+```
+
+Migration reads the old database directly with read-only SQLite and creates no copy/export. It requires matching bound calendar/owner and Librus account identity. Only for an explicitly reviewed unbound legacy source, append `--allow-legacy-binding`: the CLI first performs a read-only owner-access calendar probe and requires every transferred event's exact calendar to match. Arbitrary unbound sources are refused.
+
+Migration retains minimal human approval/edit/rejection choices, exact event IDs and ownership markers, conflict fingerprints, cancellation tombstones and unresolved operation evidence. It does not copy message bodies or bulk analysis history. Existing chosen event associations are not discarded. Inflight writes become unknown; preserve their original intent for reconciliation.
+
+`rebuild --days 30` scans all pages of recent Librus messages, retries cached fetch/analysis failures, discovers app-owned calendar candidates and reads exact transferred IDs. Its runtime permits calendar reads only; it never queues or executes calendar writes. It updates the target local database and can send message text to analysis. Foreign, missing, duplicate or ambiguous ownership requires review; partial/review results are not complete reconstruction. Days must be 1–30.
+
+`prune --days 30` previews content retention; append `--apply` only under the intended retention authorization. It clears old message bodies, analysis records, obsolete automatic proposals and unnecessary event/operation content. Minimal IDs, hashes, human decisions, ownership, conflict evidence, cancellation tombstones and every durable journal row remain. Unknown/inflight operation payload is retained in full; expired unexecuted work becomes review. In-place secure deletion and VACUUM remove freed content without making a backup. Preview and apply make zero calendar writes. Keep the old source only until the explicitly defined acceptance/cleanup point; deployment does not remove it automatically. See [the application contract](../app/CONTRACT.md).

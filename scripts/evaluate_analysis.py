@@ -92,14 +92,15 @@ def evaluate_cases(payload, runtime):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path)
+    parser.add_argument("--config", type=Path, help="Explicit private evaluation config; production config is never discovered")
     parser.add_argument("--binary", help="Explicit Codex executable on this host")
     args = parser.parse_args()
     try:
         if args.input.stat().st_size > 1_000_000:
             raise ValueError("input_too_large")
         payload = json.loads(args.input.read_text())
-        config = load_config()
-        runtime = CodexRuntime(replace(config, codex_binary=args.binary) if args.binary else config)
+        config = load_config(path=args.config or "")
+        runtime = CodexRuntime(replace(config, codex_binary=args.binary) if args.binary else config, read_only=True)
         result = evaluate_cases(payload, runtime)
     except (OSError, ValueError, TypeError):
         result = {"analysis_only": True, "passed": False, "error": "invalid_evaluation_input"}

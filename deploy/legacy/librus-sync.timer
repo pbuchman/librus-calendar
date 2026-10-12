@@ -1,0 +1,11 @@
+[Unit]
+Description=Check school messages hourly
+
+[Timer]
+OnCalendar=*-*-* *:00:00 Europe/Warsaw
+Persistent=true
+AccuracySec=1s
+Unit=librus-sync.service
+
+[Install]
+WantedBy=timers.target

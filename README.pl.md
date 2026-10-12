@@ -16,7 +16,7 @@ Wiadomości są pobierane **bezpośrednio z Librusa**. Powiadomienia Gmail nie s
 - Automatycznie kolejkuje jednoznaczne przyszłe wydarzenia szkolne, przypomnienia i terminy, gdy zapisy do kalendarza są włączone. Udział w dodatkowych zajęciach wymaga zatwierdzenia; niejasności, konflikty i odwołania trafiają do sprawdzenia.
 - Dodaje jeden prefiks `[Librus]` w tytule. Opis zawiera cytat źródłowy, znacznik własności i **czas rozpoczęcia synchronizacji** w Europe/Warsaw. Jest to czas przygotowania trwałej operacji, a nie potwierdzenie zakończenia zapisu w kalendarzu.
 - Zmienia wyłącznie własne wpisy w skonfigurowanym kalendarzu, nie wysyła zaproszeń i sprawdza wynik niepewnego zapisu przed ponowieniem.
-- Udostępnia prywatną skrzynkę przez Tailscale, synchronizację co godzinę przez systemd, codzienne kopie SQLite i opcjonalny monitoring Netdata.
+- Udostępnia prywatną skrzynkę przez Tailscale, synchronizację co godzinę przez systemd i opcjonalny monitoring Netdata.
 
 ## Uruchom lokalnie
 
@@ -56,7 +56,7 @@ To **nieoficjalna**, niezależna integracja, niezwiązana z Librusem, Google ani
 
 Treść wiadomości jest prywatna. Rzeczywista analiza przesyła przekazaną treść i kontekst zapisanych wydarzeń do skonfigurowanej usługi AI; zapis w Google Calendar przekazuje wybrane szczegóły wydarzeń i cytaty źródłowe. Przechowuj dane logowania, bazę i kopie poza repozytorium, z ograniczonymi uprawnieniami, a interfejs udostępniaj przez Tailscale wyłącznie właścicielowi. Zobacz [prywatność i granice działania](docs/architecture.pl.md).
 
-AI może błędnie zinterpretować daty i kontekst. Testy automatyczne oraz demo offline nie potwierdzają zgodności z Twoją szkołą, kontem Codex, Google Calendar ani działającym wdrożeniem. Kontroluj pierwsze wyniki i wykonuj kopie zapasowe.
+AI może błędnie zinterpretować daty i kontekst. Testy automatyczne oraz demo offline nie potwierdzają zgodności z Twoją szkołą, kontem Codex, Google Calendar ani działającym wdrożeniem. Kontroluj pierwsze wyniki i zachowuj dziennik operacji. Automatyczne kopie bazy są celowo wyłączone.
 
 ## Rozwój
 

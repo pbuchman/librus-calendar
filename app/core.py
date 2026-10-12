@@ -263,10 +263,15 @@ class AppStore:
             CREATE INDEX IF NOT EXISTS sync_runs_started ON sync_runs(started_at);
             CREATE TABLE IF NOT EXISTS analysis_audit(id TEXT PRIMARY KEY,message_id TEXT NOT NULL,source_hash TEXT NOT NULL,analyzed_at TEXT NOT NULL,mode TEXT NOT NULL,metadata TEXT NOT NULL,proposal_ids TEXT NOT NULL,superseded_ids TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS analysis_audit_message ON analysis_audit(message_id,analyzed_at);
+            CREATE TABLE IF NOT EXISTS decision_intents(id TEXT PRIMARY KEY,message_id TEXT NOT NULL,source_hash TEXT NOT NULL,payload TEXT NOT NULL,updated_at TEXT NOT NULL);
+            CREATE INDEX IF NOT EXISTS decision_intents_message ON decision_intents(message_id);
+            CREATE TABLE IF NOT EXISTS calendar_discovery_review(id TEXT PRIMARY KEY,reason TEXT NOT NULL,updated_at TEXT NOT NULL,blocking INTEGER NOT NULL DEFAULT 1);
             CREATE TABLE IF NOT EXISTS metadata_refresh(id TEXT PRIMARY KEY,event_id TEXT NOT NULL,version TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,result TEXT,last_error TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(event_id,version));
             ''')
             if 'state' not in {row[1] for row in self.db.execute('PRAGMA table_info(events)')}:
                 self.db.execute("ALTER TABLE events ADD COLUMN state TEXT NOT NULL DEFAULT 'active'")
+            if 'blocking' not in {row[1] for row in self.db.execute('PRAGMA table_info(calendar_discovery_review)')}:
+                self.db.execute('ALTER TABLE calendar_discovery_review ADD COLUMN blocking INTEGER NOT NULL DEFAULT 1')
             if 'discovered_at' not in {row[1] for row in self.db.execute('PRAGMA table_info(messages)')}:
                 self.db.execute('ALTER TABLE messages ADD COLUMN discovered_at TEXT')
             if 'pending_since' not in {row[1] for row in self.db.execute('PRAGMA table_info(messages)')}:
@@ -364,7 +369,7 @@ class AppStore:
 
     def list_messages(self, limit=100):
         with self.lock:
-            return [self._message(row) for row in self.db.execute('SELECT * FROM messages ORDER BY COALESCE(sent_at,fetched_at) DESC,id LIMIT ?', (min(max(int(limit), 1), 500),))]
+            return [self._message(row) for row in self.db.execute("SELECT * FROM messages WHERE status!='retained' ORDER BY COALESCE(sent_at,fetched_at) DESC,id LIMIT ?", (min(max(int(limit), 1), 500),))]
 
     def get_message(self, message_id):
         with self.lock:
@@ -462,6 +467,8 @@ class AppStore:
                         break
                     proposal_id = digest([proposal_id, 'replacement', retired['updated_at']])[:32]
             item.update(id=proposal_id, message_id=str(message_id))
+            from .data_admin import protect_decision
+            item = protect_decision(self, message, item)
             normalized.append(item)
         return normalized
 
@@ -623,6 +630,8 @@ class AppStore:
                 # An edited, definitely-unwritten operation can be rebuilt from the new proposal.
                 self.db.execute("DELETE FROM operations WHERE proposal_id=? AND status IN ('pending','review')", (row['id'],))
             self.db.execute('UPDATE proposals SET payload=?,status=?,updated_at=? WHERE id=?', (json.dumps(item, ensure_ascii=False), item['status'], utcnow(), row['id']))
+            from .data_admin import remember_decision
+            remember_decision(self, row, item, original=self._proposal(row))
             return item
 
     def set_writes_paused(self, paused):
@@ -646,7 +655,12 @@ class AppStore:
 
     def queue_operations(self, current=None):
         queued = []
+        discovery_unsafe = (self._setting('rebuild_status') in ('required', 'running', 'partial', 'interrupted')
+                            or self.db.execute('SELECT 1 FROM calendar_discovery_review WHERE blocking=1 LIMIT 1').fetchone())
         for item in self.list_proposals('pending', 500):
+            if discovery_unsafe:
+                self._review_unwritten(item, 'Calendar reconstruction is incomplete or ambiguous; no new write is permitted.')
+                continue
             try:
                 checked = normalize_proposal(item, current)
             except (ValueError, TypeError, OverflowError):
@@ -738,8 +752,33 @@ class AppStore:
         with self.lock, self.db:
             if self._setting('writes_paused', 'true') == 'true':
                 return False
-            cursor = self.db.execute("UPDATE operations SET status='inflight',attempts=attempts+1,updated_at=? WHERE id=? AND status='pending' AND EXISTS (SELECT 1 FROM proposals p WHERE p.id=operations.proposal_id AND p.status='pending')", (utcnow(), operation_id))
+            cursor = self.db.execute("""UPDATE operations SET status='inflight',attempts=attempts+1,updated_at=?
+                WHERE id=? AND status='pending'
+                AND EXISTS (SELECT 1 FROM proposals p WHERE p.id=operations.proposal_id AND p.status='pending')
+                AND NOT EXISTS (SELECT 1 FROM settings WHERE key='rebuild_status' AND value IN ('required','running','partial','interrupted'))
+                AND NOT EXISTS (SELECT 1 FROM calendar_discovery_review WHERE blocking=1)""", (utcnow(), operation_id))
             return bool(cursor.rowcount)
+
+    def hydrate_cancel_operation(self, operation_id, snapshot):
+        """Freeze the verified full pre-delete snapshot before claiming a write."""
+        from .codex_runtime import event_fingerprint
+        with self.lock, self.db:
+            row = self.db.execute('SELECT * FROM operations WHERE id=?', (operation_id,)).fetchone()
+            prior_result = json.loads(row['result']) if row and row['result'] else {}
+            if not row or row['status'] != 'pending' or row['attempts'] != 0 or (prior_result and prior_result.get('status') != 'failed'):
+                raise ValueError('Only an untouched cancellation intent may be hydrated.')
+            operation = json.loads(row['payload'])
+            marker = operation.get('prior_marker')
+            if (operation.get('action') != 'cancel' or not isinstance(snapshot, dict)
+                    or snapshot.get('id') != operation.get('event_id') or snapshot.get('status') == 'cancelled'
+                    or not contains_marker(snapshot.get('description'), marker)
+                    or has_external_attendees(snapshot, self.config.calendar_owner)
+                    or event_fingerprint(snapshot, self.config.calendar_owner) != operation.get('expected_fingerprint')):
+                raise ValueError('Cancellation hydration lacks the exact unchanged owned baseline.')
+            operation.update(prior_snapshot=snapshot, prior_fingerprint=operation['expected_fingerprint'])
+            self.db.execute('UPDATE operations SET payload=?,updated_at=? WHERE id=?',
+                            (json.dumps(operation, ensure_ascii=False), utcnow(), operation_id))
+            return operation
 
     def record_result(self, operation_id, result):
         if not isinstance(result, dict) or result.get('status') not in ('applied','review','unknown','failed'):
@@ -775,6 +814,10 @@ class AppStore:
                 self.db.execute('INSERT INTO events(id,calendar_id,message_id,proposal_id,snapshot,fingerprint,marker,updated_at,state) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET proposal_id=excluded.proposal_id,snapshot=excluded.snapshot,fingerprint=excluded.fingerprint,marker=excluded.marker,updated_at=excluded.updated_at,state=excluded.state',
                                 (str(result['event_id']), self.calendar_id, operation['message_id'], operation['proposal_id'], json.dumps(snapshot, ensure_ascii=False), result.get('fingerprint') or digest(snapshot), owned_marker, utcnow(), 'cancelled' if operation['action'] == 'cancel' else 'active'))
                 self.db.execute("UPDATE proposals SET status='applied',updated_at=? WHERE id=?", (utcnow(), operation['proposal_id']))
+                decision_row = self.db.execute('SELECT * FROM proposals WHERE id=?', (operation['proposal_id'],)).fetchone()
+                if decision_row:
+                    from .data_admin import remember_decision
+                    remember_decision(self, decision_row, self._proposal(decision_row))
             elif status == 'review':
                 proposal_row = self.db.execute('SELECT payload FROM proposals WHERE id=?', (operation['proposal_id'],)).fetchone()
                 if proposal_row:

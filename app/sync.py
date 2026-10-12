@@ -185,6 +185,8 @@ class SyncController:
                     if not isinstance(probe, dict) or probe.get('calendar_id') != self.store.calendar_id or probe.get('access_role') not in ('owner', 'writer'):
                         raise ValueError('Calendar write access was not verified.')
                     result = self._run(dry_run, current)
+                    from .data_admin import prune_state
+                    result['retention'] = prune_state(self.store, days=self.history_days, apply=True, current=current)
             except SyncInterrupted as error:
                 result = {'status': 'interrupted', 'error_code': error.code}
                 self.store.recover_interrupted()
@@ -325,6 +327,20 @@ class SyncController:
             if not self.store.status()['writes_paused']:
                 self._stage('write')
                 for operation in self.store.pending_operations(self.max_messages):
+                    if operation.get('action') == 'cancel' and (operation.get('prior_snapshot') or {}).get('_content_pruned'):
+                        from .codex_runtime import event_fingerprint
+                        try:
+                            snapshot = self.runtime.read_event(operation['event_id'], operation['prior_snapshot'])
+                            if event_fingerprint(snapshot, self.store.config.calendar_owner) != operation.get('expected_fingerprint'):
+                                self.store.record_result(operation['operation_id'], {'status': 'review', 'error': 'manual_edit_conflict',
+                                    'event_id': snapshot.get('id'), 'snapshot': snapshot,
+                                    'fingerprint': event_fingerprint(snapshot, self.store.config.calendar_owner)})
+                                result['operations_review'] += 1
+                                continue
+                            operation = self.store.hydrate_cancel_operation(operation['operation_id'], snapshot)
+                        except Exception:
+                            self.store.record_result(operation['operation_id'], {'status': 'failed', 'error': 'Cancellation baseline could not be verified; no write attempted.'})
+                            continue
                     if not self.store.claim_operation(operation['operation_id']):
                         continue
                     try:

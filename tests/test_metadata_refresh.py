@@ -98,6 +98,61 @@ class MetadataRefreshTests(unittest.TestCase):
     def journal(self, event_id='existing-0'):
         return self.store.db.execute('SELECT * FROM metadata_refresh WHERE event_id=?', (event_id,)).fetchone()
 
+    def test_compact_snapshot_hydrates_verified_remote_description_before_refresh(self):
+        from app.data_admin import minimal_snapshot
+        eid = 'existing-0'
+        compact = minimal_snapshot(self.originals[eid], self.markers[eid])
+        self.store.db.execute('UPDATE events SET snapshot=? WHERE id=?', (json.dumps(compact), eid))
+        self.store.db.commit()
+        preview = self.controller.run([eid])
+        self.assertEqual(preview['status'], 'preview')
+        self.assertGreater(len(self.runtime.reads), 0)
+        self.assertEqual(self.runtime.writes, [])
+        applied = self.controller.run([eid], apply=True)
+        self.assertEqual(applied['status'], 'applied')
+        self.assertIn('Original teacher source', self.runtime.events[eid]['description'])
+
+    def test_compact_snapshot_hydration_refuses_changed_remote_baseline(self):
+        from app.data_admin import minimal_snapshot
+        eid = 'existing-0'
+        self.store.db.execute('UPDATE events SET snapshot=? WHERE id=?',
+            (json.dumps(minimal_snapshot(self.originals[eid], self.markers[eid])), eid))
+        self.store.db.commit()
+        self.runtime.events[eid]['description'] = 'A preserved manual edit\n' + self.markers[eid]
+        result = self.controller.run([eid], apply=True)
+        self.assertEqual(result['status'], 'refused')
+        self.assertEqual(self.runtime.writes, [])
+
+    def test_compact_snapshot_uses_immutable_uncertain_journal_for_reconciliation(self):
+        from app.data_admin import minimal_snapshot
+        eid = 'existing-0'
+        self.runtime.failure = 'unknown_after_write'
+        first = self.controller.run([eid], apply=True)
+        self.assertEqual(first['status'], 'partial')
+        self.assertEqual(self.journal(eid)['status'], 'unknown')
+        self.store.db.execute('UPDATE events SET snapshot=? WHERE id=?',
+            (json.dumps(minimal_snapshot(self.originals[eid], self.markers[eid])), eid))
+        self.store.db.commit()
+        self.runtime.failure = None
+        second = self.controller.run([eid], apply=True)
+        self.assertEqual(second['status'], 'applied')
+        self.assertEqual(second['calendar_writes'], 0)
+        self.assertEqual(len(self.runtime.writes), 1)
+
+    def test_repeat_refresh_of_retained_settled_journal_never_reissues_write(self):
+        from datetime import timedelta
+        from app.data_admin import prune_state
+        eid = 'existing-0'
+        self.assertEqual(self.controller.run([eid], apply=True)['status'], 'applied')
+        self.store.db.execute('UPDATE messages SET sent_at=? WHERE id=?', ((NOW - timedelta(days=31)).isoformat(), '0'))
+        self.store.db.commit()
+        prune_state(self.store, apply=True, current=NOW)
+        self.assertNotIn('Original teacher source', self.journal(eid)['payload'] + self.journal(eid)['result'])
+        repeated = self.controller.run([eid], apply=True)
+        self.assertEqual(repeated['status'], 'applied')
+        self.assertEqual(repeated['calendar_writes'], 0)
+        self.assertEqual(len(self.runtime.writes), 1)
+
     def test_preview_four_targets_never_initializes_runtime_or_writes(self):
         before = [tuple(row) for row in self.store.db.execute('SELECT * FROM events')]
         controller = MetadataRefreshController(self.store, runtime_factory=lambda: self.fail('Preview must not initialize Calendar.'))

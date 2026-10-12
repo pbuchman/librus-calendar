@@ -1,100 +1,64 @@
-# Konfiguracja własnej instancji
+# Konfiguracja i wdrożenie
 
-[English](setup.md) · [README](../README.pl.md)
+[English / pełny opis operacyjny](setup.md)
 
-[Demo offline](demo.pl.md) pozwala najszybciej zobaczyć interfejs. Poniższe kroki uruchamiają dostęp do rzeczywistych kont i nie są wykonywane przez demo.
+Wymagane są Python 3.12+, konto Librus, uwierzytelniony Codex CLI z dostępnymi modelami oraz połączony Google Calendar z zapisem do wskazanego kalendarza. Modele i identyfikator konektora zależą od konta. Przykłady są fikcyjne.
 
-## Wymagania
+Prywatne `config.json`, `credentials.json`, `web.env` i `monitor.env` przechowuj w `$HOME/.config/librus-calendar`, w katalogu 0700 i plikach 0600. Baza pozostaje w `$HOME/.local/share/librus-calendar`. `deploy/config.json.example` dokumentuje ustawienia. Ustaw dokładny kalendarz, właściciela, konektor, właściciela Tailscale i dozwolony host; produkcyjne `allow_local` ma pozostać `false`. Automatyczne kopie bazy są celowo wyłączone przez `backup_enabled=false`. Nigdy nie zapisuj haseł w argumentach poleceń ani repozytorium.
 
-- Python 3.12+, osobne środowisko wirtualne i wersje bibliotek z `requirements.txt`.
-- Konto Librus Synergia z dostępem do wymaganych wiadomości.
-- Zalogowany Codex CLI na komputerze wykonującym synchronizację, obsługujący opcje używane w `app/codex_runtime.py`. Kod uruchamia `codex exec` z odizolowanymi instrukcjami i ściśle wybranymi narzędziami; nie każde wydanie CLI lub konto obsługuje tę kombinację.
-- Połączenie Google Calendar dostępne dla tego samego konta Codex i środowiska, udostępniające obsługiwane narzędzia listy, wyszukiwania, odczytu, tworzenia, aktualizacji i usuwania. Dokładny identyfikator konektora trzeba skonfigurować dla własnej instalacji.
-- Uprawnienia writer lub owner do dokładnie wskazanego kalendarza. `calendar_owner` oznacza zweryfikowany główny e-mail zalogowanego właściciela, a nie identyfikator dodatkowego kalendarza.
-- Do działania w tle: Linux z usługami użytkownika systemd, Tailscale Serve z zaufanymi nagłówkami tożsamości i opcjonalnie kolektor Python Netdata.
-
-Przykładowe modele to `gpt-6.1-sol`/`high` do analizy i `gpt-6-luna`/`medium` do narzędzi kalendarza. Są to wartości domyślne kodu, a nie gwarancja dostępności. Wybierz model i poziom rozumowania obsługiwany przez własne środowisko; repozytorium nie tworzy ani nie nadaje połączenia konektora.
-
-## Prywatna konfiguracja
-
-Użyj `deploy/config.json.example` jako wzoru dla `~/.config/librus-calendar/config.json`. Każdy dostarczony plik JSON musi być zwykłym plikiem należącym do użytkownika, z uprawnieniami **0600**, w prywatnym katalogu. Konfiguracja i hasła pozostają poza repozytorium. Zastąp wszystkie fikcyjne wartości przed rzeczywistą synchronizacją.
-
-| Pole | Znaczenie |
-| --- | --- |
-| `calendar_id` | Dokładny identyfikator Google Calendar, również dodatkowego kalendarza |
-| `calendar_owner` | Zweryfikowany główny e-mail zalogowanego właściciela; kontrola bezpieczeństwa uczestników |
-| `calendar_connector` | Identyfikator `connector_...` połączonej aplikacji |
-| `tailscale_owner` | Jedyna dozwolona tożsamość logowania Tailscale |
-| `allowed_hosts` | Dokładny host Tailscale i port; bez wieloznaczników |
-| `allow_local` | Dla prywatnego interfejsu produkcyjnego pozostaw `false` |
-| `state_path`, `credentials_path` | Prywatne lokalizacje bazy i danych logowania; domyślnie w katalogu domowym |
-| `codex_binary` | Ścieżka programu lub `codex` dostępny w PATH usługi |
-| `analysis_model`, `analysis_effort` | Model analizy i obsługiwany poziom rozumowania |
-| `tool_model`, `tool_effort` | Model narzędzi kalendarza i obsługiwany poziom rozumowania |
-| `timeout` | Limit pojedynczego wywołania środowiska w sekundach: 1–300 |
-| `monitor_url`, `monitor_output` | Opcjonalny lokalny endpoint stanu i plik zbiorczych danych monitoringu |
-
-`LIBRUS_CONFIG_FILE` wskazuje inny plik JSON; jawnie wskazany brakujący plik powoduje błąd. Puste `LIBRUS_CONFIG_FILE` wyłącza odszukiwanie JSON. `LIBRUS_<POLE_WIELKIMI_LITERAMI>` nadpisuje pole, np. `LIBRUS_CALENDAR_ID`, `LIBRUS_CODEX_BINARY`, `LIBRUS_ANALYSIS_MODEL`. `LIBRUS_ALLOWED_HOSTS` jest listą rozdzieloną przecinkami, a `LIBRUS_ALLOW_LOCAL` przyjmuje `0` lub `1`. Nieznane pola JSON i błędne ustawienia są odrzucane. Nie ma domyślnych danych osobistego konta.
-
-Utwórz plik danych logowania w chronionym edytorze, w postaci:
-
-```json
-{"login": "YOUR_LIBRUS_LOGIN", "password": "<YOUR_LIBRUS_PASSWORD>"}
-```
-
-Użyj prywatnej ścieżki `credentials_path` i uprawnień 0600. Nie umieszczaj hasła w argumencie polecenia, historii powłoki, repozytorium ani na zrzucie ekranu. `scripts/import_credentials.py` jest opcjonalnym narzędziem migracji istniejącego pliku tymczasowego `login hasło`, należącego do użytkownika: sprawdza chroniony plik docelowy przed usunięciem źródła i nie loguje danych logowania.
-
-## Sprawdź przed włączeniem zapisów
-
-Uruchom z repozytorium, używając Pythona ze środowiska wirtualnego:
+Kod produkcyjny jest instalowany jako pakiet w `$HOME/.local/lib/librus-calendar/releases/FULL_SHA/.venv`. Dowiązanie `current` wybiera wersję. Checkout do rozwoju jest osobny; Każde polecenie uruchamiane Pythonem pakietu, także ręczne status/sync i administracja, musi zawierać `-I`: katalog roboczy, odziedziczony PYTHONPATH i user site nie mogą zastąpić kodu wdrożenia. Jednostki systemd wymuszają `-I`.
 
 ```sh
-.venv/bin/python -m app.cli status
-.venv/bin/python -m scripts.probe_runtime
-.venv/bin/python -m app.cli sync --dry-run
+.venv/bin/python -m pip install -r requirements.lock
+.venv/bin/python scripts/deploy.py prepare --sha FULL_SHA
 ```
 
-Test środowiska wykonuje **rzeczywisty odczyt kalendarza** i sprawdza dostęp do wskazanego kalendarza. Dry-run może pobierać prywatne wiadomości Librusa i wysyłać je do usługi analizy; pomija zapisy. Nie działa offline. Sprawdź lokalne propozycje i kolejkę decyzji. Nowa baza ma początkowo wstrzymane zapisy. Po sprawdzeniu konta, wiadomości źródłowych, dat, modelu i działania konektora:
+`FULL_SHA` oznacza pełny, sprawdzony SHA zgodny z HEAD czystego checkoutu i osiągalny z lokalnego, wcześniej pobranego `origin/main`. Przygotowanie sprawdza prywatność źródeł i historii, uruchamia testy offline w izolowanym katalogu domowym, buduje pakiet, instaluje zależności i sprawdza zasoby poza checkoutem. Manifest wiąże SHA z plikami wdrożenia i zainstalowaną aplikacją. Nie zatrzymuje usług, nie czyta bazy produkcyjnej i nie robi jej kopii.
 
 ```sh
-.venv/bin/python -m app.cli pause-writes --resume
-.venv/bin/python -m app.cli sync
+.venv/bin/python scripts/deploy.py activate --sha FULL_SHA
+.venv/bin/python scripts/deploy.py verify
 ```
 
-Aby ponownie wstrzymać zapisy, uruchom `pause-writes` bez `--resume`. Nie zatrzymuje to pobierania ani analizy. CLI obsługuje również `--state PATH` przed podpoleceniem, `sync --credentials PATH --limit N` (1–100) i `backup --destination PATH`. Prywatna konfiguracja nadal obowiązuje, chyba że zastąpią ją jawne ustawienia środowiska.
+Aktywacja najpierw zatrzymuje timer nowych synchronizacji. Jeśli pracuje proces zapisujący kalendarz, odmawia przełączenia; nigdy go nie zabija. Spróbuj ponownie po zakończeniu. Wszystkie kontrole odbywają się przed zmianami. Odmowa obejmuje inne istniejące jednostki, dowiązania i nakładki systemd. Instalator zachowuje istniejące ustawienia prywatne.
 
-## Usługi Linux i prywatny dostęp WWW
-
-Dostarczone jednostki zakładają katalog **`~/librus-calendar`** i środowisko wirtualne wewnątrz niego. Uruchom tam `bash scripts/install_linux.sh`. Instalator kopiuje jednostki synchronizacji, WWW i backupu oraz przykłady konfiguracji, odmawia nadpisania innych istniejących jednostek i **nie uruchamia usług**. Przygotuj właściwe `config.json`, `credentials.json` i `web.env` w `~/.config/librus-calendar`. Ustaw dokładną ścieżkę Codex w `codex_binary`; PATH systemd może być inny niż w interaktywnej powłoce.
-
-`web.env` określa dokładne `LIBRUS_TAILSCALE_OWNER`, `LIBRUS_ALLOWED_HOSTS` oraz `LIBRUS_ALLOW_LOCAL=0`. Serwer WWW nasłuchuje tylko na `127.0.0.1:8795`, ignoruje przekazane adresy klienta i ufa wyłącznie lokalnemu proxy Tailscale z właściwą tożsamością właściciela. Nie udostępniaj portu przez publiczne proxy ani Tailscale Funnel. Konfiguracja ACL i dostępu do konta Tailscale należy do administratora instancji.
-
-Po skonfigurowaniu i sprawdzeniu instancji ustaw Tailscale Serve i włącz jednostki:
+Pierwsza, jawnie zatwierdzona migracja znanych starych jednostek może użyć:
 
 ```sh
-tailscale serve --bg --https=8445 --yes http://127.0.0.1:8795
-systemctl --user enable --now librus-web.service librus-sync.timer librus-backup.timer
-systemctl --user list-timers
+.venv/bin/python scripts/deploy.py activate --sha FULL_SHA --migrate-legacy --no-sync
+.venv/bin/python scripts/deploy.py verify --no-sync
 ```
 
-Synchronizacja działa o każdej pełnej godzinie Europe/Warsaw; harmonogram nadrabia pominięte uruchomienia. Cały proces ma limit 45 minut. Backup wykonywany jest codziennie o 03:15 Europe/Warsaw. Domyślna retencja obejmuje siedem najnowszych kopii; każda przechodzi kontrolę integralności SQLite. Kopie zawierają prywatne wiadomości i szczegóły wydarzeń. W razie potrzeby zapewnij ochronę hosta, szyfrowanie, kopię zewnętrzną i trwałość sesji użytkownika systemd.
+`--no-sync` uruchamia WWW i monitoring, pozostawiając synchronizację wyłączoną do odbioru pierwszego przebiegu. Po odbiorze włącz `librus-sync.timer` i wykonaj zwykłe `verify`. Tylko ta jawna migracja usuwa stare jednostki backupu. Instalator i wdrożenie nie kopiują SQLite. `bash scripts/install_linux.sh --sha FULL_SHA` instaluje same jednostki bez startu usług.
 
-## Opcjonalny monitoring Netdata
+WWW nasłuchuje wyłącznie na `127.0.0.1:8795`; zachowaj prywatną trasę Tailscale Serve HTTPS 8445 i wszystkie inne trasy. Nigdy nie włączaj Funnel. Timer synchronizacji działa co pełną godzinę w Europe/Warsaw i ogranicza cały przebieg do 45 minut. Monitoring działa co minutę.
 
-`deploy/install-librus-monitor.sh APP_USER` instaluje kolektor i reguły zdrowia jako root; wymaga istniejącej grupy `netdata` i katalogu kolektora Python. Nie restartuje Netdata ani nie włącza monitora użytkownika. Przeczytaj skrypt przed uruchomieniem z prawami administratora.
+Instalator root `deploy/install-librus-monitor.sh APP_USER` kopiuje wyłącznie kontrolowane pliki Netdata. `--migrate-legacy` dopuszcza tylko znane skróty poprzednich plików; późniejsze aktualizacje korzystają z rejestru skrótów należącego do root. Instalator nie restartuje Netdata. Zmiana kolektora Python wymaga kontrolowanego restartu odpowiedniego procesu, a nie tylko przeładowania reguł zdrowia.
 
-Skopiuj usługę i timer monitora do katalogu jednostek użytkownika aplikacji, a `deploy/monitor.env.example` do jego `~/.config/librus-calendar/monitor.env`, z uprawnieniami 0600. Zastąp fikcyjną tożsamość i host Tailscale wartościami używanymi przez proxy WWW. Pozostaw puste `LIBRUS_CONFIG_FILE=`: monitor eksportuje zbiorczy stan bazy w trybie odczytu i nie ma dostępu do prywatnych katalogów konfiguracji oraz danych logowania. Włącz `librus-monitor.timer`, a następnie przeładuj Netdata metodą właściwą dla swojej instalacji.
+`monitor.env` musi zawierać pusty `LIBRUS_CONFIG_FILE=`, `LIBRUS_BACKUP_ENABLED=0` oraz ten sam `LIBRUS_STATE_PATH`, właściciela i host co konfiguracja WWW. Systemd nie rozwija `$HOME` w tym pliku: użyj prywatnej ścieżki bezwzględnej albo `~`. Monitoring nie ma dostępu do prywatnego katalogu konfiguracji. Eksportuje tylko zbiorcze, odczytane bez zmian czasy, liczniki i stany. Celowo wyłączony backup nie zgłasza alarmów; błędy synchronizacji, WWW, bazy i świeżości kolektora nadal są widoczne. Wyciszenie konserwacyjne ma być ograniczone czasowo i przywracać dokładnie wcześniejsze reguły.
 
-Eksporter działa co minutę i zapisuje zbiorcze czasy, liczby elementów kolejek, stany techniczne i zdrowie lokalnych usług do `/var/lib/librus-monitor/status.json`. Nie eksportuje treści wiadomości ani haseł. Alarmy błędów, wieku kolejki i backupów informują o stanie technicznym; nie potwierdzają poprawności kalendarza ani skuteczności rzeczywistych zapisów.
+Demo `scripts/ui_fixture.py --port 8796` korzysta wyłącznie z fikcyjnych danych i tymczasowej bazy. Ocenę prawdziwych wiadomości wykonuj na prywatnym pliku poza Git:
 
-## Diagnoza problemów i odtwarzanie kopii
+```sh
+.venv/bin/python -m scripts.evaluate_analysis --config PRIVATE_EVAL_CONFIG PRIVATE_CASES_JSON
+```
 
-Sprawdź `.venv/bin/python -m app.cli status`, `systemctl --user list-timers` oraz `systemctl --user status librus-sync.service librus-web.service`. `journalctl --user -u librus-sync.service -n 50` pokazuje ostatnie logi procesu. Traktuj status i logi jako prywatne; usuń identyfikatory kont przed udostępnieniem. Porównaj ostatni pełny sukces z ostatnią próbą, zaległościami i niepewnymi operacjami. Samo wstrzymanie zapisów lub zakończenie timera nie dowodzi skutecznej synchronizacji.
+Ocenianie nie odkrywa konfiguracji produkcyjnej, nie otwiera bazy i wymusza runtime tylko do odczytu. Treść trafia do skonfigurowanej usługi AI. Pozostałe narzędzia rozwojowe muszą mieć odrębny stan i port, bez dostępu do produkcyjnej bazy i zapisu w kalendarzu.
 
-Uruchom `.venv/bin/python -m app.cli backup`, aby wykonać prywatną kopię z kontrolą integralności, albo wskaż `backup --destination /PRIVATE/NEW-BACKUP.sqlite3`. Istniejące pliki docelowe nie są nadpisywane. Sprawdź wybraną kopię przez `sqlite3 /PRIVATE/BACKUP.sqlite3 'PRAGMA integrity_check;'`; oczekiwany wynik to `ok`. Potwierdza to integralność SQLite, a nie zgodność z aktualnym zewnętrznym kalendarzem.
+Naprawiaj przez nową, sprawdzoną wersję kodu i zachowanie bieżącej bazy wraz z dziennikiem operacji. Powrót do poprzedniego pakietu jest możliwy tylko przy zgodności ze schematem i dziennikiem: wybierz czysty checkout poprzedniego SHA i użyj `activate --sha PREVIOUS_FULL_SHA`. Nie przywracaj starego SQLite; utrata dowodów wykonanych operacji może spowodować duplikaty w zewnętrznym kalendarzu. Najpierw rozstrzygnij niepewne wyniki, potem wznów zapisy.
 
-Przed odtworzeniem wstrzymaj zapisy i zatrzymaj timer synchronizacji, proces, usługę WWW oraz timer backupu. Zachowaj aktualną bazę **wraz z dziennikiem operacji** jako osobną sprawdzoną kopię. Odtwarzaj tylko wtedy, gdy żaden proces nie może zapisywać bazy; zachowaj właściciela i uprawnienia 0600. Przed uruchomieniem usług wykonaj `pause-writes` na odtworzonej bazie, ponieważ kopia mogła zawierać włączone zapisy. Porównaj ślady wydarzeń i operacji z bieżącym kalendarzem oraz sprawdź niepewne wyniki przed wznowieniem zapisów. Cofnięcie SQLite w ciemno po zewnętrznych zapisach może usunąć dowody zapobiegające duplikatom i spowodować powtórzenia lub konflikty; odtworzenie bazy nie cofa kalendarza.
+Migrację wykonuj Pythonem przygotowanego pakietu przed aktywacją. Zatrzymaj stare nowe przebiegi i poczekaj na zakończenie pracującego procesu. Docelowa baza musi być inna niż źródłowa i mieć wstrzymane zapisy:
 
-## Polecenia administracyjne
+```sh
+release_python="$HOME/.local/lib/librus-calendar/releases/FULL_SHA/.venv/bin/python"
+"$release_python" -I -m app.cli --config "$HOME/.config/librus-calendar/config.json" --state "$HOME/.local/share/librus-calendar/current.sqlite3" pause-writes
+"$release_python" -I -m app.cli --config "$HOME/.config/librus-calendar/config.json" --state "$HOME/.local/share/librus-calendar/current.sqlite3" migrate-decisions --from "$HOME/.local/share/librus-calendar/state.sqlite3"
+"$release_python" -I -m app.cli --config "$HOME/.config/librus-calendar/config.json" --state "$HOME/.local/share/librus-calendar/current.sqlite3" rebuild --days 30
+"$release_python" -I -m app.cli --config "$HOME/.config/librus-calendar/config.json" --state "$HOME/.local/share/librus-calendar/current.sqlite3" prune --days 30
+```
 
-`reanalyze --message-id ID` podgląda wynik ponownej analizy wskazanych lokalnych wiadomości; `--apply` zastępuje tylko nietknięte, kwalifikujące się propozycje. Nie loguje się do Librusa i nie zapisuje kalendarza. `metadata-refresh --event-id ID` podgląda zmianę prefiksu i czasu synchronizacji; `--apply` może aktualizować wskazane istniejące wydarzenia zewnętrzne. Oba wymagają jawnych identyfikatorów i zachowują dziennik operacji. Przed obsługą przeczytaj [kontrakt aplikacji](../app/CONTRACT.md). Niepewny wynik wymaga sprawdzenia, a nie ponawiania w ciemno czy cofania bazy.
+`migrate-decisions` odczytuje źródło bezpośrednio i tylko do odczytu; nie kopiuje bazy ani treści wiadomości. Zachowuje minimalne decyzje człowieka, dokładne ID wydarzeń, własność, tombstones anulowań i nierozstrzygnięte operacje. Tożsamość konta Librus i powiązany właściciel/kalendarz muszą być zgodne. Wyłącznie dla jawnie sprawdzonej starej bazy bez powiązania dodaj `--allow-legacy-binding`; wymaga to odczytowej kontroli dostępu właściciela w kalendarzu i zgodnego kalendarza każdego zapisanego wydarzenia.
+
+`rebuild --days 30` przegląda wszystkie strony wiadomości z wybranego okresu, ponawia błędy pobierania/analizy oraz czyta odkryte i przeniesione ID wydarzeń. Wymusza kalendarz tylko do odczytu: nigdy nie kolejkuje ani nie wykonuje zapisów. Zmienia lokalny stan docelowy i przesyła wiadomości do analizy. Brakujące, obce lub niejednoznaczne własności wymagają przeglądu; wyniki partial/review nie oznaczają pełnej odbudowy. Dopuszczalny okres wynosi 1–30 dni.
+
+`prune --days 30` pokazuje podgląd. Dopiero `--apply` usuwa stare treści wiadomości, audyt analizy i zbędne treści wydarzeń/operacji. Zachowuje minimalne ID, skróty, decyzje, własność, dowody konfliktów, tombstones oraz wszystkie wiersze dziennika. Pełne intencje unknown/inflight pozostają do rozstrzygnięcia; przedawnione niewykonane operacje przechodzą do przeglądu. Secure delete i VACUUM działają w miejscu, bez backupu. Pruning nie zmienia zewnętrznego kalendarza. Starą bazę usuń wyłącznie w jawnie określonym punkcie odbioru; skrypt wdrożenia jej nie usuwa. Szczegóły: [kontrakt aplikacji](../app/CONTRACT.md).

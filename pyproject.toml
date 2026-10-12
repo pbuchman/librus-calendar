@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools==80.9.0", "wheel==0.45.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "librus-calendar"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "requests==2.34.2", "fastapi==0.142.4", "uvicorn==0.54.0",
+  "Jinja2==3.1.6", "python-multipart==0.0.32", "jsonschema==4.26.0", "httpx==0.28.1",
+]
+
+[tool.setuptools]
+packages = ["app"]
+
+[tool.setuptools.package-data]
+app = ["templates/*.html", "static/*.css", "schemas/*.json", "schemas/*.md"]

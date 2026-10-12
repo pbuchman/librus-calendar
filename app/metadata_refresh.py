@@ -43,6 +43,27 @@ class MetadataRefreshController:
             raise ValueError('Metadata refresh requires an active event on the allowed calendar.')
         snapshot = json.loads(row['snapshot'])
         marker = row['marker']
+        if snapshot.get('_content_pruned'):
+            # Retention keeps the original remote conflict fingerprint, not the
+            # compact projection's hash. Read before planning a metadata write so
+            # source descriptions and manual Calendar edits are never overwritten.
+            journal = self._journal(event_id)
+            intent = json.loads(journal['payload']) if journal else {}
+            prior = intent.get('prior_snapshot')
+            if journal and journal['status'] in ('pending','inflight','unknown','review') and isinstance(prior, dict):
+                # Immutable uncertain journals already contain the exact original
+                # preimage. A changed live event may be the prior write succeeding;
+                # execution must reconcile it against the journal's desired state.
+                snapshot = prior
+            else:
+                if self.runtime is None and self.runtime_factory is not None:
+                    self.runtime = self.runtime_factory()
+                if self.runtime is None:
+                    raise ValueError('A read-only Calendar verification is required for compact event state.')
+                try:
+                    snapshot = self.runtime.read_event(event_id, snapshot)
+                except Exception:
+                    raise ValueError('Could not verify the current Calendar event; no metadata write permitted.') from None
         if (snapshot.get('id') != event_id or not re.fullmatch(r'librus-calendar:[A-Za-z0-9_-]{8,128}', marker)
                 or not contains_marker(snapshot.get('description'), marker) or has_external_attendees(snapshot, self.store.config.calendar_owner)
                 or snapshot.get('recurrence') or event_fingerprint(snapshot, owner_email=self.store.config.calendar_owner) != row['fingerprint']):
@@ -115,6 +136,7 @@ class MetadataRefreshController:
                     # Preserve readonly/private fields omitted by the connector's
                     # projection; replace writable aliases with verified values.
                     merged = {**prior, **snapshot, **operation['event']}
+                    merged.pop('_content_pruned', None)
                     if event_fingerprint(merged, owner_email=self.store.config.calendar_owner) != outcome['fingerprint']:
                         outcome, status = {'status': 'review', 'error': 'Verified metadata snapshot conflicts with preserved event fields.'}, 'review'
                     else:
@@ -138,6 +160,8 @@ class MetadataRefreshController:
                 event = self._event(event_id)
                 journal = self._journal(event_id)
                 operation = json.loads(journal['payload']) if journal else self._prepare(event, stamp)
+                if journal and journal['status'] == 'applied' and 'event' not in operation:
+                    operation = {**operation, 'event': event['snapshot']}
                 plans.append((event, journal, operation))
                 result['events'].append({'event_id': event_id, 'status': journal['status'] if journal else 'planned',
                     'title_before': event['snapshot'].get('summary', event['snapshot'].get('title')),

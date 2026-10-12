@@ -23,6 +23,7 @@ class AppConfig:
     tailscale_owner: str = ''
     allowed_hosts: tuple[str, ...] = ()
     allow_local: bool = False
+    backup_enabled: bool = False
     state_path: Path = Path('~/.local/share/librus-calendar/state.sqlite3')
     credentials_path: Path = Path('~/.config/librus-calendar/credentials.json')
     codex_binary: str = 'codex'
@@ -53,6 +54,8 @@ class AppConfig:
             raise ConfigurationError('invalid_reasoning_effort')
         if type(self.timeout) is not int or not 1 <= self.timeout <= 300:
             raise ConfigurationError('invalid_timeout')
+        if type(self.backup_enabled) is not bool:
+            raise ConfigurationError('invalid_backup_enabled')
         if type(self.allow_local) is not bool or not isinstance(self.allowed_hosts, (tuple, list)):
             raise ConfigurationError('invalid_web_configuration')
         for host in self.allowed_hosts:
@@ -120,9 +123,9 @@ def load_config(path=None, *, environ: Mapping[str, str] | None = None):
         value = env[key]
         if name == 'allowed_hosts':
             value = tuple(item.strip() for item in value.split(',') if item.strip())
-        elif name == 'allow_local':
+        elif name in {'allow_local', 'backup_enabled'}:
             if value not in {'0', '1'}:
-                raise ConfigurationError('invalid_allow_local')
+                raise ConfigurationError('invalid_' + name)
             value = value == '1'
         elif name == 'timeout':
             try:

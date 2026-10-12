@@ -1,3 +1,4 @@
+# Managed by librus-calendar deployment v1
 [Unit]
 Description=Export private Librus aggregate health for Netdata
 After=librus-web.service
@@ -5,8 +6,8 @@ After=librus-web.service
 [Service]
 Type=oneshot
 EnvironmentFile=%h/.config/librus-calendar/monitor.env
-WorkingDirectory=%h/librus-calendar
-ExecStart=%h/librus-calendar/.venv/bin/python -m app.monitoring
+WorkingDirectory=%h/.local/lib/librus-calendar/current
+ExecStart=%h/.local/lib/librus-calendar/current/.venv/bin/python -I -m app.monitoring
 TimeoutStartSec=40s
 UMask=0027
 NoNewPrivileges=true

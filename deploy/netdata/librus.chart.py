@@ -54,7 +54,7 @@ def encode_metrics(data):
 TIME_FIELDS = ('initialized_at', 'last_attempt_at', 'last_successful_sync', 'running_since',
                'writes_paused_since', 'oldest_pending_at', 'last_backup_success_at', 'last_backup_attempt_at')
 COUNT_FIELDS = ('consecutive_failures', 'messages_pending', 'operations_pending', 'operations_unknown', 'review_count')
-BOOL_FIELDS = ('db_ok', 'sync_timer_ok', 'backup_timer_ok', 'sync_unit_ok', 'sync_running', 'sync_failed', 'sync_timeout', 'backup_failed', 'web_ok')
+BOOL_FIELDS = ('db_ok', 'sync_timer_ok', 'backup_timer_ok', 'sync_unit_ok', 'sync_running', 'sync_failed', 'sync_timeout', 'backup_failed', 'web_ok', 'backup_enabled')
 RESULTS = {'idle', 'running', 'ok', 'partial', 'failed', 'interrupted', 'paused', 'dry_run'}
 
 
@@ -155,7 +155,7 @@ class HealthMetrics:
         data['invalid'] = int(not snapshot['db_ok'] or data['snapshot_age'] >= 3)
         for field, dimension in (('sync_timer_ok', 'sync_timer_down'), ('backup_timer_ok', 'backup_timer_down'),
                                  ('web_ok', 'web_down'), ('sync_unit_ok', 'sync_unit_down')):
-            data[dimension] = self.outage(field, not snapshot[field], now)
+            data[dimension] = self.outage(field, not snapshot[field] and (field != 'backup_timer_ok' or snapshot['backup_enabled']), now)
         if times is None:
             return data
         state = snapshot['state']
@@ -173,9 +173,9 @@ class HealthMetrics:
             unknown=0 if actually_running else state['operations_unknown'],
             pending_age=pending_age, pending_alert_age=0 if paused else pending_age,
             messages=state['messages_pending'], operations=state['operations_pending'], review=state['review_count'],
-            backup_age=age('last_backup_success_at', 3600) if times['last_backup_success_at'] is not None else 49,
-            backup_failed=int(snapshot['backup_failed'] or state['last_backup_result'] == 'failed'),
-            backup_missing=int(times['last_backup_success_at'] is None),
+            backup_age=(age('last_backup_success_at', 3600) if times['last_backup_success_at'] is not None else 49) if snapshot['backup_enabled'] else 0,
+            backup_failed=int(snapshot['backup_enabled'] and (snapshot['backup_failed'] or state['last_backup_result'] == 'failed')),
+            backup_missing=int(snapshot['backup_enabled'] and times['last_backup_success_at'] is None),
             pause_minutes=age('writes_paused_since') if paused else 0, paused=int(paused))
         return data
 

@@ -1,6 +1,7 @@
 from test_support import TEST_CONFIG
 """Offline fault tests: no credentials, live Librus or calendar access."""
 from datetime import datetime, timedelta, timezone
+from dataclasses import replace
 import importlib.util
 import json
 from pathlib import Path
@@ -32,7 +33,7 @@ def state():
 
 def snapshot():
     return dict(schema_version=1, generated_at=stamp(), db_ok=True, state=state(), sync_timer_ok=True,
-        backup_timer_ok=True, sync_unit_ok=True, sync_running=False, sync_failed=False, sync_timeout=False,
+        backup_enabled=True, backup_timer_ok=True, sync_unit_ok=True, sync_running=False, sync_failed=False, sync_timeout=False,
         backup_failed=False, web_ok=True)
 
 
@@ -66,6 +67,26 @@ class ExportTests(unittest.TestCase):
         self.assertNotIn('private', json.dumps(actual))
         self.assertNotIn('password', json.dumps(actual))
         COLLECTOR.validate_snapshot(actual, NOW.timestamp())
+
+    def test_disabled_backup_policy_does_not_query_or_alert_on_backup_units(self):
+        units = []
+        def inspect(unit):
+            units.append(unit)
+            return None
+        with patch.object(monitoring, 'unit_state', side_effect=inspect), \
+             patch.object(monitoring, 'web_available', return_value=False):
+            actual = monitoring.collect_snapshot(now=NOW, reader=lambda *a, **kw: state(), config=TEST_CONFIG)
+        self.assertFalse(actual['backup_enabled'])
+        self.assertTrue(actual['backup_timer_ok'])
+        self.assertFalse(actual['backup_failed'])
+        self.assertFalse(any('backup' in unit for unit in units))
+        actual['state']['last_backup_success_at'] = None
+        actual['state']['last_backup_result'] = 'failed'
+        metrics = COLLECTOR.HealthMetrics().calculate(actual, NOW.timestamp())
+        for field in ('backup_age', 'backup_failed', 'backup_missing', 'backup_timer_down'):
+            self.assertEqual(metrics[field], 0)
+        self.assertFalse(actual['sync_unit_ok'])
+        self.assertFalse(actual['web_ok'])
 
     def test_database_error_is_sanitized_and_observable(self):
         def failing(*a, **kw):

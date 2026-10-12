@@ -1,0 +1,13 @@
+[Unit]
+Description=Check Librus and synchronize school dates
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/librus-calendar
+ExecStart=%h/librus-calendar/.venv/bin/python -m app.cli sync
+TimeoutStartSec=45min
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true

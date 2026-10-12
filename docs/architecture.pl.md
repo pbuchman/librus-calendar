@@ -22,7 +22,7 @@ Analiza wiadomości zapisuje rzeczywiście zgłoszony model, poziom rozumowania,
 
 Pełny sukces synchronizacji jest oddzielony od ostatniej próby, dry-run, wstrzymania zapisów i częściowego postępu. Proces godzinowy zapisuje oczyszczone etapy techniczne, czas działania i kody błędów; pełny sukces wymaga braku automatycznych zaległości i niepewnych wyników. Propozycje czekające na decyzję rodzica nie muszą blokować technicznego sukcesu synchronizacji. Eksport Netdata w trybie odczytu zawiera zbiorcze metadane, bez treści wiadomości; zielony wskaźnik nie dowodzi, że model poprawnie zrozumiał wiadomość.
 
-Kopie powstają przez API backupu SQLite, z kontrolą integralności i ograniczonymi uprawnieniami; domyślnie pozostaje siedem najnowszych. Baza i kopie zawierają prywatne dane szkolne. Ślady analizy i usuniętych wpisów pozostają lokalnie; nie ma automatycznej ponownej analizy całej historii ani zbiorczej nieodwracalnej naprawy kalendarza.
+Automatyczne kopie bazy są celowo wyłączone. Wdrożenie nie kopiuje bazy; naprawa zachowuje bieżący dziennik operacji. Baza i kopie zawierają prywatne dane szkolne. Ślady analizy i usuniętych wpisów pozostają lokalnie; nie ma automatycznej ponownej analizy całej historii ani zbiorczej nieodwracalnej naprawy kalendarza.
 
 ## Granice przepływu danych prywatnych
 

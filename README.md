@@ -16,7 +16,7 @@ It reads messages **directly from Librus**. Gmail notifications are not the inge
 - Automatically queues clear future school events, reminders and deadlines when calendar writes are enabled. Optional extracurricular activities require participation approval; ambiguity, conflicts and cancellations require review.
 - Adds one `[Librus]` title prefix. Descriptions include the source quote, an ownership marker and a **synchronization-start timestamp** in Europe/Warsaw. That timestamp means preparation of the durable operation, not confirmation of a completed calendar write.
 - Modifies only app-owned entries on the configured calendar, sends no invitations, and reconciles possible writes before retrying.
-- Provides a private Tailscale inbox, an hourly systemd sync, daily SQLite backups and optional Netdata health checks.
+- Provides a private Tailscale inbox, an hourly systemd sync and optional Netdata health checks.
 
 ## Try it locally
 
@@ -56,7 +56,7 @@ This is an **unofficial**, independently maintained integration, unaffiliated wi
 
 Message text is private data. Real analysis sends supplied message text and relevant cached event context to the configured AI service; calendar writes send selected event details and source quotes to Google Calendar. Store credentials, database files and backups outside the repository, use restricted file permissions, and keep the interface behind owner-restricted Tailscale access. See [privacy and operating boundaries](docs/architecture.md).
 
-AI can misinterpret dates and context. Automated tests and this offline UI demo do not prove compatibility with your school, your Codex account, your Google Calendar or a live deployment. Inspect early results and keep backups.
+AI can misinterpret dates and context. Automated tests and this offline UI demo do not prove compatibility with your school, your Codex account, your Google Calendar or a live deployment. Inspect early results and retain the operation journal. Automatic database backups are intentionally disabled.
 
 ## Development
 

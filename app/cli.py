@@ -11,11 +11,21 @@ from .config import ConfigurationError, load_config
 
 def main(argv=None, *, config=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config', type=Path)
     parser.add_argument('--state', type=Path)
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('status')
     backup = sub.add_parser('backup')
     backup.add_argument('--destination', type=Path)
+    migrate = sub.add_parser('migrate-decisions', help='Transfer minimal decisions directly from a read-only old database; never copy message history.')
+    migrate.add_argument('--from', dest='source', type=Path, required=True)
+    migrate.add_argument('--allow-legacy-binding', action='store_true', help='Explicitly accept an unbound legacy source only after a read-only Calendar owner probe and exact event-calendar match.')
+    rebuild = sub.add_parser('rebuild', help='Reconstruct recent local state from Librus and read-only Calendar discovery.')
+    rebuild.add_argument('--days', type=int, default=30, choices=range(1, 31))
+    rebuild.add_argument('--credentials', type=Path)
+    prune = sub.add_parser('prune', help='Preview old message-content removal; --apply retains all write safety state.')
+    prune.add_argument('--days', type=int, default=30, choices=range(1, 31))
+    prune.add_argument('--apply', action='store_true')
     run = sub.add_parser('sync')
     run.add_argument('--dry-run', action='store_true')
     run.add_argument('--limit', type=int, default=100, choices=range(1, 101))
@@ -32,11 +42,11 @@ def main(argv=None, *, config=None):
     os.umask(0o077)
     store = None
     try:
-        config = config if config is not None else load_config()
+        config = config if config is not None else load_config(args.config)
         if args.command in ('reanalyze', 'metadata-refresh'):
             def initialize_runtime():
                 from .codex_runtime import CodexRuntime
-                return CodexRuntime(config)
+                return CodexRuntime(config, read_only=args.command == 'reanalyze' or not args.apply)
             state_path = args.state or config.state_path
             if args.command == 'reanalyze':
                 from .sync import reanalyze_cached
@@ -53,6 +63,20 @@ def main(argv=None, *, config=None):
             result = {'status': 'backed_up', 'path': store.backup(args.destination)}
         elif args.command == 'pause-writes':
             result = store.set_writes_paused(not args.resume)
+        elif args.command in ('migrate-decisions', 'prune'):
+            from .data_admin import migrate_decisions, prune_state
+            from .sync import sync_lock
+            with sync_lock(store.path) as acquired:
+                if not acquired:
+                    result = {'status': 'already_running', 'calendar_writes': 0}
+                elif args.command == 'migrate-decisions':
+                    probe = None
+                    if args.allow_legacy_binding:
+                        from .codex_runtime import CodexRuntime
+                        probe = CodexRuntime(config, read_only=True).probe()
+                    result = migrate_decisions(store, args.source, allow_legacy_binding=args.allow_legacy_binding, verified_calendar=probe)
+                else:
+                    result = prune_state(store, days=args.days, apply=args.apply)
         else:
             from .sync import SyncController
             def initialize_client(stage):
@@ -70,11 +94,16 @@ def main(argv=None, *, config=None):
                 return client
             def initialize_runtime():
                 from .codex_runtime import CodexRuntime
-                return CodexRuntime(config)
-            result = SyncController(store, client_factory=initialize_client, runtime_factory=initialize_runtime,
-                                    max_messages=args.limit).run(dry_run=args.dry_run)
+                return CodexRuntime(config, read_only=args.command == 'rebuild')
+            if args.command == 'rebuild':
+                from .data_admin import RebuildController
+                result = RebuildController(store, client_factory=initialize_client, runtime_factory=initialize_runtime,
+                                           days=args.days).run()
+            else:
+                result = SyncController(store, client_factory=initialize_client, runtime_factory=initialize_runtime,
+                                        max_messages=args.limit).run(dry_run=args.dry_run)
         print(json.dumps(result, ensure_ascii=True, indent=2))
-        return 1 if result.get('status') in ('partial', 'failed', 'interrupted') else 0
+        return 1 if result.get('status') in ('partial', 'failed', 'interrupted', 'review', 'already_running') else 0
     except ConfigurationError:
         print(json.dumps({'status': 'configuration_required', 'private_response_logged': False}))
         return 2
