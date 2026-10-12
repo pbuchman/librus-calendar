@@ -391,9 +391,13 @@ def verify(home, *, no_sync=False):
              'from app.config import load_config; from app.monitoring import sanitize_state; '
              'c=load_config(); p=c.monitor_output; assert not p.is_symlink(); '
              's=json.loads(p.read_text()); now=datetime.now(timezone.utc); '
+             'assert type(s["schema_version"]) is int and s["schema_version"] == 1; '
              'assert s["db_ok"] and s["web_ok"] and not s["backup_enabled"]; '
              'assert 0 <= (now-datetime.fromisoformat(s["generated_at"])).total_seconds() <= 180; '
-             'sanitize_state(s["state"],now)'], cwd=release)
+             # Exported state omits the raw DB schema field; the envelope owns it.
+             # Revalidate every aggregate and require the exact closed output shape.
+             'assert isinstance(s["state"],dict); '
+             'assert sanitize_state(dict(s["state"],schema_version=s["schema_version"]),now) == s["state"]'], cwd=release)
     return release
 
 
