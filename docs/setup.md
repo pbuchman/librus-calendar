@@ -13,7 +13,7 @@ The [offline demo](demo.md) is the fastest way to see the interface. The steps b
 - Writer or owner access to the exact calendar you choose. `calendar_owner` is the verified primary email of the authenticated calendar owner, distinct from a secondary calendar ID.
 - For unattended deployment: Linux with systemd user services, Tailscale Serve with trusted identity headers, and optionally Netdata's Python collector.
 
-The example model selections are `gpt-6.1-sol`/`high` for analysis and `gpt-6-luna`/`medium` for calendar tools. They reflect this code's defaults, not a promise of availability. Select models and efforts your runtime actually supports; this repository cannot create or grant a connector connection.
+The example model selection is `gpt-6.1-sol`/`high` for both analysis and every calendar tool call, including access checks, reads, reconciliation and writes. It reflects this code's defaults, not a promise of availability. Select models and efforts your runtime actually supports; this repository cannot create or grant a connector connection. Explicit private `tool_model`/`tool_effort` overrides still take precedence, so update older private configuration deliberately when adopting the new default.
 
 ## Private configuration
 
@@ -110,6 +110,18 @@ The minute monitor uses nonsensitive `monitor.env`, with `LIBRUS_CONFIG_FILE=` e
 
 The exporter reads SQLite aggregates without initializing/migrating the DB and writes `/var/lib/librus-monitor/status.json`. Its closed schema includes `backup_enabled`; disabled backups produce no backup outage/staleness/failure alarms. Sync, queue, web, database and collector freshness alerts remain active. It never exports message bodies or credentials. If maintenance notifications are muted, preserve the prior silence rules, use a bounded Librus-only mute with guaranteed cleanup, and restore the exact previous rules afterward.
 
+Five optional nullable fields extend the existing version-1 aggregate schema: `calendar_probe_result`, `calendar_probe_attempts`, `calendar_probe_recovered`, `calendar_probe_retries_24h` and `calendar_probe_recoveries_24h`. Older exporters/collectors can ignore these additions, and the updated collector accepts older snapshots. Missing or null evidence is **no data**, not success or zero retries. The new `librus_local.calendar_probe` chart shows absolute rolling 24-hour retry-start and successful-recovery counts; it is informational and adds no alarm rules. A successful second probe attempt does not increment sync failure state. Update the installed collector and restart its worker to see the new chart.
+
+## Calendar probe and safe diagnostics
+
+Before ordinary synchronization proceeds, a real read-only calendar-list probe verifies owner/writer access to the exact configured calendar. It makes at most two attempts, with a five-second delay before the second. A retry is permitted only for the structured unexpected completed tool-call-count error (zero or multiple) when all observed calls are the expected `list_calendars` read with the expected arguments. Unfinished calls, unexpected calls or arguments, mutations, malformed protocol/results, timeout, permissions failures and missing/non-writable calendars do not qualify. The second attempt has fresh per-call runtime state.
+
+The panel reports the latest sync run's probe result (`running`, `ok`, `failed` or `interrupted`), attempts and recovery. A run with no recorded probe, or a legacy database without evidence, shows “Brak danych”. A successful retry reports access confirmed, two attempts and recovery, without a warning banner. A verified calendar read establishes access at that moment; inspect the final sync result and durable operation state separately.
+
+Probe audit rows contain technical metadata only: sync run/attempt identity, timestamps, configured model/effort, validated CLI version, result, process/error codes, tool-call/protocol counts and expected-call validation flags. They contain no calendar IDs, tool arguments/results, messages, prompts, tokens or raw errors, and expire after 90 days. Monitoring exports only the five aggregate fields, never those rows. Check private installed CLI status, the panel, service state and sanitized aggregates first. Share only technical result/error categories and counts; do not dump the database or Codex transcripts into an issue. A standalone setup probe performs a calendar read but does not create sync-run audit evidence.
+
+The retry policy covers this initial read probe only. It does not directly retry create/update/delete calls. When a write outcome is uncertain, retain the journal and use read-only reconciliation before any later decision to execute work.
+
 ## Isolated development and evaluation
 
 The UI fixture uses temporary synthetic state and no accounts. Real-message evaluation requires an explicit private evaluation config and cases file outside Git:
@@ -123,6 +135,8 @@ Evaluation does not discover production config, opens no state DB, invokes an ex
 ## Diagnose and recover
 
 Check installed package status through `$HOME/.local/lib/librus-calendar/current/.venv/bin/python -I -m app.cli status`, user service status/timers, private logs and the read-only monitoring aggregates. Redact private identifiers before sharing. Full success, attempts, pending queues and unknown operations have different meanings; a completed timer does not prove successful synchronization.
+
+Calendar results require verified evidence of the exact authorized MCP tool and arguments, whether the host uses ordinary MCP or code-mode transport; a model's own success statement is insufficient.
 
 Prefer forward recovery: stop new scheduled runs, let a writer finish, preserve the current DB and operation journal, prepare a reviewed fix SHA, and activate/verify it. A compatible prior packaged release can be selected only after checking it supports the current schema/journal: check out that reviewed previous SHA cleanly and use `activate --sha PREVIOUS_FULL_SHA`. Do not roll SQLite backward or create a safety backup automatically. Database rollback can discard idempotency evidence after external calendar writes. Keep writes paused until unknown outcomes are reconciled.
 

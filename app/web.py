@@ -40,6 +40,20 @@ def event_date(snapshot):
     return human_date(boundary) if boundary else 'Termin nieznany'
 
 
+def calendar_probe_status(status):
+    """Render only recognized aggregate evidence, including legacy unknowns."""
+    labels = {'running': 'W toku', 'ok': 'Dostęp potwierdzony',
+              'failed': 'Błąd sprawdzenia', 'interrupted': 'Przerwano'}
+    result = status.get('calendar_probe_result')
+    attempts = status.get('calendar_probe_attempts')
+    recovered = status.get('calendar_probe_recovered')
+    return {
+        'result': labels.get(result, 'Brak danych') if isinstance(result, str) else 'Brak danych',
+        'attempts': str(attempts) if type(attempts) is int and attempts in (1, 2) else 'Brak danych',
+        'recovered': ('Tak' if recovered else 'Nie') if type(recovered) is bool else 'Brak danych',
+    }
+
+
 def request_sync():
     subprocess.run(['systemctl', '--user', 'start', '--no-block', 'librus-sync.service'],
                    check=True, timeout=10, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -77,6 +91,7 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
     templates = Jinja2Templates(directory=str(ROOT / 'templates'))
     templates.env.filters['human_date'] = human_date
     templates.env.filters['event_date'] = event_date
+    templates.env.filters['calendar_probe_status'] = calendar_probe_status
 
     @application.middleware('http')
     async def private_access(request: Request, call_next):

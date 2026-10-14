@@ -140,6 +140,96 @@ class HealthStateTests(unittest.TestCase):
         self.store.save_message({'id': '1', 'text': 'Original message'})
         self.assertEqual(read_monitoring_state(self.path)['oldest_pending_at'], old)
 
+    def probe_attempt(self, run_id, number=1, *, result='ok', stamp=None):
+        stamp = stamp or datetime.now(timezone.utc).isoformat()
+        attempt = dict(attempt_number=number, model='gpt-6.1-sol', effort='high', cli_version='0.162.1',
+            started_at=stamp, completed_at=None, result='running', safe_code=None, process_code=None,
+            started_count=None, completed_count=None, parse_error_count=None, unknown_event_count=None,
+            incomplete_count=None, expected_tool_name=None, expected_tool_arguments=None)
+        self.store.record_probe_attempt(run_id, attempt)
+        if result != 'running':
+            attempt.update(result=result, completed_at=stamp, safe_code='unexpected_tool_count' if result == 'failed' else None,
+                process_code=0, started_count=0, completed_count=1 if result == 'ok' else 0,
+                parse_error_count=0, unknown_event_count=0, incomplete_count=0,
+                expected_tool_name=True, expected_tool_arguments=True)
+            self.store.record_probe_attempt(run_id, attempt)
+        return attempt
+
+    def test_probe_health_unknown_until_evidence_and_legacy_reader_does_not_migrate(self):
+        fields = ('calendar_probe_result', 'calendar_probe_attempts', 'calendar_probe_recovered',
+                  'calendar_probe_retries_24h', 'calendar_probe_recoveries_24h')
+        self.assertTrue(all(self.store.status()[key] is None for key in fields))
+        run = self.store.start_sync_run()
+        self.assertTrue(all(self.store.status()[key] is None for key in fields))
+        self.probe_attempt(run, result='running')
+        state = read_monitoring_state(self.path)
+        self.assertEqual((state['calendar_probe_result'], state['calendar_probe_attempts']), ('running', 1))
+        self.assertIsNone(state['calendar_probe_recovered'])
+        self.assertEqual(state['calendar_probe_retries_24h'], 0)
+        with self.store.db:
+            self.store.db.execute('DROP TABLE calendar_probe_attempts')
+        before = self.path.read_bytes()
+        self.assertTrue(all(read_monitoring_state(self.path)[key] is None for key in fields))
+        self.assertEqual(before, self.path.read_bytes())
+
+    def test_probe_recovery_counters_are_bounded_to_24h_and_latest_run(self):
+        run = self.store.start_sync_run()
+        first = self.probe_attempt(run, result='failed')
+        second = self.probe_attempt(run, 2)
+        self.store.finish_sync_run(run, 'ok')
+        state = read_monitoring_state(self.path)
+        self.assertEqual((state['calendar_probe_result'], state['calendar_probe_attempts'], state['calendar_probe_recovered']), ('ok', 2, True))
+        self.assertEqual((state['calendar_probe_retries_24h'], state['calendar_probe_recoveries_24h']), (1, 1))
+        later = datetime.fromisoformat(second['completed_at']) + timedelta(hours=25)
+        state = read_monitoring_state(self.path, now=later)
+        self.assertEqual((state['calendar_probe_retries_24h'], state['calendar_probe_recoveries_24h']), (0, 0))
+        next_run = self.store.start_sync_run()
+        state = read_monitoring_state(self.path)
+        self.assertIsNone(state['calendar_probe_result'])
+        self.assertIsNone(state['calendar_probe_recovered'])
+        self.assertEqual(state['calendar_probe_recoveries_24h'], 1)
+        self.probe_attempt(next_run)
+        self.assertFalse(read_monitoring_state(self.path)['calendar_probe_recovered'])
+
+    def test_probe_attempt_whitelist_and_durable_retry_evidence(self):
+        run = self.store.start_sync_run()
+        first = self.probe_attempt(run, result='running')
+        for changes in ({'stdout': 'PRIVATE'}, {'model': 'PRIVATE'}, {'safe_code': 'PRIVATE'},
+                        {'cli_version': 'PRIVATE'}, {'expected_tool_name': 'PRIVATE'},
+                        {'attempt_number': 3}, {'completed_count': True}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                self.store.record_probe_attempt(run, dict(first, **changes))
+        with self.assertRaises(ValueError):
+            self.probe_attempt(run, 2, result='running')
+        with self.store.db:
+            self.store.db.execute("UPDATE calendar_probe_attempts SET cli_version='PRIVATE' WHERE sync_run_id=?", (run,))
+        with self.assertRaises(ValueError):
+            read_monitoring_state(self.path)
+
+    def test_abandoned_probe_attempt_is_interrupted_and_history_pruned_after_90_days(self):
+        run = self.store.start_sync_run()
+        self.probe_attempt(run, result='running')
+        next_run = self.store.start_sync_run()
+        row = self.store.db.execute('SELECT result,safe_code,completed_at FROM calendar_probe_attempts WHERE sync_run_id=?', (run,)).fetchone()
+        self.assertEqual((row['result'], row['safe_code']), ('interrupted', 'worker_interrupted'))
+        self.assertTrue(row['completed_at'])
+        self.store.finish_sync_run(next_run, 'ok')
+        old = (datetime.now(timezone.utc) - timedelta(days=91)).isoformat()
+        with self.store.db:
+            self.store.db.execute('UPDATE sync_runs SET started_at=?,finished_at=? WHERE id=?', (old, old, run))
+            self.store.db.execute('UPDATE calendar_probe_attempts SET started_at=?,completed_at=? WHERE sync_run_id=?', (old, old, run))
+        self.store.start_sync_run()
+        self.assertIsNone(self.store.db.execute('SELECT 1 FROM calendar_probe_attempts WHERE sync_run_id=?', (run,)).fetchone())
+        self.assertIsNone(self.store.db.execute('SELECT 1 FROM sync_runs WHERE id=?', (run,)).fetchone())
+
+    def test_probe_attempt_health_uses_existing_snapshot_and_store_status_starts_one(self):
+        trace = []
+        self.store.db.set_trace_callback(trace.append)
+        self.store.status()
+        self.assertIn('BEGIN', trace)
+        self.assertIn('ROLLBACK', trace)
+        self.assertFalse(self.store.db.in_transaction)
+
 
 if __name__ == '__main__':
     unittest.main()

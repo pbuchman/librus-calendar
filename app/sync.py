@@ -181,6 +181,7 @@ class SyncController:
                         self._stage('runtime')
                         self.runtime = self.runtime_factory()
                     self._stage('calendar_probe')
+                    self.runtime.probe_attempt_sink = lambda attempt: self.store.record_probe_attempt(self.run_id, attempt)
                     probe = self.runtime.probe()
                     if not isinstance(probe, dict) or probe.get('calendar_id') != self.store.calendar_id or probe.get('access_role') not in ('owner', 'writer'):
                         raise ValueError('Calendar write access was not verified.')

@@ -11,7 +11,7 @@
   "codex_binary": "codex",
   "analysis_model": "gpt-6.1-sol",
   "analysis_effort": "high",
-  "tool_model": "gpt-6-luna",
-  "tool_effort": "medium",
+  "tool_model": "gpt-6.1-sol",
+  "tool_effort": "high",
   "timeout": 300
 }

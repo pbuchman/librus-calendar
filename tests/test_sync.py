@@ -11,6 +11,9 @@ from unittest.mock import patch
 from app.core import AppStore, WARSAW
 from app.sync import SyncController, SyncInterrupted
 from test_core import NOW, QUOTE, proposal
+import test_runtime as runtime_fixtures
+from app.codex_runtime import CodexRuntime
+import json
 
 
 class FakeClient:
@@ -316,6 +319,139 @@ class SyncTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 self.assertEqual(main(['--state', str(self.store.path), 'sync'], config=TEST_CONFIG), 1)
         self.assertEqual(self.store.status()['last_error_code'], 'missing_private_file')
+
+
+class ProbeAuditSyncTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = AppStore(Path(self.tmp.name) / 'state.sqlite3', config=TEST_CONFIG)
+        self.store.set_writes_paused(False)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def runtime(self, outputs):
+        remaining = iter(outputs)
+        self.process_calls = []
+        def process(args, prompt, timeout):
+            self.process_calls.append(args)
+            return next(remaining)
+        return CodexRuntime(TEST_CONFIG, run_process=process)
+
+    def test_probe_recovery_is_persisted_before_discovery_and_full_success(self):
+        runtime = self.runtime([runtime_fixtures.CalendarProbeTests.output(), runtime_fixtures.CalendarProbeTests.output(runtime_fixtures.CalendarProbeTests.call())])
+        client = FakeClient(count=0)
+        original = client.messages
+        def messages(*args, **kwargs):
+            rows = self.store.db.execute('SELECT result,attempt_number FROM calendar_probe_attempts ORDER BY attempt_number').fetchall()
+            self.assertEqual([tuple(row) for row in rows], [('failed', 1), ('ok', 2)])
+            return original(*args, **kwargs)
+        client.messages = messages
+        with patch('app.codex_runtime.time.sleep') as sleep:
+            result = SyncController(self.store, client, runtime).run(current=NOW)
+        self.assertEqual(result['status'], 'ok')
+        self.assertIsNotNone(result['state']['last_successful_sync'])
+        self.assertEqual(result['state']['calendar_probe_attempts'], 2)
+        self.assertTrue(result['state']['calendar_probe_recovered'])
+        self.assertEqual(result['state']['calendar_probe_retries_24h'], 1)
+        self.assertEqual(result['state']['calendar_probe_recoveries_24h'], 1)
+        sleep.assert_called_once_with(5)
+        self.assertEqual(len(self.process_calls), 2)
+
+    def test_recovered_probe_followed_by_discovery_failure_is_not_full_success(self):
+        import requests
+        previous = self.store.start_sync_run()
+        self.store.finish_sync_run(previous, 'ok')
+        last_success = self.store.status()['last_successful_sync']
+        runtime = self.runtime([runtime_fixtures.CalendarProbeTests.output(), runtime_fixtures.CalendarProbeTests.output(runtime_fixtures.CalendarProbeTests.call())])
+        client = FakeClient(count=0)
+        def failed(*_, **__):
+            raise requests.exceptions.Timeout('PRIVATE discovery timeout')
+        client.messages = failed
+        with patch('app.codex_runtime.time.sleep'):
+            result = SyncController(self.store, client, runtime).run(current=NOW)
+        self.assertEqual((result['status'], result['error_code']), ('partial', 'discovery_timeout'))
+        self.assertEqual(result['state']['last_successful_sync'], last_success)
+        self.assertEqual(result['state']['consecutive_failures'], 1)
+        self.assertEqual(result['state']['calendar_probe_recoveries_24h'], 1)
+        self.assertTrue(result['state']['calendar_probe_recovered'])
+
+    def test_failed_probe_and_audit_failure_block_all_discovery_and_writes(self):
+        previous = self.store.start_sync_run()
+        self.store.finish_sync_run(previous, 'ok')
+        last_success = self.store.status()['last_successful_sync']
+        variants = [('count', None), ('start_audit', 1), ('finish_audit', 2)]
+        for variant, fail_on in variants:
+            client = FakeClient()
+            runtime = self.runtime([runtime_fixtures.CalendarProbeTests.output(), runtime_fixtures.CalendarProbeTests.output()])
+            persistence_calls = []
+            original = self.store.record_probe_attempt
+            def persist(run_id, metadata):
+                persistence_calls.append(metadata)
+                if len(persistence_calls) == fail_on:
+                    raise OSError('PRIVATE persistence error')
+                return original(run_id, metadata)
+            with patch.object(self.store, 'record_probe_attempt', side_effect=persist), patch('app.codex_runtime.time.sleep'):
+                result = SyncController(self.store, client, runtime).run(current=NOW)
+            self.assertEqual(result['status'], 'failed')
+            self.assertEqual(result['error_code'], 'unexpected_tool_count' if variant == 'count' else 'calendar_probe_audit_failed')
+            self.assertEqual(result['state']['last_successful_sync'], last_success)
+            self.assertEqual(client.pages, [])
+            self.assertEqual(client.details, [])
+            self.assertFalse(any('.tools.create_event.' in arg for args in self.process_calls for arg in args))
+            rows = self.store.db.execute('SELECT * FROM calendar_probe_attempts').fetchall()
+            self.assertNotIn('PRIVATE', json.dumps([dict(row) for row in rows]))
+
+    def test_interrupted_probe_records_attempt_and_preserves_last_success(self):
+        previous = self.store.start_sync_run()
+        self.store.finish_sync_run(previous, 'ok')
+        last_success = self.store.status()['last_successful_sync']
+        def interrupted(*_):
+            raise SyncInterrupted('sync_timeout')
+        runtime = CodexRuntime(TEST_CONFIG, run_process=interrupted)
+        client = FakeClient(count=0)
+        result = SyncController(self.store, client, runtime).run(current=NOW)
+        self.assertEqual((result['status'], result['error_code']), ('interrupted', 'sync_timeout'))
+        self.assertEqual(result['state']['calendar_probe_result'], 'interrupted')
+        self.assertEqual(result['state']['last_successful_sync'], last_success)
+        self.assertEqual(client.pages, [])
+
+    def test_discovery_error_categories_have_no_retry_and_no_false_success(self):
+        import requests
+        from app.librus_client import DiscoveryParsingError
+        variants = ((requests.exceptions.Timeout('PRIVATE'), 'discovery_timeout'),
+                    (requests.exceptions.HTTPError('PRIVATE'), 'discovery_http_failed'),
+                    (requests.exceptions.ConnectionError('PRIVATE'), 'discovery_connection_failed'),
+                    (DiscoveryParsingError('PRIVATE'), 'discovery_parsing_failed'),
+                    (ValueError('PRIVATE'), 'discovery_parsing_failed'),
+                    (RuntimeError('PRIVATE'), 'discovery_failed'))
+        for error, expected in variants:
+            client = FakeClient(count=0)
+            calls = []
+            def failed(*args, **kwargs):
+                calls.append(True)
+                raise error
+            client.messages = failed
+            result = SyncController(self.store, client, FakeRuntime()).run(current=NOW)
+            self.assertEqual((result['status'], result['error_code']), ('partial', expected))
+            self.assertEqual(len(calls), 1)
+            self.assertIsNone(result['state']['last_successful_sync'])
+            self.assertNotIn('PRIVATE', json.dumps(result))
+
+    def test_actual_discovery_json_and_schema_failures_have_safe_parsing_code(self):
+        from app.librus_client import LibrusClient, DiscoveryParsingError
+        from unittest.mock import Mock
+        for response in (Mock(is_redirect=False, json=Mock(side_effect=ValueError('PRIVATE'))),
+                         Mock(is_redirect=False, json=Mock(return_value={'data': 'PRIVATE'})),
+                         Mock(is_redirect=False, json=Mock(return_value=['PRIVATE']))):
+            client = object.__new__(LibrusClient)
+            client.request = Mock(return_value=response)
+            with self.assertRaises(DiscoveryParsingError) as caught:
+                client.messages()
+            self.assertEqual(caught.exception.code, 'discovery_parsing_failed')
+            self.assertNotIn('PRIVATE', str(caught.exception))
+            client.request.assert_called_once()
 
 
 if __name__ == '__main__':

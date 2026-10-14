@@ -29,8 +29,8 @@ class AppConfig:
     codex_binary: str = 'codex'
     analysis_model: str = 'gpt-6.1-sol'
     analysis_effort: str = 'high'
-    tool_model: str = 'gpt-6-luna'
-    tool_effort: str = 'medium'
+    tool_model: str = 'gpt-6.1-sol'
+    tool_effort: str = 'high'
     timeout: int = 300
     monitor_url: str = 'http://127.0.0.1:8795/api/status'
     monitor_output: Path = Path('/var/lib/librus-monitor/status.json')

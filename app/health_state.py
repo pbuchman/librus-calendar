@@ -1,8 +1,9 @@
 """Technical health metadata; the public reader never initializes or changes a DB."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import math
 from pathlib import Path
 import sqlite3
+import re
 
 RESULTS = frozenset(('idle', 'running', 'ok', 'partial', 'failed', 'interrupted', 'paused', 'dry_run'))
 STAGES = frozenset(('starting', 'credentials', 'login', 'runtime', 'calendar_probe', 'discovery',
@@ -18,6 +19,49 @@ ERROR_CODES = frozenset(('configuration_required', 'calendar_configuration_requi
     'invalid_event_boundaries', 'invalid_event_duration', 'invalid_operation_marker',
     'message_too_long', 'operation_not_allowed', 'timezone_required', 'unexpected_tool',
     'unexpected_tool_arguments', 'unexpected_tool_count', 'unsafe_event_boundaries', 'unsafe_event_fields'))
+ERROR_CODES |= frozenset(('codex_protocol_invalid', 'calendar_tool_incomplete', 'calendar_probe_audit_failed',
+    'codex_permission_denied', 'codex_configuration_failed', 'discovery_timeout', 'discovery_http_failed', 'discovery_connection_failed', 'discovery_parsing_failed'))
+PROBE_RESULTS = frozenset(('running', 'ok', 'failed', 'interrupted'))
+PROBE_FIELDS = ('attempt_number', 'model', 'effort', 'cli_version', 'started_at', 'completed_at', 'result',
+    'safe_code', 'process_code', 'started_count', 'completed_count', 'parse_error_count', 'unknown_event_count',
+    'incomplete_count', 'expected_tool_name', 'expected_tool_arguments')
+
+
+def probe_metadata(value):
+    """Strict whitelist for private-free technical attempt records."""
+    if not isinstance(value, dict) or set(value) != set(PROBE_FIELDS):
+        raise ValueError('Invalid calendar probe metadata fields.')
+    result = dict(value)
+    if type(result['attempt_number']) is not int or result['attempt_number'] not in (1, 2):
+        raise ValueError('Invalid calendar probe attempt number.')
+    if not isinstance(result['model'], str) or not re.fullmatch(r'gpt-[0-9][a-z0-9.-]{0,80}', result['model']):
+        raise ValueError('Invalid calendar probe model.')
+    if result['effort'] not in {'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'}:
+        raise ValueError('Invalid calendar probe effort.')
+    version = result['cli_version']
+    if version is not None and (not isinstance(version, str) or not re.fullmatch(r'[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}(?:[-+][A-Za-z0-9.-]{1,40})?', version)):
+        raise ValueError('Invalid calendar probe CLI version.')
+    if result['result'] not in PROBE_RESULTS or (result['safe_code'] is not None and result['safe_code'] not in ERROR_CODES):
+        raise ValueError('Invalid calendar probe result.')
+    for key in ('started_count', 'completed_count', 'parse_error_count', 'unknown_event_count', 'incomplete_count'):
+        if result[key] is not None and (type(result[key]) is not int or not 0 <= result[key] <= 1000000):
+            raise ValueError('Invalid calendar probe count.')
+    code = result['process_code']
+    if code is not None and (type(code) is not int or not -255 <= code <= 255):
+        raise ValueError('Invalid calendar probe process code.')
+    for key in ('expected_tool_name', 'expected_tool_arguments'):
+        if result[key] is not None and type(result[key]) is not bool:
+            raise ValueError('Invalid calendar probe evidence flag.')
+    result['started_at'] = timestamp(result['started_at'])
+    result['completed_at'] = timestamp(result['completed_at'])
+    if not result['started_at'] or (result['result'] == 'running') != (result['completed_at'] is None):
+        raise ValueError('Invalid calendar probe timestamps.')
+    if result['completed_at'] and result['completed_at'] < result['started_at']:
+        raise ValueError('Invalid calendar probe time order.')
+    if ((result['result'] in {'running', 'ok'} and result['safe_code'] is not None)
+            or (result['result'] in {'failed', 'interrupted'} and result['safe_code'] is None)):
+        raise ValueError('Invalid calendar probe error code.')
+    return result
 
 
 def timestamp(value):
@@ -35,11 +79,21 @@ def error_code(error, stage=None):
         return code
     if isinstance(error, FileNotFoundError):
         return 'missing_private_file'
+    if stage == 'discovery':
+        import requests
+        if isinstance(error, (TimeoutError, requests.exceptions.Timeout)):
+            return 'discovery_timeout'
+        if isinstance(error, requests.exceptions.HTTPError):
+            return 'discovery_http_failed'
+        if isinstance(error, (ConnectionError, requests.exceptions.ConnectionError)):
+            return 'discovery_connection_failed'
+        if isinstance(error, (ValueError, TypeError, KeyError)):
+            return 'discovery_parsing_failed'
     return {'credentials': 'invalid_credentials', 'login': 'login_failed', 'calendar_probe': 'calendar_write_access_missing',
             'discovery': 'discovery_failed', 'fetch': 'fetch_failed', 'analysis': 'analysis_failed'}.get(stage, 'operation_failed')
 
 
-def read_connection_state(db):
+def read_connection_state(db, now=None):
     """Read aggregate columns only, on the caller's existing consistent snapshot."""
     tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     if not {'settings', 'messages', 'proposals', 'operations'}.issubset(tables):
@@ -68,7 +122,7 @@ def read_connection_state(db):
         oldest = min((value for value in (oldest, metadata_oldest) if value), default=None)
     last = None
     if 'sync_runs' in tables:
-        cursor = db.execute('SELECT started_at,finished_at,stage,result,error_code,duration_seconds FROM sync_runs ORDER BY started_at DESC,rowid DESC LIMIT 1')
+        cursor = db.execute('SELECT id,started_at,finished_at,stage,result,error_code,duration_seconds FROM sync_runs ORDER BY started_at DESC,rowid DESC LIMIT 1')
         row = cursor.fetchone()
         last = dict(zip((col[0] for col in cursor.description), row)) if row else None
     result = last['result'] if last else 'idle'
@@ -85,7 +139,30 @@ def read_connection_state(db):
     failures = int(settings.get('consecutive_sync_failures', '0'))
     if failures < 0:
         raise ValueError('Invalid failure count.')
-    return dict(schema_version=1, initialized_at=timestamp(settings.get('health_initialized_at')),
+    probe = dict(calendar_probe_result=None, calendar_probe_attempts=None, calendar_probe_recovered=None,
+                 calendar_probe_retries_24h=None, calendar_probe_recoveries_24h=None)
+    if 'calendar_probe_attempts' in tables and 'sync_runs' in tables:
+        # Read only whitelisted columns, never payloads or tool/private strings.
+        cursor = db.execute('SELECT sync_run_id,' + ','.join(PROBE_FIELDS) + ' FROM calendar_probe_attempts')
+        columns = [column[0] for column in cursor.description]
+        attempts = []
+        for row in cursor:
+            values = dict(zip(columns, row))
+            run_id = values.pop('sync_run_id')
+            for flag in ('expected_tool_name', 'expected_tool_arguments'):
+                if values[flag] in (0, 1) and values[flag] is not None:
+                    values[flag] = bool(values[flag])
+            attempts.append((run_id, probe_metadata(values)))
+        if attempts:
+            cutoff = ((now or datetime.now(timezone.utc)).astimezone(timezone.utc) - timedelta(hours=24)).isoformat()
+            probe['calendar_probe_retries_24h'] = sum(item['attempt_number'] == 2 and item['started_at'] >= cutoff for _, item in attempts)
+            probe['calendar_probe_recoveries_24h'] = sum(item['attempt_number'] == 2 and item['result'] == 'ok' and item['completed_at'] >= cutoff for _, item in attempts)
+            latest = [item for run_id, item in attempts if last and run_id == last['id']]
+            if latest:
+                item = max(latest, key=lambda value: value['attempt_number'])
+                probe.update(calendar_probe_result=item['result'], calendar_probe_attempts=len(latest),
+                    calendar_probe_recovered=None if item['result'] == 'running' else item['result'] == 'ok' and item['attempt_number'] == 2)
+    return dict(schema_version=1, **probe, initialized_at=timestamp(settings.get('health_initialized_at')),
         last_attempt_at=timestamp(last['started_at'] if last else settings.get('last_sync')),
         last_successful_sync=timestamp(settings.get('last_successful_sync')),
         last_result=result, last_stage=stage, last_error_code=code, last_duration_seconds=duration,
@@ -107,6 +184,6 @@ def read_monitoring_state(path, now=None):
     try:
         db.execute('PRAGMA query_only=ON')
         db.execute('BEGIN')
-        return read_connection_state(db)
+        return read_connection_state(db, now=now)
     finally:
         db.close()

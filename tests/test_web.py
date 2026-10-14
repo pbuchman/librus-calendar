@@ -105,6 +105,34 @@ class WebTests(unittest.TestCase):
         self.assertIn('2 wiadomości, 1 zapisów', response.text)
         self.assertEqual(self.client.get('/api/status').json()['last_result'], 'partial')
 
+    def test_legacy_probe_has_no_invented_success(self):
+        response = self.client.get('/')
+        probe = response.text.split('aria-label="Ostatnie sprawdzenie kalendarza"', 1)[1].split('</section>', 1)[0]
+        self.assertEqual(probe.count('Brak danych'), 3)
+        self.assertNotIn('Dostęp potwierdzony', probe)
+
+    def test_successful_probe_retry_is_neutral_status(self):
+        status = self.store.status()
+        status.update(last_result='ok', calendar_probe_result='ok', calendar_probe_attempts=2,
+                      calendar_probe_recovered=True)
+        self.store.status = lambda: status
+        response = self.client.get('/')
+        probe = response.text.split('aria-label="Ostatnie sprawdzenie kalendarza"', 1)[1].split('</section>', 1)[0]
+        self.assertIn('Dostęp potwierdzony', probe)
+        self.assertIn('Liczba prób</span><strong>2</strong>', probe)
+        self.assertIn('Odzyskano po ponowieniu</span><strong>Tak</strong>', probe)
+        self.assertNotIn('role="alert"', response.text)
+
+    def test_probe_presentation_rejects_malformed_values(self):
+        status = self.store.status()
+        status.update(calendar_probe_result={'private': 'payload'}, calendar_probe_attempts=True,
+                      calendar_probe_recovered='private response')
+        self.store.status = lambda: status
+        response = self.client.get('/')
+        probe = response.text.split('aria-label="Ostatnie sprawdzenie kalendarza"', 1)[1].split('</section>', 1)[0]
+        self.assertEqual(probe.count('Brak danych'), 3)
+        self.assertNotIn('private', probe)
+
 class RealStoreIntegrationTests(unittest.TestCase):
     def test_panel_controls_persist_and_approval_survives_reload(self):
         from app.core import AppStore

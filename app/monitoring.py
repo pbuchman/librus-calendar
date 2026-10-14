@@ -19,6 +19,8 @@ TIME_FIELDS = ('initialized_at', 'last_attempt_at', 'last_successful_sync', 'run
 COUNT_FIELDS = ('consecutive_failures', 'messages_pending', 'operations_pending', 'operations_unknown', 'review_count')
 RESULTS = {'idle', 'running', 'ok', 'partial', 'failed', 'interrupted', 'paused', 'dry_run'}
 BACKUP_RESULTS = {'idle', 'running', 'ok', 'failed', None}
+PROBE_RESULTS = {'running', 'ok', 'failed', 'interrupted'}
+PROBE_COUNTS = ('calendar_probe_retries_24h', 'calendar_probe_recoveries_24h')
 
 
 def utc_now():
@@ -67,6 +69,23 @@ def sanitize_state(state, now):
     if duration is not None and (type(duration) not in (int, float) or not 0 <= duration <= 31536000):
         raise ValueError('invalid duration')
     clean['last_duration_seconds'] = duration
+    result = state.get('calendar_probe_result')
+    if result is not None and (not isinstance(result, str) or result not in PROBE_RESULTS):
+        raise ValueError('invalid probe result')
+    clean['calendar_probe_result'] = result
+    attempts = state.get('calendar_probe_attempts')
+    if attempts is not None and (type(attempts) is not int or attempts not in (1, 2)):
+        raise ValueError('invalid probe attempts')
+    clean['calendar_probe_attempts'] = attempts
+    recovered = state.get('calendar_probe_recovered')
+    if recovered is not None and type(recovered) is not bool:
+        raise ValueError('invalid probe recovery')
+    clean['calendar_probe_recovered'] = recovered
+    for name in PROBE_COUNTS:
+        value = state.get(name)
+        if value is not None and (type(value) is not int or not 0 <= value <= 10**12):
+            raise ValueError('invalid probe count')
+        clean[name] = value
     return clean
 
 

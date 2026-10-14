@@ -26,6 +26,10 @@ class PocError(Exception):
     pass
 
 
+class DiscoveryParsingError(PocError):
+    code = 'discovery_parsing_failed'
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -154,9 +158,12 @@ class LibrusClient:
         response = self.request('GET', INBOX_URL, params={'page': page, 'limit': limit})
         if response.is_redirect:
             raise PocError('Librus API session expired.')
-        payload = self.json(response)
+        try:
+            payload = self.json(response)
+        except PocError:
+            raise DiscoveryParsingError('Inbox response could not be parsed.') from None
         if not isinstance(payload.get('data'), list) or len(payload['data']) > limit:
-            raise PocError('Unexpected inbox schema or server ignored the fetch limit.')
+            raise DiscoveryParsingError('Unexpected inbox schema or server ignored the fetch limit.')
         return payload['data'], payload.get('total')
 
     def message(self, message_id):
