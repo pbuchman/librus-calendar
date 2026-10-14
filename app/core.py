@@ -10,7 +10,7 @@ import stat
 import threading
 import uuid
 from zoneinfo import ZoneInfo
-from .health_state import ERROR_CODES, RESULTS, STAGES, read_connection_state
+from .health_state import ERROR_CODES, RESULTS, STAGES, PROBE_FIELDS, probe_metadata, read_connection_state
 
 WARSAW = ZoneInfo('Europe/Warsaw')
 from .config import AppConfig, ConfigurationError, load_config
@@ -261,6 +261,15 @@ class AppStore:
             CREATE INDEX IF NOT EXISTS operations_status ON operations(status);
             CREATE TABLE IF NOT EXISTS sync_runs(id TEXT PRIMARY KEY,started_at TEXT NOT NULL,finished_at TEXT,stage TEXT NOT NULL,result TEXT NOT NULL,error_code TEXT,duration_seconds REAL);
             CREATE INDEX IF NOT EXISTS sync_runs_started ON sync_runs(started_at);
+            CREATE TABLE IF NOT EXISTS calendar_probe_attempts(
+                sync_run_id TEXT NOT NULL REFERENCES sync_runs(id) ON DELETE CASCADE,
+                attempt_number INTEGER NOT NULL CHECK(attempt_number IN (1,2)),
+                model TEXT NOT NULL,effort TEXT NOT NULL,cli_version TEXT,
+                started_at TEXT NOT NULL,completed_at TEXT,result TEXT NOT NULL,safe_code TEXT,
+                process_code INTEGER,started_count INTEGER,completed_count INTEGER,parse_error_count INTEGER,
+                unknown_event_count INTEGER,incomplete_count INTEGER,expected_tool_name INTEGER,expected_tool_arguments INTEGER,
+                PRIMARY KEY(sync_run_id,attempt_number));
+            CREATE INDEX IF NOT EXISTS calendar_probe_attempts_started ON calendar_probe_attempts(started_at);
             CREATE TABLE IF NOT EXISTS analysis_audit(id TEXT PRIMARY KEY,message_id TEXT NOT NULL,source_hash TEXT NOT NULL,analyzed_at TEXT NOT NULL,mode TEXT NOT NULL,metadata TEXT NOT NULL,proposal_ids TEXT NOT NULL,superseded_ids TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS analysis_audit_message ON analysis_audit(message_id,analyzed_at);
             CREATE TABLE IF NOT EXISTS decision_intents(id TEXT PRIMARY KEY,message_id TEXT NOT NULL,source_hash TEXT NOT NULL,payload TEXT NOT NULL,updated_at TEXT NOT NULL);
@@ -307,13 +316,20 @@ class AppStore:
 
     def status(self):
         with self.lock:
-            count = lambda table, clause='': self.db.execute('SELECT COUNT(*) FROM ' + table + clause).fetchone()[0]
-            return {**read_connection_state(self.db), 'messages': count('messages'), 'messages_retry': count('messages', " WHERE status IN ('fetch_pending','fetch_failed','analysis_failed')"),
-                    'proposals_pending': count('proposals', " WHERE status='pending'"), 'proposals_review': count('proposals', " WHERE status='review'"),
-                    'events': count('events', " WHERE state='active'"), 'events_cancelled': count('events', " WHERE state='cancelled'"),
-                    'writes_paused': self._setting('writes_paused', 'true') == 'true',
-                    'last_sync': self._setting('last_sync'), 'last_error': self._setting('last_error'), 'sync_requested_at': self._setting('sync_requested_at'),
-                    'calendar_id': self.calendar_id, 'timezone': 'Europe/Warsaw'}
+            own_snapshot = not self.db.in_transaction
+            if own_snapshot:
+                self.db.execute('BEGIN')
+            try:
+                count = lambda table, clause='': self.db.execute('SELECT COUNT(*) FROM ' + table + clause).fetchone()[0]
+                return {**read_connection_state(self.db), 'messages': count('messages'), 'messages_retry': count('messages', " WHERE status IN ('fetch_pending','fetch_failed','analysis_failed')"),
+                        'proposals_pending': count('proposals', " WHERE status='pending'"), 'proposals_review': count('proposals', " WHERE status='review'"),
+                        'events': count('events', " WHERE state='active'"), 'events_cancelled': count('events', " WHERE state='cancelled'"),
+                        'writes_paused': self._setting('writes_paused', 'true') == 'true',
+                        'last_sync': self._setting('last_sync'), 'last_error': self._setting('last_error'), 'sync_requested_at': self._setting('sync_requested_at'),
+                        'calendar_id': self.calendar_id, 'timezone': 'Europe/Warsaw'}
+            finally:
+                if own_snapshot:
+                    self.db.rollback()
 
     def start_sync_run(self):
         """Only called under sync.lock, so older running rows are abandoned workers."""
@@ -323,14 +339,42 @@ class AppStore:
             for row in abandoned:
                 duration = max(0, (datetime.fromisoformat(stamp) - datetime.fromisoformat(row['started_at'])).total_seconds())
                 self.db.execute("UPDATE sync_runs SET result='interrupted',error_code='worker_interrupted',finished_at=?,duration_seconds=? WHERE id=?", (stamp, duration, row['id']))
+                self.db.execute("UPDATE calendar_probe_attempts SET result='interrupted',safe_code='worker_interrupted',completed_at=? WHERE sync_run_id=? AND result='running'", (stamp, row['id']))
             failures = int(self._setting('consecutive_sync_failures', '0')) + len(abandoned)
             self.db.execute("INSERT OR REPLACE INTO settings VALUES ('consecutive_sync_failures',?)", (str(failures),))
-            self.db.execute('DELETE FROM sync_runs WHERE started_at<? AND finished_at IS NOT NULL', ((datetime.fromisoformat(stamp) - timedelta(days=90)).isoformat(),))
+            cutoff = (datetime.fromisoformat(stamp) - timedelta(days=90)).isoformat()
+            self.db.execute('DELETE FROM calendar_probe_attempts WHERE sync_run_id IN (SELECT id FROM sync_runs WHERE started_at<? AND finished_at IS NOT NULL)', (cutoff,))
+            self.db.execute('DELETE FROM sync_runs WHERE started_at<? AND finished_at IS NOT NULL', (cutoff,))
             run_id = uuid.uuid4().hex
             self.db.execute("INSERT INTO sync_runs(id,started_at,stage,result) VALUES (?,?,'starting','running')", (run_id, stamp))
             self.db.execute("INSERT OR REPLACE INTO settings VALUES ('last_sync',?)", (stamp,))
             self.db.execute("INSERT OR REPLACE INTO settings VALUES ('sync_requested_at','')")
             return run_id
+
+    def record_probe_attempt(self, run_id, metadata):
+        metadata = probe_metadata(metadata)
+        with self.lock, self.db:
+            if not self.db.execute("SELECT 1 FROM sync_runs WHERE id=? AND result='running'", (run_id,)).fetchone():
+                raise ValueError('Calendar probe sync run is not active.')
+            prior = self.db.execute('SELECT * FROM calendar_probe_attempts WHERE sync_run_id=? AND attempt_number=?',
+                                    (run_id, metadata['attempt_number'])).fetchone()
+            if prior:
+                immutable = ('model', 'effort', 'started_at')
+                if prior['result'] != 'running' or any(prior[key] != metadata[key] for key in immutable):
+                    raise ValueError('Calendar probe attempt is immutable.')
+                self.db.execute('UPDATE calendar_probe_attempts SET ' + ','.join(key + '=?' for key in PROBE_FIELDS) + ' WHERE sync_run_id=? AND attempt_number=?',
+                    tuple(metadata[key] for key in PROBE_FIELDS) + (run_id, metadata['attempt_number']))
+            else:
+                if metadata['result'] != 'running':
+                    raise ValueError('Calendar probe attempt must start durably.')
+                if metadata['attempt_number'] == 2:
+                    first = self.db.execute('SELECT * FROM calendar_probe_attempts WHERE sync_run_id=? AND attempt_number=1', (run_id,)).fetchone()
+                    if (not first or first['result'] != 'failed' or first['safe_code'] != 'unexpected_tool_count'
+                            or first['expected_tool_name'] != 1 or first['expected_tool_arguments'] != 1
+                            or any(first[key] != 0 for key in ('parse_error_count', 'unknown_event_count', 'incomplete_count'))):
+                        raise ValueError('Calendar probe retry evidence is missing.')
+                self.db.execute('INSERT INTO calendar_probe_attempts(sync_run_id,' + ','.join(PROBE_FIELDS) + ') VALUES (' + ','.join('?' for _ in range(len(PROBE_FIELDS) + 1)) + ')',
+                    (run_id,) + tuple(metadata[key] for key in PROBE_FIELDS))
 
     def sync_stage(self, run_id, stage):
         if stage not in STAGES:
@@ -349,6 +393,9 @@ class AppStore:
             if duration_seconds is None:
                 duration_seconds = max(0, (datetime.fromisoformat(stamp) - datetime.fromisoformat(row['started_at'])).total_seconds())
             self.db.execute('UPDATE sync_runs SET finished_at=?,result=?,error_code=?,duration_seconds=? WHERE id=?', (stamp, result, error_code, duration_seconds, run_id))
+            if result in ('failed', 'interrupted'):
+                self.db.execute('UPDATE calendar_probe_attempts SET completed_at=?,result=?,safe_code=? WHERE sync_run_id=? AND result=\'running\'',
+                    (stamp, 'interrupted' if result == 'interrupted' else 'failed', error_code or 'operation_failed', run_id))
             failures = int(self._setting('consecutive_sync_failures', '0'))
             if result == 'ok':
                 failures = 0

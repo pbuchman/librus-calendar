@@ -14,7 +14,7 @@ priority = 90000
 WIRE_SCALE = 1000
 MAX_METRIC_VALUE = 10**12
 
-ORDER = ['sync', 'queue', 'services', 'monitoring', 'backup', 'pause']
+ORDER = ['sync', 'queue', 'services', 'monitoring', 'backup', 'pause', 'calendar_probe']
 CHARTS = {
     'sync': {'options': [None, 'Librus synchronization', 'minutes / count', 'sync', 'librus_local.sync', 'line'],
         'lines': [['success_age', 'last full success age'], ['success_alert_age', 'unpaused full success age'], ['success_missing', 'no full success'],
@@ -34,7 +34,10 @@ CHARTS = {
                   ['backup_missing', 'no verified backup']]},
     'pause': {'options': [None, 'Librus write pause', 'minutes / state', 'sync', 'librus_local.pause', 'line'],
         'lines': [['pause_minutes', 'write pause duration'], ['paused', 'writes paused']]},
+    'calendar_probe': {'options': [None, 'Librus calendar probe (rolling 24 hours)', 'count', 'sync', 'librus_local.calendar_probe', 'line'],
+        'lines': [['probe_retries_24h', 'read probe retries'], ['probe_recoveries_24h', 'read probe recoveries']]},
 }
+OPTIONAL_METRICS = {'probe_retries_24h', 'probe_recoveries_24h'}
 
 # python.d casts collected values to int before applying chart multiplier/divisor.
 # Encode fixed-point integers on the wire so time thresholds retain sub-unit precision.
@@ -56,6 +59,7 @@ TIME_FIELDS = ('initialized_at', 'last_attempt_at', 'last_successful_sync', 'run
 COUNT_FIELDS = ('consecutive_failures', 'messages_pending', 'operations_pending', 'operations_unknown', 'review_count')
 BOOL_FIELDS = ('db_ok', 'sync_timer_ok', 'backup_timer_ok', 'sync_unit_ok', 'sync_running', 'sync_failed', 'sync_timeout', 'backup_failed', 'web_ok', 'backup_enabled')
 RESULTS = {'idle', 'running', 'ok', 'partial', 'failed', 'interrupted', 'paused', 'dry_run'}
+PROBE_RESULTS = {'running', 'ok', 'failed', 'interrupted'}
 
 
 def parsed_time(value, now):
@@ -103,6 +107,19 @@ def validate_snapshot(snapshot, now):
         duration = state['last_duration_seconds']
         if duration is not None and (type(duration) not in (int, float) or not math.isfinite(duration) or duration < 0):
             raise ValueError('invalid duration')
+        result = state.get('calendar_probe_result')
+        if result is not None and (not isinstance(result, str) or result not in PROBE_RESULTS):
+            raise ValueError('invalid probe result')
+        attempts = state.get('calendar_probe_attempts')
+        if attempts is not None and (type(attempts) is not int or attempts not in (1, 2)):
+            raise ValueError('invalid probe attempts')
+        recovered = state.get('calendar_probe_recovered')
+        if recovered is not None and type(recovered) is not bool:
+            raise ValueError('invalid probe recovery')
+        for name in ('calendar_probe_retries_24h', 'calendar_probe_recoveries_24h'):
+            value = state.get(name)
+            if value is not None and (type(value) is not int or not 0 <= value <= MAX_METRIC_VALUE):
+                raise ValueError('invalid probe count')
         # These timestamps are required to age nonempty queues/runs without hiding outages.
         if (state['messages_pending'] or state['operations_pending']) and parsed['oldest_pending_at'] is None:
             raise ValueError('pending age unavailable')
@@ -134,9 +151,9 @@ class HealthMetrics:
 
     def invalid_data(self, now):
         try:
-            data = self.calculate(self.last_snapshot, now) if self.last_snapshot is not None else {line[0]: 0 for chart in CHARTS.values() for line in chart['lines']}
+            data = self.calculate(self.last_snapshot, now) if self.last_snapshot is not None else self.empty_data()
         except (ValueError, KeyError, TypeError, OverflowError):
-            data = {line[0]: 0 for chart in CHARTS.values() for line in chart['lines']}
+            data = self.empty_data()
         if self.first_missing_at is None:
             self.first_missing_at = now
         baseline = self.last_generated if self.last_generated is not None else self.first_missing_at
@@ -144,12 +161,19 @@ class HealthMetrics:
                     invalid_minutes=self.outage('invalid', True, now), invalid=1)
         return data
 
+    @staticmethod
+    def empty_data():
+        # An old exporter/DB has no probe evidence. Leave a chart gap rather than
+        # claiming zero retries or a successful calendar read.
+        return {line[0]: 0 for chart in CHARTS.values() for line in chart['lines']
+                if line[0] not in OPTIONAL_METRICS}
+
     def calculate(self, snapshot, now):
         generated, times = validate_snapshot(snapshot, now)
         self.last_generated = generated
         self.last_snapshot = snapshot
         self.first_missing_at = None
-        data = {line[0]: 0 for chart in CHARTS.values() for line in chart['lines']}
+        data = self.empty_data()
         data['snapshot_age'] = max(0, now - generated) / 60.0
         data['db_down'] = self.outage('db', not snapshot['db_ok'], now)
         data['invalid'] = int(not snapshot['db_ok'] or data['snapshot_age'] >= 3)
@@ -159,6 +183,10 @@ class HealthMetrics:
         if times is None:
             return data
         state = snapshot['state']
+        for field, dimension in (('calendar_probe_retries_24h', 'probe_retries_24h'),
+                                 ('calendar_probe_recoveries_24h', 'probe_recoveries_24h')):
+            if state.get(field) is not None:
+                data[dimension] = state[field]
         paused = state['writes_paused']
         running = state['last_result'] == 'running'
         actually_running = running and snapshot['sync_running']

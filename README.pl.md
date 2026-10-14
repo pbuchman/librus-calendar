@@ -17,6 +17,7 @@ Wiadomości są pobierane **bezpośrednio z Librusa**. Powiadomienia Gmail nie s
 - Dodaje jeden prefiks `[Librus]` w tytule. Opis zawiera cytat źródłowy, znacznik własności i **czas rozpoczęcia synchronizacji** w Europe/Warsaw. Jest to czas przygotowania trwałej operacji, a nie potwierdzenie zakończenia zapisu w kalendarzu.
 - Zmienia wyłącznie własne wpisy w skonfigurowanym kalendarzu, nie wysyła zaproszeń i sprawdza wynik niepewnego zapisu przed ponowieniem.
 - Udostępnia prywatną skrzynkę przez Tailscale, synchronizację co godzinę przez systemd i opcjonalny monitoring Netdata.
+- Pokazuje ostatnie sprawdzenie dostępu do kalendarza i odzyskanie po ograniczonym ponowieniu odczytu; Netdata prezentuje próby ponowienia i odzyskania z ostatnich 24 godzin.
 
 ## Uruchom lokalnie
 
@@ -49,6 +50,8 @@ Otwórz [http://127.0.0.1:8795](http://127.0.0.1:8795). Rzeczywisty interfejs dz
 Rzeczywista synchronizacja wymaga konta Librus, obsługiwanego i zalogowanego środowiska Codex CLI, dostępnych modeli analizy i narzędzi, połączonej aplikacji Google Calendar oraz prawa zapisu do dokładnie wskazanego kalendarza. Te elementy **nie są dostarczane z projektem**; nazwy modeli, identyfikatory konektorów i narzędzia mogą zależeć od konta i środowiska. Nie jest to samodzielna integracja OAuth. Zacznij od [instrukcji konfiguracji i wdrożenia](docs/setup.pl.md).
 
 Zapisy są początkowo wstrzymane. Pierwsze `sync --dry-run` może nadal czytać Librusa i wywoływać AI oraz narzędzia odczytu kalendarza; nie jest to demo offline. Sprawdź rozpoznane działania i wynik testu środowiska przed włączeniem zapisów.
+
+Analiza i narzędzia kalendarza domyślnie używają `gpt-6.1-sol` z rozumowaniem `high`. Wyłącznie początkowe odczytowe sprawdzenie listy kalendarzy może być ponowione raz po pięciu sekundach przy zweryfikowanej nieoczekiwanej liczbie zakończonych wywołań narzędzia (zero lub wiele). Ta zasada nie ponawia zapisów; niepewny zapis wymaga sprawdzenia wyniku w trybie odczytu. Zobacz [sprawdzanie kalendarza i bezpieczną diagnostykę](docs/setup.pl.md#sprawdzanie-kalendarza-i-bezpieczna-diagnostyka).
 
 ## Prywatność i ograniczenia
 

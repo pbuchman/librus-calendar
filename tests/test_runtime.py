@@ -364,5 +364,233 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(actual["start"], raw["start"])
 
 
+class CalendarProbeTests(unittest.TestCase):
+    @staticmethod
+    def call(*, identity=None, kind='item.completed', tool='google_calendar.list_calendars',
+             arguments=None, result=None, status=None):
+        item = {'type': 'mcp_tool_call', 'tool': tool,
+                'arguments': {'max_results': 100} if arguments is None else arguments}
+        if identity is not None:
+            item['id'] = identity
+        if kind == 'item.completed':
+            item['result'] = result if result is not None else {'structured_content': {
+                'calendars': [{'id': CALENDAR_ID, 'access_role': 'owner'}]}}
+        if status is not None:
+            item['status'] = status
+        return {'type': kind, 'item': item}
+
+    def runtime(self, outputs):
+        self.invocations = []
+        remaining = iter(outputs)
+        def run(args, prompt, timeout):
+            self.invocations.append((args, prompt))
+            return next(remaining)
+        return CodexRuntime({'run_process': run})
+
+    @staticmethod
+    def output(*records, stderr='', code=0):
+        return code, '\n'.join(json.dumps(record) for record in records), stderr
+
+    def test_zero_calls_recover_once_with_exact_read_permissions_and_wait(self):
+        runtime = self.runtime([self.output({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': '{"ok":true}'}}),
+                                self.output(self.call())])
+        sink = []
+        runtime.probe_attempt_sink = lambda record: sink.append(record)
+        with patch('app.codex_runtime.time.sleep') as sleep:
+            result = runtime.probe()
+        sleep.assert_called_once_with(5)
+        self.assertEqual((result['attempts'], result['recovered']), (2, True))
+        self.assertEqual([record['result'] for record in sink], ['running', 'failed', 'running', 'ok'])
+        first = runtime.last_probe_attempts[0]
+        self.assertEqual((first['started_count'], first['completed_count'], first['parse_error_count']), (0, 0, 0))
+        self.assertTrue(first['expected_tool_name'] and first['expected_tool_arguments'])
+        for args, prompt in self.invocations:
+            self.assertEqual(args[args.index('-m') + 1], 'gpt-6.1-sol')
+            self.assertIn('model_reasoning_effort="high"', args)
+            self.assertIn('apps.connector_synthetic.tools.list_calendars.enabled=true', args)
+            self.assertFalse(any('.tools.create_event.' in arg or '.tools.update_event.' in arg or '.tools.delete_event.' in arg for arg in args))
+            self.assertIn('"tool": "list_calendars", "arguments": {"max_results": 100}', prompt)
+            self.assertIn('inspect ALL_TOOLS metadata', prompt)
+            self.assertIn('functions.exec', prompt)
+            self.assertIn('that one application tool', prompt)
+            self.assertIn('view_image', args)
+            self.assertFalse(any('tools.view_image=' in arg for arg in args))
+            self.assertIn('suppress_unstable_features_warning=true', args)
+
+    def test_multiple_completed_expected_calls_can_recover_but_never_third_attempt(self):
+        first = self.output(self.call(identity='a'), self.call(identity='b'))
+        for second, succeeded in ((self.output(self.call()), True), (first, False)):
+            runtime = self.runtime([first, second, self.output(self.call())])
+            with patch('app.codex_runtime.time.sleep') as sleep:
+                if succeeded:
+                    self.assertTrue(runtime.probe()['recovered'])
+                else:
+                    with self.assertRaisesRegex(RuntimeFailure, 'unexpected_tool_count'):
+                        runtime.probe()
+            self.assertEqual(len(self.invocations), 2)
+            sleep.assert_called_once_with(5)
+
+    def test_wrong_tools_or_arguments_never_retry_even_with_multiple_calls(self):
+        for record in (self.call(tool='google_calendar.create_event'), self.call(arguments={'max_results': 99}),
+                       self.call(arguments={'max_results': 100, 'page': 1})):
+            runtime = self.runtime([self.output(self.call(), record)])
+            with patch('app.codex_runtime.time.sleep') as sleep, self.assertRaisesRegex(RuntimeFailure, 'unexpected_tool_arguments'):
+                runtime.probe()
+            sleep.assert_not_called()
+            self.assertEqual(len(self.invocations), 1)
+
+    def test_malformed_or_unknown_protocol_never_retry(self):
+        malformed = ['not-json', json.dumps([]), json.dumps(None), json.dumps({'type': 'new.protocol'}),
+            json.dumps({'type': 'item.completed', 'item': []}), json.dumps({'type': 'item.completed', 'item': 'PRIVATE'}),
+            json.dumps({'type': 'item.completed', 'item': {'type': []}}),
+            json.dumps({'type': 'item.completed', 'item': {'type': 'shell', 'command': 'PRIVATE'}})]
+        for bad in ({'tool': []}, {'arguments': []}, {'result': []}, {'id': 23}, {'status': []}):
+            record = self.call()
+            record['item'].update(bad)
+            malformed.append(json.dumps(record))
+        for stdout in malformed:
+            runtime = self.runtime([(0, stdout, '')])
+            with patch('app.codex_runtime.time.sleep') as sleep, self.assertRaisesRegex(RuntimeFailure, 'codex_protocol_invalid'):
+                runtime.probe()
+            sleep.assert_not_called()
+            self.assertNotIn('PRIVATE', json.dumps(runtime.last_probe_attempts))
+
+    def test_started_or_updated_unfinished_call_never_retry(self):
+        for records in ((self.call(identity='a', kind='item.started'),),
+                        (self.call(identity='a', kind='item.started'), self.call(identity='b')),
+                        (self.call(identity='a', kind='item.updated'),),
+                        (self.call(kind='item.updated'),),
+                        (self.call(status='in_progress'),)):
+            runtime = self.runtime([self.output(*records)])
+            with patch('app.codex_runtime.time.sleep') as sleep, self.assertRaisesRegex(RuntimeFailure, 'calendar_tool_incomplete'):
+                runtime.probe()
+            self.assertGreater(runtime.last_probe_attempts[0]['incomplete_count'], 0)
+            sleep.assert_not_called()
+
+    def test_completed_start_pair_is_accepted_and_duplicate_identity_is_malformed(self):
+        runtime = self.runtime([self.output(self.call(identity='a', kind='item.started'), self.call(identity='a'))])
+        self.assertFalse(runtime.probe()['recovered'])
+        self.assertEqual(runtime.last_probe_attempts[0]['started_count'], 1)
+        runtime = self.runtime([self.output(self.call(identity='a'), self.call(identity='a'))])
+        with patch('app.codex_runtime.time.sleep') as sleep, self.assertRaisesRegex(RuntimeFailure, 'codex_protocol_invalid'):
+            runtime.probe()
+        sleep.assert_not_called()
+
+    def test_errors_in_any_lifecycle_record_block_success_and_retry(self):
+        for kind in ('item.started', 'item.updated'):
+            for changes in ({'error': {'message': 'PRIVATE quota'}}, {'status': 'failed'}, {'status': 'cancelled'},
+                            {'result': {'isError': True}}, {'result': {'structured_content': {'error': 'PRIVATE'}}}):
+                failed = self.call(identity='a', kind=kind)
+                failed['item'].update(changes)
+                for completed in ((self.call(identity='a'),), (self.call(identity='a'), self.call(identity='b'))):
+                    runtime = self.runtime([self.output(failed, *completed)])
+                    with patch('app.codex_runtime.time.sleep') as sleep, self.assertRaisesRegex(RuntimeFailure, 'calendar_tool_failed'):
+                        runtime.probe()
+                    sleep.assert_not_called()
+
+    def test_known_process_errors_and_quota_permission_config_never_retry(self):
+        for hint, code in (('Usage limit exceeded PRIVATE', 'codex_limit'),
+                           ('Permission denied PRIVATE', 'codex_permission_denied'),
+                           ('Invalid configuration PRIVATE', 'codex_configuration_failed'),
+                           ('Startup failed PRIVATE', 'codex_failed')):
+            variants = [self.output({'type': 'item.completed', 'item': {'type': 'error', 'message': hint}}),
+                        self.output({'type': 'turn.failed', 'error': {'message': hint}}),
+                        self.output(stderr=hint, code=0 if code != 'codex_failed' else 1)]
+            for output in variants:
+                runtime = self.runtime([output])
+                with patch('app.codex_runtime.time.sleep') as sleep, self.assertRaisesRegex(RuntimeFailure, code):
+                    runtime.probe()
+                sleep.assert_not_called()
+                self.assertNotIn('PRIVATE', json.dumps(runtime.last_probe_attempts))
+
+    def test_successful_payload_or_agent_text_is_not_process_error_evidence(self):
+        call = self.call()
+        call['item']['result']['structured_content']['calendars'][0]['description'] = 'credits quota forbidden unauthorized 404 PRIVATE'
+        runtime = self.runtime([self.output(call, {'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'quota PRIVATE'}})])
+        self.assertEqual(runtime.probe()['access_role'], 'owner')
+        self.assertNotIn('PRIVATE', json.dumps(runtime.last_probe_attempts))
+
+    def test_tool_errors_unreadable_result_access_and_timeout_never_retry(self):
+        bad_error = self.call()
+        bad_error['item']['error'] = {'message': 'Permission denied PRIVATE'}
+        missing = self.call()
+        missing['item'].pop('result')
+        variants = [(self.output(self.call(), bad_error), 'calendar_tool_failed'),
+            (self.output(missing), 'calendar_tool_incomplete'),
+            (self.output(self.call(result={'content': [{'type': 'text', 'text': 'PRIVATE unreadable'}]})), 'calendar_result_unreadable'),
+            (self.output(self.call(result={'structured_content': {'errors': ['PRIVATE quota']}})), 'calendar_tool_failed'),
+            (self.output(self.call(result={'structured_content': {'calendars': [{'id': CALENDAR_ID, 'access_role': 'reader'}]}})), 'calendar_write_access_missing'),
+            (self.output(self.call(), self.call(result={'structured_content': {'calendars': []}})), 'calendar_write_access_missing'),
+            (self.output(self.call(), self.call(result={'structured_content': []})), 'calendar_result_unreadable')]
+        for output, code in variants:
+            runtime = self.runtime([output])
+            with patch('app.codex_runtime.time.sleep') as sleep, self.assertRaisesRegex(RuntimeFailure, code):
+                runtime.probe()
+            sleep.assert_not_called()
+        runtime = CodexRuntime({'run_process': lambda *_: (_ for _ in ()).throw(RuntimeFailure('codex_timeout'))})
+        with patch('app.codex_runtime.time.sleep') as sleep, self.assertRaisesRegex(RuntimeFailure, 'codex_timeout'):
+            runtime.probe()
+        sleep.assert_not_called()
+
+    def test_audit_failure_blocks_dispatch_or_retry(self):
+        for fail_on in (1, 2, 3, 4):
+            runtime = self.runtime([self.output(), self.output(self.call())])
+            records = []
+            def persist(record):
+                records.append(record)
+                if len(records) == fail_on:
+                    raise OSError('PRIVATE storage failure')
+            runtime.probe_attempt_sink = persist
+            with patch('app.codex_runtime.time.sleep'), self.assertRaisesRegex(RuntimeFailure, 'calendar_probe_audit_failed'):
+                runtime.probe()
+            self.assertEqual(len(self.invocations), (0, 1, 1, 2)[fail_on - 1])
+
+    def test_interruption_is_recorded_and_retry_wait_obeys_deadline(self):
+        from app.sync import SyncInterrupted
+        def interrupted(*_):
+            raise SyncInterrupted('sync_timeout')
+        runtime = CodexRuntime({'run_process': interrupted})
+        records = []
+        runtime.probe_attempt_sink = lambda record: records.append(record)
+        with self.assertRaises(SyncInterrupted):
+            runtime.probe()
+        self.assertEqual((records[-1]['result'], records[-1]['safe_code']), ('interrupted', 'sync_timeout'))
+        runtime = self.runtime([self.output(), self.output(self.call())])
+        with patch('app.codex_runtime.time.sleep', side_effect=SyncInterrupted('sync_timeout')), self.assertRaises(SyncInterrupted):
+            runtime.probe()
+        self.assertEqual(len(self.invocations), 1)
+
+    def test_timeout_captures_emitted_call_counts_and_process_exit_without_private_output(self):
+        import subprocess
+        from app.codex_runtime import CodexRuntime as ActualRuntime
+        process = MagicMock(pid=12345, returncode=-9)
+        started = json.dumps(self.call(identity='a', kind='item.started'))
+        process.communicate.side_effect = [subprocess.TimeoutExpired('codex', 300), (started, 'PRIVATE stderr')]
+        runtime = ActualRuntime(TEST_CONFIG)
+        with patch.object(runtime, '_cli_version', return_value=None), patch('app.codex_runtime.subprocess.Popen', return_value=process), patch('app.codex_runtime.os.killpg'), self.assertRaisesRegex(RuntimeFailure, 'codex_timeout'):
+            runtime.probe()
+        attempt = runtime.last_probe_attempts[0]
+        self.assertEqual((attempt['started_count'], attempt['completed_count'], attempt['process_code']), (1, 0, -9))
+        self.assertEqual(attempt['safe_code'], 'codex_timeout')
+        self.assertNotIn('PRIVATE', json.dumps(attempt))
+
+    def test_cli_version_is_strictly_sanitized(self):
+        for output, expected in (('codex-cli 0.162.1\n', '0.162.1'), ('PRIVATE secret\n', None),
+                                 ('codex-cli 0.162.1\nPRIVATE', None), ('codex-cli 0.162.1+abc.2', '0.162.1+abc.2')):
+            runtime = self.runtime([])
+            runtime._injected_runner = False
+            process = MagicMock(returncode=0, stdout=output)
+            with patch('app.codex_runtime.subprocess.run', return_value=process):
+                self.assertEqual(runtime._cli_version(), expected)
+
+    def test_write_tool_count_is_never_retryable(self):
+        runtime = self.runtime([self.output()])
+        with self.assertRaises(RuntimeFailure) as caught:
+            runtime._tool('create_event', {'calendar_id': CALENDAR_ID})
+        self.assertTrue(caught.exception.possible_write)
+        self.assertFalse(caught.exception.retryable_probe)
+        self.assertEqual(len(self.invocations), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

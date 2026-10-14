@@ -37,6 +37,12 @@ def snapshot():
         backup_failed=False, web_ok=True)
 
 
+def probe_fields():
+    return dict(calendar_probe_result='ok', calendar_probe_attempts=2,
+                calendar_probe_recovered=True, calendar_probe_retries_24h=3,
+                calendar_probe_recoveries_24h=2)
+
+
 def load_collector():
     # The host's installed python.d framework is validated at deployment. Stub only its base here.
     module_name = 'bases.FrameworkServices.SimpleService'
@@ -56,6 +62,31 @@ COLLECTOR = load_collector()
 
 
 class ExportTests(unittest.TestCase):
+    def test_optional_probe_aggregates_accept_current_and_legacy_state(self):
+        legacy = monitoring.sanitize_state(state(), NOW)
+        for field in probe_fields():
+            self.assertIsNone(legacy[field])
+        sample = state()
+        sample.update(probe_fields(), calendar_id='calendar@example.test',
+                      calendar_probe_payload='private response', calendar_probe_error='private error')
+        clean = monitoring.sanitize_state(sample, NOW)
+        self.assertEqual({field: clean[field] for field in probe_fields()}, probe_fields())
+        self.assertNotIn('calendar_id', clean)
+        self.assertNotIn('private', json.dumps(clean))
+
+    def test_malformed_optional_probe_aggregates_fail_closed(self):
+        for field, value in [('calendar_probe_result', 'success'), ('calendar_probe_result', []),
+                             ('calendar_probe_attempts', True), ('calendar_probe_attempts', 0),
+                             ('calendar_probe_attempts', 3), ('calendar_probe_recovered', 1),
+                             ('calendar_probe_retries_24h', -1), ('calendar_probe_retries_24h', True),
+                             ('calendar_probe_recoveries_24h', 10**12 + 1),
+                             ('calendar_probe_recoveries_24h', float('nan'))]:
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                sample = state()
+                sample.update(probe_fields())
+                sample[field] = value
+                monitoring.sanitize_state(sample, NOW)
+
     def test_snapshot_closed_whitelist_drops_private_fields(self):
         value = state()
         value.update(message_body='private content', password='dummy-never-exported')
@@ -199,6 +230,56 @@ class CollectorTests(unittest.TestCase):
         self.metrics = COLLECTOR.HealthMetrics()
         self.now = NOW.timestamp()
 
+    def test_probe_chart_is_optional_and_rolling_counts_are_absolute(self):
+        value = snapshot()
+        baseline = self.metrics.calculate(value, self.now)
+        self.assertNotIn('probe_retries_24h', baseline)
+        self.assertNotIn('probe_recoveries_24h', baseline)
+        value['state'].update({field: None for field in probe_fields()})
+        self.assertEqual(self.metrics.calculate(value, self.now), baseline)
+        value['state'].update(probe_fields())
+        actual = self.metrics.calculate(value, self.now)
+        self.assertEqual(actual['probe_retries_24h'], 3)
+        self.assertEqual(actual['probe_recoveries_24h'], 2)
+        for field, original in baseline.items():
+            self.assertEqual(actual[field], original)
+        self.assertEqual(actual['failures'], 0)
+        self.assertEqual(actual['invalid'], 0)
+        chart = COLLECTOR.CHARTS['calendar_probe']
+        self.assertIn('rolling 24 hours', chart['options'][1])
+        self.assertEqual([line[2:] for line in chart['lines']], [['absolute', 1, 1000]] * 2)
+        rules = (ROOT/'deploy/netdata/librus_local-health.conf').read_text()
+        self.assertNotIn('probe_retries_24h', rules)
+        self.assertNotIn('probe_recoveries_24h', rules)
+
+    def test_optional_probe_aggregates_malformed_in_snapshot_are_rejected(self):
+        for field, malformed in [('calendar_probe_result', 'private content'),
+                                 ('calendar_probe_result', {}), ('calendar_probe_attempts', True),
+                                 ('calendar_probe_attempts', 0), ('calendar_probe_attempts', 3),
+                                 ('calendar_probe_recovered', 'yes'), ('calendar_probe_retries_24h', -1),
+                                 ('calendar_probe_recoveries_24h', True),
+                                 ('calendar_probe_retries_24h', 10**12 + 1)]:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                value = snapshot()
+                value['state'].update(probe_fields())
+                value['state'][field] = malformed
+                COLLECTOR.validate_snapshot(value, self.now)
+
+    def test_current_probe_wire_is_accepted_and_legacy_metrics_preserved(self):
+        value = snapshot()
+        value['state'].update(probe_fields())
+        value['state'] = monitoring.sanitize_state(value['state'], NOW)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'status.json'
+            path.write_text(json.dumps(value))
+            service = COLLECTOR.Service({'path': str(path)})
+            with patch.object(COLLECTOR.time, 'time', return_value=self.now):
+                data = service.get_data()
+        self.assertEqual(data['probe_retries_24h'], 3000)
+        self.assertEqual(data['probe_recoveries_24h'], 2000)
+        self.assertEqual(data['failures'], 0)
+        self.assertEqual(data['invalid'], 0)
+
     def test_success_age_is_live_when_export_stalls(self):
         value = snapshot()
         first = self.metrics.calculate(value, self.now)
@@ -288,7 +369,8 @@ class CollectorTests(unittest.TestCase):
                     actual = service.get_data()
                 self.assertEqual(actual['invalid_minutes'], minutes * COLLECTOR.WIRE_SCALE)
                 self.assertEqual(actual['snapshot_age'], minutes * COLLECTOR.WIRE_SCALE)
-                self.assertEqual(set(actual), {line[0] for chart in COLLECTOR.CHARTS.values() for line in chart['lines']})
+                self.assertEqual(set(actual), {line[0] for chart in COLLECTOR.CHARTS.values()
+                    for line in chart['lines']} - COLLECTOR.OPTIONAL_METRICS)
 
     def test_corruption_retains_last_known_fault_and_ages_business_metrics(self):
         value = snapshot()

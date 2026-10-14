@@ -26,10 +26,10 @@ MESSAGE = {"text": proposal()["source_quote"], "sent_at": "2030-03-06T10:00:00+0
 
 
 class AnalysisPolicyTests(unittest.TestCase):
-    def test_tool_executor_remains_luna_medium(self):
+    def test_tool_executor_defaults_to_sol_high(self):
         args = CodexRuntime()._args("/private/work", "tool.json", ("list_calendars",))
-        self.assertEqual(args[args.index("-m") + 1], "gpt-6-luna")
-        self.assertIn('model_reasoning_effort="medium"', args)
+        self.assertEqual(args[args.index("-m") + 1], "gpt-6.1-sol")
+        self.assertIn('model_reasoning_effort="high"', args)
 
     def test_analysis_has_no_apps_shell_or_web(self):
         args = CodexRuntime()._args("/private/work", "analysis.json", ())

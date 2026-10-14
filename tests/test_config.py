@@ -19,6 +19,11 @@ from test_support import TEST_CONFIG
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_runtime_defaults_tool_execution_to_sol_high_without_changing_analysis(self):
+        config = AppConfig()
+        self.assertEqual((config.tool_model, config.tool_effort), ('gpt-6.1-sol', 'high'))
+        self.assertEqual((config.analysis_model, config.analysis_effort), ('gpt-6.1-sol', 'high'))
+
     def test_backup_policy_defaults_off_and_requires_explicit_boolean(self):
         self.assertFalse(AppConfig().backup_enabled)
         self.assertTrue(load_config(environ={'LIBRUS_CONFIG_FILE': '', 'LIBRUS_BACKUP_ENABLED': '1'}).backup_enabled)

@@ -22,6 +22,10 @@ Message analysis stores the actual runtime-reported model, reasoning effort, pro
 
 Full sync success is distinct from last attempt, dry-run, paused state and partial progress. The hourly worker persists sanitized technical stages, durations and error codes; a full success requires no automatic pending work or unknown outcomes. Proposals awaiting parent review do not necessarily block technical sync success. The read-only Netdata export contains aggregate health metadata, not message contents; a green health indicator is not proof that the model understood a message correctly.
 
+Analysis and every calendar tool use the configured model/effort, defaulting to `gpt-6.1-sol`/`high`. The initial calendar-list access probe has at most one retry after five seconds, only for a structured unexpected completed tool-call count (zero or multiple) with the exact expected read call and arguments. Unfinished calls and other failures do not retry; create/update/delete calls are outside this retry policy. Uncertain writes continue to require read-only reconciliation.
+
+Each persisted sync probe attempt contains only run/attempt identity, timestamps, model/effort, validated CLI version, result, process/error codes, tool-call/protocol counts and expected-call validation flags; technical history expires after 90 days. It excludes calendar identifiers, tool arguments/results, prompts, message data and raw errors. The panel shows last-run probe result, attempts and recovery. The additive monitoring fields are optional: absent/null evidence means no data. Netdata's absolute rolling 24-hour retry/recovery chart is informational; successful recovery does not create a sync warning, and existing alarms remain unchanged.
+
 Automatic database backups are intentionally disabled. Deployment does not create a database copy; forward recovery preserves the current operation journal. Both primary state and backups contain private school data. Audit evidence and tombstones remain local; there is no automatic history-wide reanalysis or irreversible blanket calendar repair.
 
 ## Private data boundaries

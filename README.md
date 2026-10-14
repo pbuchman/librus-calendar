@@ -17,6 +17,7 @@ It reads messages **directly from Librus**. Gmail notifications are not the inge
 - Adds one `[Librus]` title prefix. Descriptions include the source quote, an ownership marker and a **synchronization-start timestamp** in Europe/Warsaw. That timestamp means preparation of the durable operation, not confirmation of a completed calendar write.
 - Modifies only app-owned entries on the configured calendar, sends no invitations, and reconciles possible writes before retrying.
 - Provides a private Tailscale inbox, an hourly systemd sync and optional Netdata health checks.
+- Shows the latest calendar access check and any recovery after its bounded read-only retry; Netdata charts retries and recoveries over the last 24 hours.
 
 ## Try it locally
 
@@ -49,6 +50,8 @@ Open [http://127.0.0.1:8795](http://127.0.0.1:8795). The real app UI runs agains
 Real synchronization requires your Librus account, a supported authenticated Codex CLI runtime, an available analysis/tool model, a connected Google Calendar app and write access to the exact configured calendar. These prerequisites are **not bundled**; model names, connector identifiers and supported tools can vary by account and runtime. This is not a standalone OAuth integration. Start with the [configuration and deployment guide](docs/setup.md).
 
 Writes start paused. An initial `sync --dry-run` can still read Librus and invoke AI/calendar read tools; it is not the offline demo. Check the recognized actions and runtime probe before enabling writes.
+
+Analysis and calendar tools default to `gpt-6.1-sol` with `high` reasoning. Only the initial calendar-list probe may retry once after five seconds for a verified unexpected completed tool-call count (zero or multiple). Calendar writes are never retried by this probe policy; uncertain writes require read-only reconciliation. See [probe behavior and diagnostics](docs/setup.md#calendar-probe-and-safe-diagnostics).
 
 ## Privacy and limitations
 
