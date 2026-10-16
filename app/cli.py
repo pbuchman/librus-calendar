@@ -36,6 +36,10 @@ def main(argv=None, *, config=None):
     metadata = sub.add_parser('metadata-refresh', help='Preview title/timestamp updates to explicit existing event IDs.')
     metadata.add_argument('--event-id', action='append', required=True)
     metadata.add_argument('--apply', action='store_true')
+    grouping = sub.add_parser('group-existing', help='Preview an explicit private alternative grouping request; apply its fingerprint-bound private plan without Calendar writes.')
+    grouping.add_argument('--request-file', type=Path, help='Private JSON containing message_id, proposal_ids and source_evidence; preview only.')
+    grouping.add_argument('--plan-file', type=Path, required=True)
+    grouping.add_argument('--apply', action='store_true')
     pause = sub.add_parser('pause-writes')
     pause.add_argument('--resume', action='store_true')
     args = parser.parse_args(argv)
@@ -63,12 +67,25 @@ def main(argv=None, *, config=None):
             result = {'status': 'backed_up', 'path': store.backup(args.destination)}
         elif args.command == 'pause-writes':
             result = store.set_writes_paused(not args.resume)
-        elif args.command in ('migrate-decisions', 'prune'):
+        elif args.command in ('migrate-decisions', 'prune', 'group-existing'):
             from .data_admin import migrate_decisions, prune_state
             from .sync import sync_lock
             with sync_lock(store.path) as acquired:
                 if not acquired:
                     result = {'status': 'already_running', 'calendar_writes': 0}
+                elif args.command == 'group-existing':
+                    from .offer_groups import group_existing, read_private_json
+                    if args.apply:
+                        if args.request_file:
+                            raise ValueError('Apply uses only the exact saved plan.')
+                        request = {}
+                    else:
+                        if not args.request_file:
+                            raise ValueError('Preview requires a private explicit grouping request.')
+                        request = read_private_json(args.request_file)
+                        if set(request) != {'message_id','proposal_ids','source_evidence'}:
+                            raise ValueError('Unexpected grouping request fields.')
+                    result = group_existing(store, plan_path=args.plan_file, apply=args.apply, **request)
                 elif args.command == 'migrate-decisions':
                     probe = None
                     if args.allow_legacy_binding:

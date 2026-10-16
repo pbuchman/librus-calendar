@@ -8,12 +8,20 @@ Wszyscy nauczyciele, wiadomości i wyniki analizy są fikcyjni. Zegar wskazuje *
 
 | Zrzut | Źródło |
 | --- | --- |
-| `assets/inbox.png` | Rzeczywista skrzynka aplikacji, pięć fikcyjnych wiadomości napisanych od podstaw |
+| `assets/inbox.png` | Rzeczywista skrzynka aplikacji, siedem fikcyjnych wiadomości napisanych od podstaw |
 | `assets/message-detail.png` | Rzeczywisty szczegół wiadomości i fikcyjne rozpoznanie wyjścia do planetarium |
-| `assets/extracurricular-review.png` | Rzeczywisty formularz decyzji o udziale w dobrowolnej robotyce |
+| `assets/extracurricular-review.png` | Rzeczywista karta wyboru terminu jednej oferty szkolenia pierwszej pomocy, w tym miniony nieaktywny termin |
 | `assets/calendar-week.png` | Osobna lokalna ilustracja HTML na podstawie tych samych danych; **nie jest funkcją kalendarza aplikacji ani zrzutem Google Calendar** |
 
 Ilustracja kalendarza zawiera szkolne wyjście, spotkanie rodziców i całodniowy termin dostarczenia zgody. Robotyka pozostaje niezatwierdzona i nie pojawia się na niej. Zatwierdzenie propozycji zmienia wyłącznie tymczasową bazę; funkcja synchronizacji demo niczego nie wykonuje.
+
+## Wypróbuj jedną ofertę z terminami do wyboru
+
+Otwórz `/review` lub `/messages/demo-training-choice`. Fikcyjne szkolenie pierwszej pomocy ma trzy terminy, w tym jeden miniony — nadal widoczny, ale nieaktywny. Żaden nie jest domyślnie zaznaczony. Wybierz przyszły termin i naciśnij **Dodaj wybrany termin**, aby zakolejkować tylko ten wybór; karta pokaże wybrany termin i zamknie pozostałe opcje. **Odrzuć całą ofertę** odrzuca wszystkie opcje bez zaznaczania terminu. Rozstrzygnięta oferta znika z kolejki decyzji; stan wyboru albo odrzucenia pozostaje w szczególe wiadomości źródłowej. Licznik nawigacji liczy jedną otwartą ofertę zamiast każdej daty. Jeśli wybrany termin później wymaga sprawdzenia po konflikcie zapisu, do kolejki wraca wyłącznie ten termin z kontrolowanym zatwierdzeniem lub odrzuceniem; pozostałe opcje pozostają zamknięte. Niejednoznaczne nowe propozycje po wcześniejszej decyzji o ofercie pokazują kontekst źródłowy i pozwalają na odrzucenie, a zatwierdzenie jest zablokowane. Odświeżenie zachowuje decyzję w bieżącym procesie demo; ponowne uruchomienie zeruje fikcyjne dane.
+
+Osobna wiadomość `/messages/demo-training-series` opisuje dwa spotkania cyklu teatralnego. Pozostają zwykłymi osobnymi propozycjami; cykl nie jest wyborem alternatywnych dat. Istniejąca robotyka nadal wymaga zwykłego potwierdzenia udziału. Demo zawiera siedem fikcyjnych wiadomości napisanych od podstaw.
+
+Odczyt `/api/proposals` zachowuje dotychczasowy limit. `/api/proposal-groups` zwraca komplet opcji oferty niezależnie od tego limitu. Decyzja korzysta z `POST /api/proposal-groups/{id}/decision`, pól `decision=select|reject`, `proposal_id` przy wyborze i `expected_revision`, nagłówka tego samego źródła oraz ciasteczka i pola CSRF. Decyzja o pojedynczej propozycji nie omija zasady jednego wyboru. Zmiana źródła, nieaktualna wersja, miniony termin i sprzeczna decyzja o zamkniętej ofercie są odrzucane przez bazę aplikacji.
 
 ## Odtwórz cztery obrazy
 
@@ -28,7 +36,7 @@ npm install --prefix /tmp/librus-demo-browser playwright
 
 Aby użyć istniejącego Chrome/Chromium, zamiast pobierania przeglądarki podaj `--browser-executable /absolute/path/to/browser`. `--node /absolute/path/to/node` wybiera środowisko Node. `--output DIRECTORY` zmienia katalog czterech obrazów, domyślnie `docs/assets`. `--qa-output DIRECTORY` określa osobny katalog zrzutu mobilnego i wyników JSON; domyślnie pozostają poza repozytorium, w katalogu tymczasowym.
 
-Generator uruchamia izolowane demo, sprawdza tytuł, treść i oznaczenie strony, zapisuje widoki desktopowe 1440×1080, zatwierdza zajęcia dodatkowe i sprawdza zapis decyzji, wstrzymuje zapisy, żąda fikcyjnej synchronizacji i sprawdza nawigację do wiadomości przy 390×844. Blokuje nielokalne żądania przeglądarki i przerywa, jeśli którekolwiek zostanie podjęte lub wystąpi błąd przeglądarki. Następnie renderuje samodzielną ilustrację kalendarza. Piksele mogą nieznacznie zależeć od wersji przeglądarki i czcionek; dane i zegar są stałe.
+Generator uruchamia izolowane demo, sprawdza tytuł, treść i oznaczenie strony, zapisuje widoki desktopowe 1440×1080, zatwierdza osobną propozycję robotyki, sprawdza komplet alternatywnych terminów bez domyślnego wyboru i z nieaktywną minioną datą, wybiera jeden przyszły termin i sprawdza zamknięty stan w szczególe wiadomości, wstrzymuje zapisy, żąda fikcyjnej synchronizacji i sprawdza nawigację do wiadomości przy 390×844. Blokuje nielokalne żądania przeglądarki i przerywa, jeśli którekolwiek zostanie podjęte lub wystąpi błąd przeglądarki. Następnie renderuje samodzielną ilustrację kalendarza. Piksele mogą nieznacznie zależeć od wersji przeglądarki i czcionek; dane i zegar są stałe.
 
 Testy izolacji:
 

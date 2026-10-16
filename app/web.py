@@ -123,13 +123,29 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
     def page(request, section='messages', selected=None, notice=None):
         csrf = request.cookies.get(cookie_name) or secrets.token_urlsafe(32)
         next_sync = (clock().astimezone(WARSAW).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).isoformat()
+        groups = store.list_proposal_groups(current=clock())
+        grouped_ids = {member['id'] for group in groups for member in group['members']}
+        proposals = [item for item in store.list_proposals() if item['id'] not in grouped_ids]
+        selected_reviews = [{**member, 'selected_for_offer': True} for group in groups
+                            for member in group['members'] if group['status'] == 'selected'
+                            and member['id'] == group['selected_proposal_id'] and member['status'] == 'review']
+        proposals.extend(selected_reviews)
+        selected_review_ids = {member['id'] for member in selected_reviews}
+        status = store.status()
+        grouped_review_count = sum(member['status'] == 'review' and member['id'] not in selected_review_ids
+                                   for group in groups for member in group['members'])
+        open_groups = [group for group in groups if group['status'] == 'open']
+        review_count = max(0, status.get('proposals_review', 0) - grouped_review_count) + len(open_groups)
+        selected_groups = [group for group in groups if selected and group['message_id'] == selected['id']]
         context = {'next_sync': next_sync, 'request': request, 'csrf': csrf, 'section': section,
-                   'status': store.status(), 'messages': store.list_messages(),
-                   'events': store.list_events(), 'proposals': store.list_proposals(),
+                   'status': status, 'review_count': review_count, 'messages': store.list_messages(),
+                   'events': store.list_events(), 'proposals': proposals, 'proposal_groups': open_groups,
+                   'selected_groups': selected_groups,
+                   'has_review': bool(open_groups) or any(p['status'] == 'review' for p in proposals),
                    'selected': selected, 'notice': notice or request.query_params.get('notice'),
                    'demo_mode': demo_mode, 'demo_banner': 'Demo — dane fikcyjne / fictional data',
                    'calendar_label': 'calendar@example.test' if demo_mode else (config.calendar_id or 'Nie skonfigurowano'),
-                   'selected_proposals': [item for item in store.list_proposals() if selected and item.get('message_id') == selected.get('id')]}
+                   'selected_proposals': [item for item in proposals if selected and item.get('message_id') == selected.get('id') and not item.get('selected_for_offer')]}
         response = templates.TemplateResponse(request=request, name='inbox.html', context=context)
         response.set_cookie(cookie_name, csrf, httponly=True, secure=not allow_local,
                             samesite='strict', max_age=86400)
@@ -166,6 +182,10 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
     def proposals_api():
         return store.list_proposals()
 
+    @application.get('/api/proposal-groups')
+    def proposal_groups_api():
+        return store.list_proposal_groups(current=clock())
+
     @application.get('/api/events')
     def events_api():
         return store.list_events()
@@ -187,6 +207,26 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
         store.set_writes_paused(form['paused'] == 'true')
         return RedirectResponse('/?notice=writes', status_code=303)
 
+    @application.post('/api/proposal-groups/{group_id}/decision')
+    async def resolve_group(request: Request, group_id: str):
+        form = await request.form()
+        decision = str(form.get('decision', ''))
+        proposal_id = str(form.get('proposal_id', '')).strip() or None
+        if decision not in {'select', 'reject'} or (decision == 'select' and not proposal_id):
+            raise HTTPException(400, 'Wybierz jeden termin albo odrzuć całą ofertę.')
+        try:
+            revision = int(str(form.get('expected_revision', '')))
+            store.resolve_proposal_group(group_id, decision, proposal_id=proposal_id, expected_revision=revision, current=clock())
+        except (ValueError, KeyError):
+            raise HTTPException(400, 'Nie można zapisać tej decyzji. Odśwież ofertę i sprawdź dostępne terminy.') from None
+        target = '/review'
+        return_to = str(form.get('return_to', ''))
+        group = store.get_proposal_group(group_id, current=clock())
+        if group and return_to == 'message':
+            from urllib.parse import quote
+            target = '/messages/' + quote(str(group['message_id']), safe='')
+        return RedirectResponse(target + '?notice=resolved', status_code=303)
+
     @application.post('/proposals/{proposal_id}')
     async def resolve(request: Request, proposal_id: str):
         form = await request.form()
@@ -199,6 +239,9 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
             changes['all_day'] = form.get('all_day') == 'true'
         try:
             proposal = next((item for item in store.list_proposals() if str(item['id']) == proposal_id), None)
+            if proposal is None:
+                group = store.get_proposal_group_for_proposal(proposal_id, current=clock())
+                proposal = next((member for member in group['members'] if str(member['id']) == proposal_id), None) if group else None
             if not proposal or (proposal.get('kind') == 'cancel' and action == 'approve'):
                 raise ValueError('Cancellation requires explicit confirmation')
             store.resolve_proposal(proposal_id, 'ignore' if action == 'reject' else action, changes)

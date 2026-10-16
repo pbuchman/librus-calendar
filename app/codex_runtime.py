@@ -24,7 +24,7 @@ import jsonschema
 from .config import AppConfig, ConfigurationError, load_config
 ANALYSIS_MODEL = "gpt-6.1-sol"
 ANALYSIS_EFFORT = "high"
-ANALYSIS_PROMPT_VERSION = "school-actions-v3"
+ANALYSIS_PROMPT_VERSION = "school-actions-v4-alternatives"
 TOOL_MODEL = "gpt-6.1-sol"
 TOOL_EFFORT = "high"
 # Backward-compatible names refer only to the calendar tool executor.
@@ -477,6 +477,13 @@ class CodexRuntime:
                 return data
             try:
                 result = json.loads(messages[-1])
+                # Nullable additive fields keep previously persisted synthetic or
+                # compatible runtime output readable; new strict output includes them.
+                if schema == 'analysis.json' and isinstance(result, dict) and isinstance(result.get('proposals'), list):
+                    for proposal in result['proposals']:
+                        if isinstance(proposal, dict):
+                            proposal.setdefault('alternative_group', None)
+                            proposal.setdefault('alternative_group_evidence', None)
                 jsonschema.validate(result, json.loads((SCHEMAS / schema).read_text()))
             except (ValueError, IndexError, jsonschema.ValidationError, jsonschema.SchemaError):
                 raise RuntimeFailure("invalid_analysis_json")
@@ -524,6 +531,11 @@ class CodexRuntime:
                     proposal.update(needs_review=True, review_reason=(proposal["review_reason"].strip() + " " + reason).strip()[:1000])
                 if proposal["needs_review"] and not proposal["review_reason"].strip():
                     proposal["review_reason"] = "Termin lub zastosowanie zadania wymaga potwierdzenia."
+        from .offer_groups import validate_alternatives
+        validate_alternatives(data, proposals)
+        for proposal in proposals:
+            if proposal.get('alternative_group'):
+                proposal.update(needs_review=True, review_reason='Wybierz jeden termin z całej oferty alternatywnych zajęć.')
         self.last_analysis_metadata = {
             "model": self.config.analysis_model, "effort": self.config.analysis_effort,
             "prompt_version": ANALYSIS_PROMPT_VERSION, "decision_reason": result["decision_reason"],

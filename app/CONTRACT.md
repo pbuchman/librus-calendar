@@ -44,7 +44,7 @@ The additive proposal column requires forward recovery after migration: earlier 
 ## Runtime analysis
 
 `CodexRuntime(config: AppConfig | None = None).analyze(message:dict, related_events:list[dict]) -> list[dict]`.
-`last_analysis_metadata` is reset before each call and set only after that call succeeds: {model, effort, prompt_version: `school-actions-v3`, decision_reason}. The model supplies a nonblank decision reason even when proposals is empty. The store persists only these documented fields, not arbitrary runtime metadata. A compatible legacy runtime with missing metadata is recorded with unknown model/effort/prompt_version and an explicit missing-reason explanation; it never inherits provenance from a previous call.
+`last_analysis_metadata` is reset before each call and set only after that call succeeds: {model, effort, prompt_version: `school-actions-v4-alternatives`, decision_reason}. The model supplies a nonblank decision reason even when proposals is empty. The store persists only these documented fields, not arbitrary runtime metadata. A compatible legacy runtime with missing metadata is recorded with unknown model/effort/prompt_version and an explicit missing-reason explanation; it never inherits provenance from a previous call.
 Message shape is Store message row (id,subject,sender,sent_at,text). Related events are Store list_events dictionaries; user modifications must be checked again by execute, never inferred safe from cached fingerprints.
 
 Analysis proposal schema: {kind: "create"|"update"|"cancel"|"ignore", temporal_kind: "event"|"deadline"|"reminder", activity_scope: "school"|"extracurricular"|"unknown", due_at: ISO timestamp|null, title: str, description: str, start: ISO date or datetime, end: ISO date or datetime|null, all_day: bool, confidence:"high"|"medium"|"low", needs_review:bool, review_reason:str, source_quote:str, event_id:str|null}. Core fills message_id/id and validates. Existing proposals lacking temporal_kind default to `event`; missing activity_scope defaults to `unknown`. `ignore` may have empty date fields. Update requires event_id of an app-owned event. Cancellation is always initial manual review; only explicit confirm_cancel from the panel grants trusted deletion_approved=true. Analysis cannot grant this. Uncertain proposals -> review, past -> ignored. App titles start `[Librus]`; normalization strips repeated legacy `[Szkoła]` and current prefixes before adding one `[Librus]`.
@@ -52,6 +52,72 @@ Analysis proposal schema: {kind: "create"|"update"|"cancel"|"ignore", temporal_k
 Ordinary school actions with high or medium confidence and needs_review=false may be automatic, including optional classroom crafts and uniquely established preparation dates. Genuine ambiguity, missing source evidence, duplicate/conflicting dates and cancellation remain review. Extracurricular creates require participation approval; any nonignored unknown-scope action requires review unless already human-approved. Scope is per action, so an extra-activity offer in the same message cannot block a separately classified school action. A narrow enrollment-expression guard applies only to unknown legacy proposals; `chętni` alone is not a registration requirement. Existing human-approved proposals are not reanalyzed or reclassified by migration.
 
 A deadline is a task due by a date/time, persisted as all_day=true with date-only start and exclusive next-day end. The prompt emits end=null; core normalizes a stale end to exactly one calendar day. due_at is nullable, but if present must include an explicit Europe/Warsaw-valid numeric offset and fall on the start day. The exact timestamp is retained; title and description show `do HH:MM`, and the description includes its date. No one-hour duration is inferred for deadlines. A timed deadline or invalid/mismatched due_at becomes review and cannot reach Calendar. Date-only reminders likewise require all_day=true. A uniquely inferred preparation date connected to an ordinary school activity may be automatic at medium confidence. Ambiguous inferred dates require review. Ordinary timed events retain the explicitly noted one-hour fallback. Source-quote, optional-participation, duplicate and unknown-write safeguards apply independently of temporal classification.
+
+## Explicit alternative offers
+
+Analysis adds nullable `alternative_group` and `alternative_group_evidence` fields.
+New strict output includes both; compatible older output defaults them to null.
+Only explicitly related create/event/extracurricular alternatives with two to
+thirty distinct dates and the same matching source excerpt form a group. No title
+similarity or language keyword list establishes membership. Independent obligations
+and recurring course lessons remain separate proposals. Unsupported grouping claims
+lose their group fields and remain manual review; they never gain automatic writes.
+
+Additive `proposal_groups` and `proposal_group_members` tables bind stable existing
+proposal IDs to one message/source hash. States are `open`, `selected`, `rejected`.
+`AppStore.list_proposal_groups(message_id=None,status=None,current=None)`,
+`get_proposal_group(id,current=None)` and
+`get_proposal_group_for_proposal(id,current=None)` return consistent complete groups,
+independent of the ordinary 100-proposal/message page limits. Shape is
+`{id,message_id,source_hash,group_key,source_evidence,status,selected_proposal_id,
+revision,stale,members:[proposal+eligible+ineligible_reason]}` with members sorted
+chronologically. Ineligibility codes are `past`, `stale`, `closed`, `unavailable`,
+`invalid`. The optional aware clock supports deterministic demo/testing.
+
+`resolve_proposal_group(group_id,decision,proposal_id=None,expected_revision=None,
+current=None)` accepts `select` for exactly one future member or `reject` for all.
+It reserves `BEGIN IMMEDIATE` before its first read, verifies source/revision and
+complete membership, and atomically approves the selected proposal, rejects every
+sibling, and records all member `decision_intents`. It never contacts Calendar.
+Identical repeated decisions return the closed state without another mutation;
+conflicting decisions fail. Past selection, stale source, external write evidence,
+invalid revision and persistence failure leave the whole group unchanged.
+
+Open and unselected group members cannot use individual proposal decisions. An
+already selected member may use the established individual review/rebase path,
+with unchanged source, operation and owned-event guards; its siblings remain closed.
+Queue preparation and claim independently verify the selected membership. Known
+independent offers remain separate even when they share a date/source quote.
+Reanalysis cannot supersede a closed group. Ordinary reconstruction retains exact
+human intent; unknown/renamed grouping requires matching literal offer evidence.
+Ambiguous replacements remain review with `blocked_by_group_decision`; approval
+is refused, while explicit ignore can safely dismiss them. Dates alone never
+transfer approval between offers. No new write retry behavior is introduced.
+
+Successful analysis of a changed source atomically supersedes untouched members
+and removes its unsupported old open group, without human-rejection flags. Retention
+uses the same reservation before reading eligibility or flags and retires open
+groups whose source expires. Closed groups retain minimal decision state/membership
+through pruning and direct decision transfer; source excerpts are removed.
+
+`group-existing --request-file PRIVATE_REQUEST_JSON --plan-file NEW_PRIVATE_PLAN_JSON`
+previews exactly one explicitly confirmed legacy group. Request keys are
+`{message_id,proposal_ids,source_evidence}` with 2–30 unique explicit current
+create/event/extracurricular review proposals from one source. Request files must
+be owned regular files mode 0600. The non-overwriting plan is 0600 in an owned 0700
+directory and binds the absolute database path, source hash and exact proposal row
+fingerprints. The explicit request may confirm alternatives whose source lists
+sessions without specific choice keywords; evidence still must match the source.
+
+`group-existing --plan-file PRIVATE_PLAN_JSON --apply` rechecks that plan under
+sync.lock and an immediate SQLite transaction, then adds only group/membership
+rows. Existing proposal IDs, payload bytes and operation journals are unchanged.
+Any event history, human intent or operation journal in the selected scope refuses
+grouping. Repeating an unchanged applied plan returns `already_applied`; changed
+source, rows or human group state refuses. Outputs contain only counts, status,
+`calendar_writes:0`, and the preview plan path. Neither command initializes Librus,
+analysis or Calendar clients. A grouping request or plan is private operational data
+and must never be committed.
 
 ## Explicit cached reanalysis
 

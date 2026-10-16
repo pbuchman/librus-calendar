@@ -13,6 +13,7 @@ It reads messages **directly from Librus**. Gmail notifications are not the inge
 ## What it does
 
 - Keeps message bodies, recognized actions, analysis provenance and calendar snapshots in a local SQLite database.
+- Groups explicitly alternative dates for one optional offer into one card. Choose one date with no default selection, or reject the whole offer. Past options stay visible and disabled; choosing a date closes the other options. Recurring meetings and separate obligations keep independent decisions.
 - Automatically queues clear future school events, reminders and deadlines when calendar writes are enabled. Optional extracurricular activities require participation approval; ambiguity, conflicts and cancellations require review.
 - Adds one `[Librus]` title prefix. Descriptions include the source quote, an ownership marker and a **synchronization-start timestamp** in Europe/Warsaw. That timestamp means preparation of the durable operation, not confirmation of a completed calendar write.
 - Modifies only app-owned entries on the configured calendar, sends no invitations, and reconciles possible writes before retrying.
@@ -39,7 +40,7 @@ Open [http://127.0.0.1:8795](http://127.0.0.1:8795). The real app UI runs agains
 
 ![Actual app review screen for a synthetic extracurricular activity](docs/assets/extracurricular-review.png)
 
-*The optional robotics workshop awaits participation approval.*
+*One fictional first-aid offer presents alternative dates; the past option is visible and disabled. No date is selected by default.*
 
 ![Locally rendered calendar illustration using the same synthetic fixtures](docs/assets/calendar-week.png)
 

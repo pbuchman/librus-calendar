@@ -8,12 +8,20 @@ All teacher names, messages and analysis results are synthetic. The clock is **6
 
 | Screenshot | Source |
 | --- | --- |
-| `assets/inbox.png` | Actual app inbox, five newly authored fictional messages |
+| `assets/inbox.png` | Actual app inbox, seven newly authored fictional messages |
 | `assets/message-detail.png` | Actual app detail and synthetic recognized planetarium event |
-| `assets/extracurricular-review.png` | Actual app participation-review form for optional robotics |
+| `assets/extracurricular-review.png` | Actual app choice card for one optional first-aid offer, including a past disabled date |
 | `assets/calendar-week.png` | Separate local HTML illustration from the same fixture; **not an app calendar feature or a Google Calendar screenshot** |
 
 The calendar illustration contains the school trip, parent meeting and all-day consent deadline. Robotics remains unapproved and is absent. Approving its proposal only changes temporary SQLite state; the demo's sync callback is a no-op.
+
+## Try one offer with alternative dates
+
+Open `/review` or `/messages/demo-training-choice`. The fictional first-aid offer has three dates, including one past date that remains visible and disabled. None is selected by default. Select one future date and use **Dodaj wybrany termin** to queue only that choice; the card then shows the chosen date and closes all other options. **Odrzuć całą ofertę** rejects every option without needing a date selection. Completed offers leave the review queue; the selected or rejected state remains visible in source-message detail. The navigation badge counts one open offer rather than each alternative. If the chosen date later needs review after a write conflict, only that chosen date returns to the queue with guarded approval/rejection controls; the other dates stay closed. Ambiguous replacement proposals after an earlier offer decision show source context and allow rejection, with approval blocked. Refreshing preserves the decision for that demo process; restarting resets all fictional state.
+
+The separate message `/messages/demo-training-series` contains two meetings of a recurring theatre course. Both remain ordinary independent proposals; a series is not a choice of alternative dates. Existing optional robotics remains an ordinary participation approval. The fixture has seven newly authored fictional messages.
+
+The read-only `/api/proposals` remains available with its existing limit. `/api/proposal-groups` supplies complete offer membership independently of that limit. Group decisions use `POST /api/proposal-groups/{id}/decision` with `decision=select|reject`, `proposal_id` for selection, `expected_revision`, the same-origin header and the CSRF cookie/form token. Individual proposal decisions cannot bypass the one-choice rule. Source changes, a stale revision, past dates or a conflicting closed decision are rejected by the store.
 
 ## Reproduce the four images
 
@@ -28,7 +36,7 @@ npm install --prefix /tmp/librus-demo-browser playwright
 
 If using an existing Chrome/Chromium installation, pass `--browser-executable /absolute/path/to/browser` instead of downloading a browser. `--node /absolute/path/to/node` selects a Node runtime. `--output DIRECTORY` overrides the four-image destination, whose default is `docs/assets`. `--qa-output DIRECTORY` selects a separate directory for the mobile screenshot and JSON check summary; by default these remain outside the repository in the temporary directory.
 
-The renderer starts the isolated demo, checks the actual page title, content and banner, captures desktop screens at 1440×1080, approves the extracurricular proposal and verifies its stored state, pauses writes, requests a no-op sync, and checks message navigation at 390×844. It blocks non-loopback browser requests and fails if any are attempted or browser errors occur. It then renders the standalone calendar illustration. Image pixels may vary slightly across browser/font versions; fixture values and the clock are fixed.
+The renderer starts the isolated demo, checks the actual page title, content and banner, captures desktop screens at 1440×1080, approves the standalone robotics proposal, checks the complete alternative offer with no default and a past disabled date, selects one future option and verifies the closed state in message detail, pauses writes, requests a no-op sync, and checks message navigation at 390×844. It blocks non-loopback browser requests and fails if any are attempted or browser errors occur. It then renders the standalone calendar illustration. Image pixels may vary slightly across browser/font versions; fixture values and the clock are fixed.
 
 Isolation tests:
 

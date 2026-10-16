@@ -28,7 +28,7 @@ class DemoTests(unittest.TestCase):
                     self.assertIn('06.03.2030, 11:00', page.text)
                     self.assertNotIn('must-not-use', page.text)
                     self.assertEqual(store.status()['events'], len(CALENDAR_EVENTS))
-                    self.assertEqual(store.status()['proposals_review'], 1)
+                    self.assertGreaterEqual(store.status()['proposals_review'], 3)
                     csrf = client.cookies.get('librus_csrf')
                     result = client.post('/sync', data={'csrf': csrf}, headers={'origin': 'http://testserver'})
                     self.assertEqual(result.status_code, 200)
@@ -54,6 +54,30 @@ class DemoTests(unittest.TestCase):
             finally:
                 first.close()
                 second.close()
+
+    def test_alternative_offer_is_one_card_and_recurring_series_stays_independent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = seed_store(Path(directory)/'state.sqlite3')
+            try:
+                groups = store.list_proposal_groups(current=DEMO_NOW)
+                self.assertEqual(len(groups), 1)
+                self.assertEqual(groups[0]['message_id'], 'demo-training-choice')
+                self.assertEqual(len(groups[0]['members']), 3)
+                self.assertEqual(sum(member['eligible'] for member in groups[0]['members']), 2)
+                client = TestClient(make_demo_app(store), client=('127.0.0.1', 50000))
+                page = client.get('/review').text
+                self.assertEqual(page.count('data-offer-id='), 1)
+                self.assertEqual(page.count('type="radio"'), 3)
+                self.assertNotIn('type="radio" name="proposal_id" checked', page)
+                self.assertIn('Termin minął', page)
+                self.assertIn('Sala C', page)
+                self.assertIn('Przykładowa 8', page)
+                series = [item for item in store.list_proposals() if item['message_id'] == 'demo-training-series']
+                self.assertEqual(len(series), 2)
+                self.assertTrue(all('/proposals/' + item['id'] in page for item in series))
+                self.assertIn('data-offer-id=', client.get('/messages/demo-training-choice').text)
+            finally:
+                store.close()
 
     def test_calendar_is_explicit_illustration_from_same_fixture(self):
         illustration = calendar_illustration()

@@ -128,3 +128,20 @@ nonempty, auditable Polish result summary stating which actions/dates were found
 or why none qualify. It is not hidden reasoning or a transcript of your analysis.
 No proposals must have an explicit reason, e.g. general undated advice or another
 person's task. Never claim an action was executed or a calendar was modified.
+
+
+Alternative dates for ONE extracurricular participation offer must share a short
+`alternative_group` marker and the same literal `alternative_group_evidence`
+excerpt establishing the offered alternatives; use null for both on every
+independent obligation. A message can offer several dates without literally saying
+"choose one": group only when its meaning is clearly alternative participation.
+Every alternative requires manual review, even with exact dates and high confidence.
+Never infer a group from matching titles, activities or nearby dates. A course's
+first lesson plus each following lesson is a series, so all group fields are null.
+A consent deadline and the trip itself are independent obligations, likewise
+preparation with its own date and an event; leave their group fields null.
+Different sibling/child appointments and two separately required classes are
+independent. If the relationship is unclear, leave both fields null and require
+review with a short explanation. Use a different marker for each distinct offer
+inside the source. Only create/event/extracurricular proposals may be alternatives;
+never group updates, cancellations, deadlines or reminders.

@@ -1,0 +1,30 @@
+{% macro offer_card(group, return_to) -%}
+<article class="proposal offer-group" aria-label="Oferta z terminami do wyboru" data-offer-id="{{ group.id }}">
+  <div class="proposal-heading"><div>
+    <span class="status-tag">{{ {'open':'Wybierz jeden termin', 'selected':'Wybrano termin', 'rejected':'Odrzucono całą ofertę'}.get(group.status, 'Do sprawdzenia') }}</span>
+    <h2>{{ group.members[0].title }}</h2>
+  </div>{% if return_to != 'message' %}<a href="/messages/{{ group.message_id|urlencode }}">Otwórz wiadomość</a>{% endif %}</div>
+  <p>{% if group.status == 'open' %}To jedna oferta z alternatywnymi terminami. Wybierz jeden termin, aby dodać go do kalendarza, albo odrzuć całą ofertę.{% elif group.status == 'selected' %}Wybrano jeden termin tej oferty. Pozostałe opcje są zamknięte.{% else %}Odrzucono wszystkie terminy tej oferty.{% endif %}</p>
+  {% if group.source_evidence %}<blockquote>{{ group.source_evidence }}</blockquote>{% endif %}
+  {% if group.stale %}<p class="error">Treść wiadomości lub stan oferty się zmieniły. Oferta wymaga ponownej analizy.</p>{% endif %}
+  <form method="post" action="/api/proposal-groups/{{ group.id|urlencode }}/decision">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <input type="hidden" name="expected_revision" value="{{ group.revision }}">
+    <input type="hidden" name="return_to" value="{{ return_to }}">
+    <fieldset class="offer-options"><legend>{{ 'Dostępne terminy — wybierz jeden' if group.status == 'open' else 'Terminy oferty' }}</legend>
+    {% for option in group.members %}
+      <label class="offer-option {{ 'unavailable' if not option.eligible and group.status == 'open' }} {{ 'chosen' if group.selected_proposal_id == option.id }}">
+        {% if group.status == 'open' %}<input type="radio" name="proposal_id" value="{{ option.id }}" required {% if not option.eligible or group.stale %}disabled{% endif %}>{% endif %}
+        <span class="option-content"><strong>{{ option.start|human_date }}{% if option.end %} – {{ option.end|human_date }}{% endif %}{{ ' · cały dzień' if option.all_day }}</strong>
+        {% if option.description %}<span class="option-description">{{ option.description }}</span>{% endif %}
+        {% if option.source_quote and option.source_quote != group.source_evidence %}<span class="option-quote">{{ option.source_quote }}</span>{% endif %}
+        {% if group.selected_proposal_id == option.id %}<span class="status-tag">Wybrany · {{ {'pending':'Czeka na zapis', 'applied':'W kalendarzu','review':'Do sprawdzenia'}.get(option.status, option.status) }}</span>
+        {% elif group.status == 'selected' %}<span class="status-tag">Niewybrany — zamknięty</span>
+        {% elif group.status == 'rejected' %}<span class="status-tag">Odrzucony</span>
+        {% elif not option.eligible %}<span class="status-tag">{{ 'Termin minął — niedostępny' if option.ineligible_reason == 'past' else 'Termin niedostępny' }}</span>{% endif %}</span>
+      </label>
+    {% endfor %}</fieldset>
+    {% if group.status == 'open' and not group.stale %}{% set available = group.members|selectattr('eligible')|list %}{% if not available %}<p>Brak dostępnych terminów. Możesz odrzucić całą ofertę.</p>{% endif %}<div class="actions"><button class="primary" type="submit" name="decision" value="select" {% if not available %}disabled{% endif %}>Dodaj wybrany termin</button><button class="subtle" type="submit" name="decision" value="reject" formnovalidate>Odrzuć całą ofertę</button></div>{% endif %}
+  </form>
+</article>
+{%- endmacro %}

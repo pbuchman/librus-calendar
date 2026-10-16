@@ -23,6 +23,10 @@ class FakeStore:
                      status='pending',attachment_count=0)]
     def get_message(self, key):
         return self.list_messages()[0] if key == 'm1' else None
+    def list_proposal_groups(self, **kwargs):
+        return []
+    def get_proposal_group_for_proposal(self, key, **kwargs):
+        return None
     def list_events(self):
         return []
     def list_proposals(self):

@@ -26,7 +26,7 @@ def intent_signature(item):
 def minimal_proposal(item):
     """Keep a chosen action, never the original teacher quote or AI reasoning."""
     keep = ('id', 'message_id', 'kind', 'title', 'start', 'end', 'all_day', 'temporal_kind',
-            'due_at', 'activity_scope', 'event_id', 'default_duration', *FLAGS)
+            'due_at', 'activity_scope', 'event_id', 'default_duration', 'alternative_group_id', 'blocked_by_group_decision', *FLAGS)
     result = {key: item[key] for key in keep if key in item}
     result.update(description=item.get('description', '') if item.get('user_approved') or item.get('user_edited') else '',
                   source_quote='', confidence='high' if item.get('user_approved') else 'low',
@@ -76,11 +76,36 @@ def protect_decision(store, message, item):
     if not rows:
         return item
     signature = json.loads(json.dumps(intent_signature(item)))
+    if item.get('alternative_group'):
+        group = store.db.execute('SELECT id FROM proposal_groups WHERE message_id=? AND source_hash=? AND group_key=?',
+            (message['id'],message['payload_hash'],item['alternative_group'])).fetchone()
+        if group:
+            member_ids = {row[0] for row in store.db.execute('SELECT proposal_id FROM proposal_group_members WHERE group_id=?',(group['id'],))}
+        else:
+            # A renamed marker needs the same literal offer evidence. A broad
+            # source quote and coinciding date do not identify a different offer.
+            evidence = re.sub(r'\s+', ' ', str(item.get('alternative_group_evidence') or '')).strip()
+            candidates = [row for row in store.db.execute(
+                'SELECT m.proposal_id,g.id AS group_id,g.source_evidence FROM proposal_group_members m JOIN proposal_groups g ON g.id=m.group_id WHERE g.message_id=? AND g.source_hash=?',
+                (message['id'],message['payload_hash'])) if evidence and re.sub(r'\s+',' ',row['source_evidence']).strip()==evidence]
+            member_ids = {row['proposal_id'] for row in candidates} if len({row['group_id'] for row in candidates})==1 else set()
+        rows = [row for row in rows if row['id'] in member_ids]
+        if not rows:
+            return item
+    else:
+        possible_groups = set()
+        for known in store.db.execute('SELECT p.*,m.group_id FROM proposals p JOIN proposal_group_members m ON m.proposal_id=p.id WHERE p.message_id=? AND p.source_hash=?',
+                                      (message['id'],message['payload_hash'])):
+            if json.loads(json.dumps(intent_signature(store._proposal(known)))) == signature:
+                possible_groups.add(known['group_id'])
+        if len(possible_groups)>1:
+            return dict(item,status='review',needs_review=True,
+                review_reason='A prior offer decision cannot be matched to one offer; explicit reconciliation required.')
     matches = [row for row in rows if json.loads(row['payload']).get('signature') == signature]
     if len(matches) == 1 and matches[0]['source_hash'] == message['payload_hash']:
         decision = json.loads(matches[0]['payload'])['proposal']
         if decision.get('user_rejected'):
-            return dict(item, status='ignored', user_rejected=True, review_reason='Explicit prior user rejection retained.')
+            return dict(item, id=matches[0]['id'], status='ignored', user_rejected=True, review_reason='Explicit prior user rejection retained.')
         # A previously applied approval is never a new operation, regardless of
         # current model wording. Unwritten approvals retain the edited action.
         retained_status = decision.get('status', 'review')
@@ -199,6 +224,10 @@ def migrate_decisions(store, source_path, *, allow_legacy_binding=False, verifie
         decisions = {}
         if 'decision_intents' in tables:
             decisions = {row['id']: dict(row) for row in source.execute('SELECT * FROM decision_intents')}
+        groups = [dict(row) for row in source.execute("SELECT * FROM proposal_groups WHERE status<>'open'")] if 'proposal_groups' in tables else []
+        group_members = [dict(row) for row in source.execute('SELECT * FROM proposal_group_members')] if 'proposal_group_members' in tables else []
+        group_ids = {row['id'] for row in groups}
+        group_members = [row for row in group_members if row['group_id'] in group_ids]
         proposals = list(source.execute('SELECT * FROM proposals'))
         for row in proposals:
             item = json.loads(row['payload'])
@@ -254,6 +283,22 @@ def migrate_decisions(store, source_path, *, allow_legacy_binding=False, verifie
                 created_at, pending_since = proposal_age(row, item['status'])
                 store.db.execute('INSERT OR IGNORE INTO proposals(id,message_id,source_hash,payload,status,created_at,updated_at,pending_since) VALUES (?,?,?,?,?,?,?,?)',
                                  (row['id'], row['message_id'], row['source_hash'], json.dumps(item, ensure_ascii=False), item['status'], created_at, row['updated_at'], pending_since))
+            for group in groups:
+                members = [row for row in group_members if row['group_id'] == group['id']]
+                if len(members) < 2 or any(member['proposal_id'] not in decisions for member in members):
+                    raise ValueError('Group decision membership is incomplete.')
+                prior = store.db.execute('SELECT * FROM proposal_groups WHERE id=?', (group['id'],)).fetchone()
+                immutable = ('message_id','source_hash','group_key','status','selected_proposal_id','revision')
+                if prior and any(prior[key] != group[key] for key in immutable):
+                    raise ValueError('Target contains a conflicting group decision.')
+                store.db.execute('INSERT OR IGNORE INTO proposal_groups VALUES (?,?,?,?,?,?,?,?,?,?)',
+                    tuple(group[key] if key != 'source_evidence' else '' for key in ('id','message_id','source_hash','group_key','source_evidence','status','selected_proposal_id','revision','created_at','updated_at')))
+                for member in members:
+                    prior_member = store.db.execute('SELECT group_id,position FROM proposal_group_members WHERE proposal_id=?', (member['proposal_id'],)).fetchone()
+                    if prior_member and (prior_member['group_id'] != member['group_id'] or prior_member['position'] != member['position']):
+                        raise ValueError('Target contains conflicting group membership.')
+                    store.db.execute('INSERT OR IGNORE INTO proposal_group_members VALUES (?,?,?)',
+                        (member['group_id'],member['proposal_id'],member['position']))
             for row in events:
                 snapshot = json.loads(row['snapshot'])
                 if not row['marker'] or not snapshot.get('id') or snapshot['id'] != row['id']:
@@ -304,6 +349,20 @@ def migrate_decisions(store, source_path, *, allow_legacy_binding=False, verifie
 
 
 def prune_state(store, *, days=30, apply=False, current=None):
+    # UI decisions use a separate connection. Reserve before reading retention
+    # eligibility or proposals so their latest trusted human flags cannot be lost.
+    with store.lock:
+        if apply:
+            store.db.execute('PRAGMA secure_delete=ON')
+            with store.db:
+                if not store.db.in_transaction:
+                    store.db.execute('BEGIN IMMEDIATE')
+                return _prune_state_locked(store, days=days, apply=True, current=current)
+        with store._group_snapshot():
+            return _prune_state_locked(store, days=days, apply=False, current=current)
+
+
+def _prune_state_locked(store, *, days=30, apply=False, current=None):
     if type(days) is not int or not 1 <= days <= 30:
         raise ValueError('Retention must be between one and thirty days.')
     current = current or datetime.now(WARSAW)
@@ -329,6 +388,7 @@ def prune_state(store, *, days=30, apply=False, current=None):
         with store.db:
             for row in old:
                 mid = row['id']
+                store._retire_open_groups(mid)
                 for proposal in store.db.execute('SELECT * FROM proposals WHERE message_id=?', (mid,)).fetchall():
                     item = store._proposal(proposal)
                     remember_decision(store, proposal, item)
@@ -347,7 +407,8 @@ def prune_state(store, *, days=30, apply=False, current=None):
                     except (ValueError, TypeError, KeyError):
                         future = True
                     linked = store.db.execute('SELECT 1 FROM events WHERE proposal_id=?', (proposal['id'],)).fetchone()
-                    if not operation and not linked and not future and not any(item.get(flag) for flag in FLAGS):
+                    grouped = store.db.execute('SELECT 1 FROM proposal_group_members WHERE proposal_id=?', (proposal['id'],)).fetchone()
+                    if not operation and not linked and not grouped and not future and not any(item.get(flag) for flag in FLAGS):
                         store.db.execute('DELETE FROM proposals WHERE id=?', (proposal['id'],))
                         continue
                     if item['status'] == 'pending':
@@ -363,6 +424,7 @@ def prune_state(store, *, days=30, apply=False, current=None):
                 clean = {'id': mid, 'sent_at': row['sent_at'], 'text': '', 'retained': True}
                 if mid in dirty_ids:
                     store.db.execute("UPDATE messages SET payload=?,status='retained',last_error=NULL,pending_since=NULL,analysis_metadata=NULL,analyzed_at=NULL WHERE id=?", (json.dumps(clean), mid))
+                store.db.execute("UPDATE proposal_groups SET source_evidence='' WHERE message_id=?", (mid,))
                 store.db.execute('DELETE FROM analysis_audit WHERE message_id=?', (mid,))
                 for event in store.db.execute('SELECT * FROM events WHERE message_id=?', (mid,)).fetchall():
                     if store.db.execute("SELECT 1 FROM operations WHERE proposal_id=? AND status IN ('inflight','unknown')", (event['proposal_id'],)).fetchone():

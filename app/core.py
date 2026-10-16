@@ -215,7 +215,10 @@ def event_body(proposal, message, marker, synchronization_started_at=None):
             }
 
 
-class AppStore:
+from .offer_groups import GROUP_SCHEMA, ProposalGroupsMixin
+
+
+class AppStore(ProposalGroupsMixin):
     def __init__(self, path=None, *, config=None):
         os.umask(0o077)
         self.config = config if config is not None else load_config()
@@ -277,6 +280,7 @@ class AppStore:
             CREATE TABLE IF NOT EXISTS calendar_discovery_review(id TEXT PRIMARY KEY,reason TEXT NOT NULL,updated_at TEXT NOT NULL,blocking INTEGER NOT NULL DEFAULT 1);
             CREATE TABLE IF NOT EXISTS metadata_refresh(id TEXT PRIMARY KEY,event_id TEXT NOT NULL,version TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,result TEXT,last_error TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(event_id,version));
             ''')
+            self.db.executescript(GROUP_SCHEMA)
             if 'state' not in {row[1] for row in self.db.execute('PRAGMA table_info(events)')}:
                 self.db.execute("ALTER TABLE events ADD COLUMN state TEXT NOT NULL DEFAULT 'active'")
             if 'blocking' not in {row[1] for row in self.db.execute('PRAGMA table_info(calendar_discovery_review)')}:
@@ -475,6 +479,9 @@ class AppStore:
             raise ValueError('A full cached message is required before analysis.')
         if not isinstance(proposals, list) or len(proposals) > 30:
             raise ValueError('Unexpected analysis result shape.')
+        from .offer_groups import validate_alternatives
+        proposals = [dict(item) if isinstance(item,dict) else item for item in proposals]
+        validate_alternatives(message, proposals)
         normalized = []
         for index, raw in enumerate(proposals):
             try:
@@ -509,6 +516,10 @@ class AppStore:
                         item.update(status='review', needs_review=True, review_reason='Another school event starts at the same time; confirm duplicate, overlap, or update.')
                     if item['activity_scope'] == 'unknown' and requires_registration(message):
                         item.update(status='review', needs_review=True, review_reason='This message offers an optional activity or requires sign-up; participation must be confirmed.')
+            if isinstance(raw, dict) and raw.get('alternative_group'):
+                item.update(alternative_group=raw['alternative_group'], alternative_group_evidence=raw['alternative_group_evidence'])
+                if item['status'] != 'ignored':
+                    item.update(status='review', needs_review=True, review_reason='Choose one alternative from the complete offer group.')
             proposal_id = digest([str(message_id), message['payload_hash'], index, item])[:32]
             if reanalysis:
                 # Never reuse a retired operation's unique proposal ID. Repeated current
@@ -522,6 +533,11 @@ class AppStore:
             item.update(id=proposal_id, message_id=str(message_id))
             from .data_admin import human_event_review_reason, protect_decision
             item = protect_decision(self, message, item)
+            item = self._protect_group_decision(message,item)
+            prior_group = self.get_proposal_group_for_proposal(item['id'], current)
+            if prior_group and prior_group['status'] != 'open':
+                item.pop('alternative_group', None)
+                item.pop('alternative_group_evidence', None)
             reason = human_event_review_reason(self, item)
             if reason:
                 item.update(status='review', needs_review=True, review_reason=reason)
@@ -531,10 +547,12 @@ class AppStore:
     def _save_analysis(self, message, normalized, metadata, mode, superseded_ids=()):
         stamp = utcnow()
         metadata = analysis_metadata(metadata, len(normalized))
+        self._retire_open_groups(message['id'], keep_source_hash=message['payload_hash'])
         for item in normalized:
             self.db.execute('INSERT OR IGNORE INTO proposals(id,message_id,source_hash,payload,status,created_at,updated_at,pending_since) VALUES (?,?,?,?,?,?,?,?)',
                             (item['id'], message['id'], message['payload_hash'], json.dumps(item, ensure_ascii=False), item['status'], stamp, stamp,
                              stamp if item['status'] == 'pending' else None))
+        self._save_proposal_groups(message, normalized)
         self.db.execute("UPDATE messages SET analyzed_hash=payload_hash,status='analyzed',last_error=NULL,pending_since=NULL,analysis_metadata=?,analyzed_at=? WHERE id=?",
                         (json.dumps(metadata, ensure_ascii=False), stamp, message['id']))
         self.db.execute('INSERT INTO analysis_audit VALUES (?,?,?,?,?,?,?,?)',
@@ -543,6 +561,8 @@ class AppStore:
 
     def save_proposals(self, message_id, proposals, current=None, metadata=None):
         with self.lock, self.db:
+            if not self.db.in_transaction:
+                self.db.execute('BEGIN IMMEDIATE')
             normalized = self._prepare_proposals(message_id, proposals, current)
             self._save_analysis(self.get_message(message_id), normalized, metadata, 'sync')
         return normalized
@@ -562,6 +582,8 @@ class AppStore:
             if self.db.execute('SELECT 1 FROM events WHERE message_id=? OR proposal_id IN (SELECT id FROM proposals WHERE message_id=?)',
                                (message['id'], message['id'])).fetchone():
                 raise ValueError('Cached reanalysis refuses a source with historical calendar events.')
+            if self.db.execute("SELECT 1 FROM proposal_groups WHERE message_id=? AND status<>'open' LIMIT 1", (message['id'],)).fetchone():
+                raise ValueError('Cached reanalysis refuses a source with a prior group decision.')
             eligible = []
             for row in self.db.execute("SELECT * FROM proposals WHERE message_id=? AND status!='superseded'", (message['id'],)):
                 item = self._proposal(row)
@@ -598,6 +620,9 @@ class AppStore:
                 for proposal_id in superseded:
                     self.db.execute("UPDATE proposals SET status='superseded',updated_at=?,pending_since=NULL WHERE id=?", (utcnow(), proposal_id))
                     self.db.execute("UPDATE operations SET status='superseded',last_error='Superseded by explicitly requested cached reanalysis.',updated_at=? WHERE proposal_id=? AND status='pending' AND attempts=0", (utcnow(), proposal_id))
+                # Open groups are replaceable only under this same reservation.
+                self.db.execute("DELETE FROM proposal_group_members WHERE group_id IN (SELECT id FROM proposal_groups WHERE message_id=? AND status='open')", (str(message_id),))
+                self.db.execute("DELETE FROM proposal_groups WHERE message_id=? AND status='open'", (str(message_id),))
                 self._save_analysis(self.get_message(message_id), normalized, metadata, 'cached_reanalysis', superseded)
                 return {'proposals': normalized, 'superseded_ids': superseded}
 
@@ -654,6 +679,15 @@ class AppStore:
             row = self.db.execute('SELECT * FROM proposals WHERE id=?', (str(proposal_id),)).fetchone()
             if not row:
                 raise ValueError('Unknown proposal.')
+            if json.loads(row['payload']).get('blocked_by_group_decision') and decision != 'ignore':
+                raise ValueError('A prior group decision blocks this ambiguous replacement.')
+            group = self.get_proposal_group_for_proposal(proposal_id)
+            if group:
+                if group['status'] != 'selected' or group['selected_proposal_id'] != str(proposal_id) or row['status'] != 'review':
+                    raise ValueError('Use the complete alternative group to choose or reject this proposal.')
+                group_reason = self._group_write_reason(proposal_id)
+                if group_reason:
+                    raise ValueError(group_reason)
             if row['status'] in ('applied', 'superseded'):
                 raise ValueError('An applied or superseded proposal cannot be replayed.')
             active = self.db.execute("SELECT status FROM operations WHERE proposal_id=? AND status IN ('inflight','unknown','applied')", (str(proposal_id),)).fetchone()
@@ -730,6 +764,10 @@ class AppStore:
                 if not row:
                     continue
                 item = self._proposal(row)
+                group_reason = self._group_write_reason(item['id'])
+                if group_reason:
+                    self._review_unwritten_locked(item, group_reason)
+                    continue
                 discovery_unsafe = (self._setting('rebuild_status') in ('required', 'running', 'partial', 'interrupted')
                                     or self.db.execute('SELECT 1 FROM calendar_discovery_review WHERE blocking=1 LIMIT 1').fetchone())
                 if discovery_unsafe:
@@ -835,6 +873,10 @@ class AppStore:
             if not proposal_row:
                 return False
             item = self._proposal(proposal_row)
+            group_reason = self._group_write_reason(item['id'])
+            if group_reason:
+                self._review_unwritten_locked(item, group_reason)
+                return False
             operation = json.loads(operation_row['payload'])
             if expected_operation is not None and operation != expected_operation:
                 # A newer explicit edit keeps its pending intent. The caller's

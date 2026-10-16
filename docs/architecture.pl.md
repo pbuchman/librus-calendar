@@ -8,6 +8,8 @@ System pobiera listy i treść wiadomości bezpośrednio z Librus Synergia przez
 
 ## Decyzje i bezpieczeństwo zapisu
 
+Jawnie alternatywne terminy jednej dobrowolnej oferty są zapisywane jako jedna trwała grupa powiązana z wiadomością źródłową. Kolejka decyzji i szczegół wiadomości pokazują komplet opcji niezależnie od limitu starszej listy propozycji; żaden termin nie jest domyślnie wybrany. Minione daty pozostają widoczne, ale nie można ich zaznaczyć. Wybór przyszłego terminu atomowo kolejkuje tę opcję i zamyka pozostałe; odrzucenie zamyka całą ofertę. Sprawdzenie wersji i źródła chroni przed nieaktualną decyzją; działanie na pojedynczej propozycji nie omija grupy. Zamknięta grupa zachowuje stan wyboru albo odrzucenia. Cykl spotkań i osobne obowiązki nie są łączone wyłącznie na podstawie wspólnej wiadomości lub tytułu.
+
 Jednoznaczne przyszłe działania szkolne z potwierdzeniem w źródle mogą być automatyczne, gdy zapisy są włączone. Przygotowanie do szkoły, zajęcia klasowe i terminy oceniane są osobno dla każdego działania. Tworzenie dobrowolnych zajęć dodatkowych wymaga decyzji o udziale nawet przy jasnej dacie; nieznany zakres, niejednoznaczne daty, nakładające się lub powielone początki, niebezpieczny stan wydarzenia i odwołania wymagają sprawdzenia. Sama analiza nie może zatwierdzić odwołania ani uznać, że dziecko zapisano na dodatkowe zajęcia.
 
 Daty używają Europe/Warsaw i rozróżniają wydarzenia godzinowe od całodniowych przypomnień i terminów. Dokładna godzina deadline'u pozostaje w tytule i opisie, a zapis w kalendarzu obejmuje jeden cały dzień. Błędne i niejednoznaczne godziny zmiany czasu są odrzucane. Dla wydarzenia godzinowego bez końca może zostać użyty wyraźnie opisany domyślny czas jednej godziny.

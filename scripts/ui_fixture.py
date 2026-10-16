@@ -21,6 +21,12 @@ DEMO_CONFIG = AppConfig(calendar_id='calendar@example.test', calendar_owner='own
 
 # Newly authored synthetic messages; no private source messages were reused.
 MESSAGES = [
+    {'id': 'demo-training-choice', 'subject': 'Szkolenie pierwszej pomocy — wybierz jeden termin',
+     'sender': 'Anna Demonstracyjna · trenerka demo', 'sent_at': '2030-03-06T10:00:00+01:00',
+     'text': 'Zapraszamy na jedno dobrowolne szkolenie pierwszej pomocy. Proszę wybrać jeden z trzech terminów: 5 marca 2030 od 16:00 do 18:00 w sali A; 9 marca 2030 od 10:00 do 12:00 w sali C; 12 marca 2030 od 17:00 do 19:00 w centrum szkoleniowym przy ulicy Przykładowej 8. To alternatywy tej samej oferty, nie cykl spotkań.\n\nWiadomość demonstracyjna — dane fikcyjne.', 'attachment_count': 0},
+    {'id': 'demo-training-series', 'subject': 'Cykl zajęć teatralnych — dwa spotkania',
+     'sender': 'Olga Przykładowa · nauczycielka demo', 'sent_at': '2030-03-06T07:00:00+01:00',
+     'text': 'Dobrowolny cykl teatralny obejmuje dwa osobne spotkania: 11 marca 2030 od 16:00 do 17:00 w sali T oraz 18 marca 2030 od 16:00 do 17:00 w sali T. Uczestnicy biorą udział w obu spotkaniach.\n\nWiadomość demonstracyjna — dane fikcyjne.', 'attachment_count': 0},
     {'id': 'demo-trip', 'subject': 'Wyjście klasy do planetarium', 'sender': 'Marta Fikcyjna · nauczycielka demo',
      'sent_at': '2030-03-06T09:30:00+01:00',
      'text': 'Dzień dobry!\n\n8 marca 2030 klasa odwiedzi planetarium. Zbiórka przed szkołą o 08:30, powrót o 12:00. Proszę spakować wodę i małą przekąskę.\n\nMarta Fikcyjna\nWiadomość demonstracyjna — dane fikcyjne.', 'attachment_count': 0},
@@ -66,6 +72,23 @@ def _seed_store(path: Path) -> AppStore:
                           'temporal_kind': event.get('temporal_kind', 'event'), 'due_at': event.get('due_at'),
                           'activity_scope': 'school', 'confidence': 'high', 'needs_review': False,
                           'source_quote': event['quote'], 'event_id': None}]
+        elif message['id'] == 'demo-training-choice':
+            evidence = 'Proszę wybrać jeden z trzech terminów'
+            terms = [('2030-03-05T16:00:00+01:00', '2030-03-05T18:00:00+01:00', 'Sala A'),
+                     ('2030-03-09T10:00:00+01:00', '2030-03-09T12:00:00+01:00', 'Sala C'),
+                     ('2030-03-12T17:00:00+01:00', '2030-03-12T19:00:00+01:00', 'Centrum szkoleniowe, ul. Przykładowa 8')]
+            proposals = [dict(kind='create', title='Szkolenie pierwszej pomocy', description=place,
+                             start=start, end=end, all_day=False, activity_scope='extracurricular',
+                             confidence='high', needs_review=True, review_reason='Wybierz jeden termin szkolenia.',
+                             source_quote=evidence, event_id=None, alternative_group='first-aid-choice',
+                             alternative_group_evidence=evidence) for start, end, place in terms]
+        elif message['id'] == 'demo-training-series':
+            proposals = [dict(kind='create', title=f'Cykl teatralny — spotkanie {index}', description='Sala T',
+                             start=f'2030-03-{day}T16:00:00+01:00', end=f'2030-03-{day}T17:00:00+01:00',
+                             all_day=False, activity_scope='extracurricular', confidence='high', needs_review=True,
+                             review_reason='Potwierdź udział w zajęciach dodatkowych.',
+                             source_quote='Uczestnicy biorą udział w obu spotkaniach.', event_id=None)
+                          for index, day in enumerate(('11', '18'), 1)]
         elif message['id'] == 'demo-robotics':
             proposals = [{'kind': 'create', 'title': 'Dodatkowe warsztaty robotyki', 'description': DEMO_LABEL,
                           'start': '2030-03-09T15:00:00+01:00', 'end': '2030-03-09T16:30:00+01:00',

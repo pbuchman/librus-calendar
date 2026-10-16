@@ -13,6 +13,7 @@ Wiadomości są pobierane **bezpośrednio z Librusa**. Powiadomienia Gmail nie s
 ## Co robi aplikacja
 
 - Przechowuje treści wiadomości, rozpoznane działania, pochodzenie analizy i kopie stanu wydarzeń w lokalnej bazie SQLite.
+- Łączy jawnie alternatywne terminy jednej dobrowolnej oferty w jedną kartę. Wybierz jeden termin bez domyślnego zaznaczenia albo odrzuć całą ofertę. Minione terminy pozostają widoczne i nieaktywne; wybór zamyka pozostałe opcje. Spotkania cykliczne i odrębne obowiązki pozostają osobnymi decyzjami.
 - Automatycznie kolejkuje jednoznaczne przyszłe wydarzenia szkolne, przypomnienia i terminy, gdy zapisy do kalendarza są włączone. Udział w dodatkowych zajęciach wymaga zatwierdzenia; niejasności, konflikty i odwołania trafiają do sprawdzenia.
 - Dodaje jeden prefiks `[Librus]` w tytule. Opis zawiera cytat źródłowy, znacznik własności i **czas rozpoczęcia synchronizacji** w Europe/Warsaw. Jest to czas przygotowania trwałej operacji, a nie potwierdzenie zakończenia zapisu w kalendarzu.
 - Zmienia wyłącznie własne wpisy w skonfigurowanym kalendarzu, nie wysyła zaproszeń i sprawdza wynik niepewnego zapisu przed ponowieniem.
@@ -39,7 +40,7 @@ Otwórz [http://127.0.0.1:8795](http://127.0.0.1:8795). Rzeczywisty interfejs dz
 
 ![Rzeczywisty widok zatwierdzania fikcyjnych zajęć dodatkowych](docs/assets/extracurricular-review.png)
 
-*Dobrowolne warsztaty robotyki czekają na potwierdzenie udziału.*
+*Jedna fikcyjna oferta szkolenia pierwszej pomocy przedstawia terminy do wyboru; miniony termin jest widoczny i nieaktywny. Żaden termin nie jest domyślnie zaznaczony.*
 
 ![Lokalna ilustracja kalendarza z tymi samymi danymi fikcyjnymi](docs/assets/calendar-week.png)
 
