@@ -5,10 +5,12 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from app.core import AppStore, digest
 from app.codex_runtime import CodexRuntime, RuntimeFailure, event_fingerprint
 from app.data_admin import migrate_decisions, prune_state, RebuildController
+from app.health_state import read_monitoring_state
 from test_support import TEST_CONFIG
 from test_core import NOW, QUOTE, message, proposal
 from test_sync import FakeClient, FakeRuntime
@@ -169,6 +171,61 @@ class DataAdminTests(unittest.TestCase):
         # Transfer itself requires successful reconstruction before writes.
         self.store.set_setting('rebuild_status', 'rebuilt')
         self.assertEqual(len(self.store.queue_operations(NOW)), 1)
+
+    def test_transfer_preserves_queue_age_and_attempted_operations_from_old_and_new_schemas(self):
+        created = '2026-10-01T10:00:00+00:00'
+        eligible = '2026-10-15T15:00:00+00:00'
+        prepared = '2026-10-16T06:00:00+00:00'
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                source = AppStore(Path(self.tmp.name)/str(legacy)/'source.sqlite3', config=TEST_CONFIG)
+                target = AppStore(Path(self.tmp.name)/str(legacy)/'target.sqlite3', config=TEST_CONFIG)
+                try:
+                    source.set_setting('librus_account_hash', digest('synthetic-account'))
+                    with patch('app.core.utcnow', return_value=created):
+                        for mid in ('0', '1'):
+                            source.save_message(message(mid))
+                            source.save_proposals(mid, [proposal(start='2030-11-%02dT09:00:00+01:00' % (10 + int(mid)))], NOW)
+                    approved = source.list_proposals()[0]
+                    with patch('app.core.utcnow', return_value=eligible):
+                        source.resolve_proposal(approved['id'], 'approve')
+                    with source.db:
+                        source.db.execute('UPDATE proposals SET pending_since=?', (eligible,))
+                    with patch('app.core.utcnow', return_value=prepared):
+                        operations = source.queue_operations(NOW)
+                        source.set_writes_paused(False)
+                        for operation in operations:
+                            self.assertTrue(source.claim_operation(operation['operation_id']))
+                            source.record_result(operation['operation_id'], {'status': 'failed', 'error': 'operation_failed'})
+                    if legacy:
+                        with source.db:
+                            source.db.execute('ALTER TABLE proposals DROP COLUMN pending_since')
+                    before = source.path.read_bytes()
+                    journals = [dict(row) for row in source.db.execute('SELECT * FROM operations ORDER BY id')]
+                    result = migrate_decisions(target, source.path)
+                    self.assertEqual(result['unresolved_operations'], 2)
+                    self.assertEqual(source.path.read_bytes(), before)
+                    self.assertEqual([dict(row) for row in target.db.execute('SELECT * FROM operations ORDER BY id')], journals)
+                    self.assertEqual(target._setting('calendar_binding'), source._setting('calendar_binding'))
+                    self.assertEqual(target._setting('calendar_owner_binding'), source._setting('calendar_owner_binding'))
+                    self.assertEqual(target._setting('librus_account_hash'), source._setting('librus_account_hash'))
+                    ages = [row[0] for row in target.db.execute('SELECT pending_since FROM proposals')]
+                    self.assertEqual(ages, [created if legacy else eligible] * 2)
+                    self.assertEqual(read_monitoring_state(target.path)['oldest_pending_at'], created if legacy else eligible)
+                finally:
+                    source.close()
+                    target.close()
+
+    def test_decision_only_transfer_uses_conservative_source_initialization_age(self):
+        item = self.decision('0')
+        baseline = self.old._setting('health_initialized_at')
+        with self.old.db:
+            self.old.db.execute('DELETE FROM proposals WHERE id=?', (item['id'],))
+        before = self.old.path.read_bytes()
+        migrate_decisions(self.store, self.old.path)
+        self.assertEqual(self.old.path.read_bytes(), before)
+        self.assertEqual(self.store.db.execute('SELECT pending_since FROM proposals').fetchone()[0], baseline)
+        self.assertEqual(read_monitoring_state(self.store.path)['oldest_pending_at'], baseline)
 
     def test_rebuild_complete_over_100_preserves_calendar_edits_and_repeated_ids(self):
         self.store.set_writes_paused(False)

@@ -222,6 +222,16 @@ def migrate_decisions(store, source_path, *, allow_legacy_binding=False, verifie
         unresolved_ids = {row['proposal_id'] for row in unresolved}
         metadata = list(source.execute("SELECT * FROM metadata_refresh WHERE status IN ('pending','review','inflight','unknown')")) if 'metadata_refresh' in tables else []
         stamp = utcnow()
+
+        def proposal_age(row, status):
+            values = dict(row)
+            # Decision-only sources have no exact eligibility evidence. Their
+            # initialization (or last known record time) is conservative, not a
+            # newly invented eligibility time at transfer.
+            baseline = values.get('created_at') or settings.get('health_initialized_at') or values['updated_at']
+            pending_since = (values.get('pending_since') or baseline) if status == 'pending' else None
+            return baseline, pending_since
+
         with store.lock, store.db:
             store.db.execute('BEGIN IMMEDIATE')
             old_account = store._setting('librus_account_hash')
@@ -241,8 +251,9 @@ def migrate_decisions(store, source_path, *, allow_legacy_binding=False, verifie
                                  (row['id'], row['message_id'], row['source_hash'], row['payload'], row['updated_at']))
                 item = json.loads(row['payload'])['proposal']
                 item['status'] = 'applied' if item.get('status') == 'applied' else ('ignored' if item.get('user_rejected') else item.get('status', 'review'))
-                store.db.execute('INSERT OR IGNORE INTO proposals VALUES (?,?,?,?,?,?,?)',
-                                 (row['id'], row['message_id'], row['source_hash'], json.dumps(item, ensure_ascii=False), item['status'], stamp, row['updated_at']))
+                created_at, pending_since = proposal_age(row, item['status'])
+                store.db.execute('INSERT OR IGNORE INTO proposals(id,message_id,source_hash,payload,status,created_at,updated_at,pending_since) VALUES (?,?,?,?,?,?,?,?)',
+                                 (row['id'], row['message_id'], row['source_hash'], json.dumps(item, ensure_ascii=False), item['status'], created_at, row['updated_at'], pending_since))
             for row in events:
                 snapshot = json.loads(row['snapshot'])
                 if not row['marker'] or not snapshot.get('id') or snapshot['id'] != row['id']:
@@ -259,7 +270,10 @@ def migrate_decisions(store, source_path, *, allow_legacy_binding=False, verifie
                 original = next((p for p in proposals if p['id'] == row['proposal_id']), None)
                 if not original:
                     raise ValueError('Unresolved operation has no proposal evidence.')
-                store.db.execute('INSERT OR IGNORE INTO proposals VALUES (?,?,?,?,?,?,?)', tuple(original))
+                created_at, pending_since = proposal_age(original, original['status'])
+                store.db.execute('INSERT OR IGNORE INTO proposals(id,message_id,source_hash,payload,status,created_at,updated_at,pending_since) VALUES (?,?,?,?,?,?,?,?)',
+                                 tuple(original[key] for key in ('id','message_id','source_hash','payload','status'))
+                                 + (created_at, original['updated_at'], pending_since))
                 existing = store.db.execute('SELECT payload FROM operations WHERE id=?', (row['id'],)).fetchone()
                 if existing and existing[0] != row['payload']:
                     raise ValueError('Target contains conflicting operation intent.')
@@ -338,7 +352,7 @@ def prune_state(store, *, days=30, apply=False, current=None):
                         continue
                     if item['status'] == 'pending':
                         item.update(status='review', needs_review=True, review_reason='Source content retention expired; explicit review required.')
-                    store.db.execute('UPDATE proposals SET payload=?,status=? WHERE id=?', (json.dumps(item, ensure_ascii=False), item['status'], proposal['id']))
+                    store.db.execute('UPDATE proposals SET payload=?,status=?,pending_since=NULL WHERE id=?', (json.dumps(item, ensure_ascii=False), item['status'], proposal['id']))
                     if operation and (operation['status'] in ('applied', 'superseded')
                                       or (operation['status'] in ('pending', 'review') and operation['attempts'] == 0)):
                         payload = json.loads(operation['payload'])
