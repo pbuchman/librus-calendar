@@ -355,6 +355,58 @@ class OfferGroupTests(unittest.TestCase):
         self.assertEqual(self.store.status()['proposals_review'],0)
         self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM decision_intents').fetchone()[0],0)
 
+    def test_dismissed_blocked_replacements_stay_persistently_ignored_after_cosmetic_reanalysis(self):
+        source=EVIDENCE+' Drugi potwierdzony fragment źródła.'
+        self.store.save_message(dict(MESSAGE,text=source))
+        group=self.create_group()
+        self.decide(group)
+        self.store.queue_operations(NOW)
+        original_choice=self.store.get_proposal_group(group['id'],current=NOW)
+        raw=[option(source_quote='Drugi potwierdzony fragment źródła.',alternative_group='changed-key'),
+             option('2030-03-12T16:00:00+01:00',source_quote='Drugi potwierdzony fragment źródła.',alternative_group='changed-key')]
+        blocked=self.store.save_proposals(MESSAGE['id'],raw,NOW)
+        for item in blocked:self.store.resolve_proposal(item['id'],'ignore')
+        before=self.state()
+        variants=[
+            [dict(item,title='Nowa nazwa zajęć') for item in raw],
+            [dict(item,alternative_group='another-model-key') for item in raw],
+            list(reversed(raw)),
+            [dict(item,title='Jeszcze inna nazwa',alternative_group='third-key') for item in reversed(raw)],
+        ]
+        for replay in variants:
+            with self.subTest(replay=replay):
+                self.store.save_proposals(MESSAGE['id'],replay,NOW)
+                # Check persisted rows/cards, not only the normalized return.
+                self.assertEqual(self.state(),before)
+                self.assertEqual(self.store.list_proposals(status='review'),[])
+                dismissed=[item for item in self.store.list_proposals() if item.get('blocked_by_group_decision')]
+                self.assertEqual(len(dismissed),2)
+                self.assertTrue(all(item['status']=='ignored' and item['user_rejected'] for item in dismissed))
+                self.assertEqual(self.store.get_proposal_group(group['id'],current=NOW),original_choice)
+                self.assertEqual(len(self.store.pending_operations()),1)
+        self.assertEqual(self.store.queue_operations(NOW),[])
+
+    def test_dismissed_blocked_replacement_does_not_reject_an_established_independent_offer(self):
+        evidence_b='Druga niezależna oferta ma terminy 8 i 12 marca.'
+        self.store.save_message(dict(MESSAGE,text=EVIDENCE+' '+evidence_b))
+        raw=[option(),option('2030-03-12T16:00:00+01:00'),
+             option(source_quote=evidence_b,alternative_group='independent',alternative_group_evidence=evidence_b),
+             option('2030-03-12T16:00:00+01:00',source_quote=evidence_b,alternative_group='independent',alternative_group_evidence=evidence_b)]
+        self.store.save_proposals(MESSAGE['id'],raw,NOW)
+        first=next(group for group in self.store.list_proposal_groups(current=NOW) if group['group_key']=='one-training')
+        independent=next(group for group in self.store.list_proposal_groups(current=NOW) if group['group_key']=='independent')
+        self.decide(first)
+        ambiguous=[dict(item,alternative_group='unknown-key',alternative_group_evidence=EVIDENCE) for item in raw[2:]]
+        for item in self.store.save_proposals(MESSAGE['id'],ambiguous,NOW):
+            self.assertTrue(item.get('blocked_by_group_decision'))
+            self.store.resolve_proposal(item['id'],'ignore')
+        self.store.save_proposals(MESSAGE['id'],raw,NOW)
+        persisted=self.store.get_proposal_group(independent['id'],current=NOW)
+        self.assertEqual(len(persisted['members']),2)
+        self.assertTrue(all(item['status']=='review' and not item.get('user_rejected') for item in persisted['members']))
+        self.decide(persisted)
+        self.assertEqual(len(self.store.queue_operations(NOW)),2)
+
     def test_analysis_reserves_before_reading_closed_group_decisions(self):
         group=self.create_group()
         other=AppStore(self.path,config=TEST_CONFIG)

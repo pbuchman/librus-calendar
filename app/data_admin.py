@@ -76,6 +76,31 @@ def protect_decision(store, message, item):
     if not rows:
         return item
     signature = json.loads(json.dumps(intent_signature(item)))
+    # Explicit dismissal of a standalone blocked replacement is safe to retain
+    # across cosmetic model changes. This path can only restore rejection, and
+    # must never take a decision away from a different established offer.
+    known_group = store.db.execute('SELECT id FROM proposal_groups WHERE message_id=? AND source_hash=? AND group_key=?',
+        (message['id'],message['payload_hash'],item.get('alternative_group'))).fetchone() if item.get('alternative_group') else None
+    rejected = []
+    for row in rows:
+        record = json.loads(row['payload'])
+        decision = record['proposal']
+        blocked = decision.get('blocked_by_group_decision')
+        if (row['source_hash'] != message['payload_hash'] or record.get('signature') != signature
+                or decision.get('user_rejected') is not True or not blocked
+                or (known_group and known_group['id'] != blocked)
+                or store.db.execute('SELECT 1 FROM proposal_group_members WHERE proposal_id=?',(row['id'],)).fetchone()):
+            continue
+        if store.db.execute("SELECT 1 FROM proposal_groups WHERE id=? AND message_id=? AND source_hash=? AND status<>'open'",
+                            (blocked,message['id'],message['payload_hash'])).fetchone():
+            rejected.append((row,blocked))
+    if rejected:
+        row,blocked = min(rejected,key=lambda pair:pair[0]['id'])
+        item = dict(item,id=row['id'],status='ignored',user_rejected=True,user_approved=False,
+            needs_review=False,blocked_by_group_decision=blocked,review_reason='Explicit prior user rejection retained.')
+        item.pop('alternative_group',None)
+        item.pop('alternative_group_evidence',None)
+        return item
     if item.get('alternative_group'):
         group = store.db.execute('SELECT id FROM proposal_groups WHERE message_id=? AND source_hash=? AND group_key=?',
             (message['id'],message['payload_hash'],item['alternative_group'])).fetchone()

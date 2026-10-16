@@ -105,6 +105,8 @@ class ProposalGroupsMixin:
         closed = self.db.execute("SELECT * FROM proposal_groups WHERE message_id=? AND source_hash=? AND status<>'open'",(message['id'],message['payload_hash'])).fetchall()
         if not closed or item.get('kind') != 'create' or item.get('activity_scope') != 'extracurricular':
             return item
+        if item.get('user_rejected') is True and item.get('blocked_by_group_decision'):
+            return item
         # An already-known independent offer remains independent, including a
         # sibling offer with the same start. Dates never prove offer identity.
         if item.get('alternative_group') and self.db.execute("SELECT 1 FROM proposal_groups WHERE message_id=? AND source_hash=? AND group_key=? AND status='open'",(message['id'],message['payload_hash'],item['alternative_group'])).fetchone():
