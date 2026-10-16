@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from app.core import AppStore
 from app.health_state import read_monitoring_state
+from test_core import NOW, message, proposal
 
 
 class HealthStateTests(unittest.TestCase):
@@ -138,6 +139,77 @@ class HealthStateTests(unittest.TestCase):
         self.store.close()
         self.store = AppStore(self.path, config=TEST_CONFIG)
         self.store.save_message({'id': '1', 'text': 'Original message'})
+        self.assertEqual(read_monitoring_state(self.path)['oldest_pending_at'], old)
+
+    def test_old_review_approval_starts_age_at_eligibility_and_reapproval_keeps_it(self):
+        old = '2026-10-01T10:00:00+00:00'
+        approved = '2026-10-16T06:52:38+00:00'
+        later = '2026-10-16T07:30:00+00:00'
+        with patch('app.core.utcnow', return_value=old):
+            self.store.save_message(message())
+            item = self.store.save_proposals('1', [proposal(needs_review=True)], NOW)[0]
+        self.assertEqual(item['status'], 'review')
+        self.assertIsNone(read_monitoring_state(self.path)['oldest_pending_at'])
+        with patch('app.core.utcnow', return_value=approved):
+            self.store.resolve_proposal(item['id'], 'approve')
+        self.assertEqual(read_monitoring_state(self.path)['oldest_pending_at'], approved)
+        with patch('app.core.utcnow', return_value=later):
+            self.store.resolve_proposal(item['id'], 'approve')
+        self.assertEqual(read_monitoring_state(self.path)['oldest_pending_at'], approved)
+        self.store.close()
+        self.store = AppStore(self.path, config=TEST_CONFIG)
+        self.assertEqual(read_monitoring_state(self.path)['oldest_pending_at'], approved)
+        self.assertEqual(self.store.db.execute('SELECT created_at FROM proposals').fetchone()[0], old)
+
+    def test_automatic_queue_age_survives_preparation_and_failed_operation_retries(self):
+        old = '2026-10-01T10:00:00+00:00'
+        later = '2026-10-16T07:30:00+00:00'
+        with patch('app.core.utcnow', return_value=old):
+            self.store.save_message(message())
+            item = self.store.save_proposals('1', [proposal()], NOW)[0]
+        self.assertEqual(read_monitoring_state(self.path)['oldest_pending_at'], old)
+        with patch('app.core.utcnow', return_value=later):
+            operation = self.store.queue_operations(NOW)[0]
+            self.store.queue_operations(NOW)
+            self.store.set_writes_paused(False)
+            self.assertTrue(self.store.claim_operation(operation['operation_id']))
+            self.store.record_result(operation['operation_id'], {'status': 'failed', 'error': 'operation_failed'})
+            self.store.queue_operations(NOW)
+        self.assertEqual(read_monitoring_state(self.path)['operations_pending'], 1)
+        self.assertEqual(read_monitoring_state(self.path)['oldest_pending_at'], old)
+        self.assertEqual(self.store.db.execute('SELECT pending_since FROM proposals WHERE id=?', (item['id'],)).fetchone()[0], old)
+
+    def test_review_removes_queue_age_and_fresh_approval_starts_a_new_age(self):
+        first = '2026-10-01T10:00:00+00:00'
+        second = '2026-10-16T06:52:38+00:00'
+        with patch('app.core.utcnow', return_value=first):
+            self.store.save_message(message())
+            item = self.store.save_proposals('1', [proposal()], NOW)[0]
+            operation = self.store.queue_operations(NOW)[0]
+        self.store.record_result(operation['operation_id'], {'status': 'review', 'error': 'Synthetic review'})
+        self.assertIsNone(read_monitoring_state(self.path)['oldest_pending_at'])
+        self.assertIsNone(self.store.db.execute('SELECT pending_since FROM proposals').fetchone()[0])
+        with patch('app.core.utcnow', return_value=second):
+            self.store.resolve_proposal(item['id'], 'approve')
+        self.assertEqual(read_monitoring_state(self.path)['oldest_pending_at'], second)
+        self.store.resolve_proposal(item['id'], 'ignore')
+        self.assertIsNone(read_monitoring_state(self.path)['oldest_pending_at'])
+        self.assertIsNone(self.store.db.execute('SELECT pending_since FROM proposals').fetchone()[0])
+
+    def test_legacy_proposal_reader_is_read_only_and_migration_keeps_conservative_age(self):
+        old = '2026-10-01T10:00:00+00:00'
+        with patch('app.core.utcnow', return_value=old):
+            self.store.save_message(message())
+            self.store.save_proposals('1', [proposal()], NOW)
+        with self.store.db:
+            self.store.db.execute('ALTER TABLE proposals DROP COLUMN pending_since')
+        before = self.path.read_bytes()
+        with patch('app.core.AppStore', side_effect=AssertionError('must not initialize')):
+            self.assertEqual(read_monitoring_state(self.path)['oldest_pending_at'], old)
+        self.assertEqual(self.path.read_bytes(), before)
+        self.store.close()
+        self.store = AppStore(self.path, config=TEST_CONFIG)
+        self.assertEqual(self.store.db.execute('SELECT pending_since FROM proposals').fetchone()[0], old)
         self.assertEqual(read_monitoring_state(self.path)['oldest_pending_at'], old)
 
     def probe_attempt(self, run_id, number=1, *, result='ok', stamp=None):

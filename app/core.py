@@ -254,7 +254,7 @@ class AppStore:
             PRAGMA journal_mode=DELETE;
             CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS messages(id TEXT PRIMARY KEY,payload TEXT NOT NULL DEFAULT '{}',payload_hash TEXT,status TEXT NOT NULL DEFAULT 'fetch_pending',analyzed_hash TEXT,sent_at TEXT,fetched_at TEXT,last_error TEXT,attempts INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS proposals(id TEXT PRIMARY KEY,message_id TEXT NOT NULL,source_hash TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS proposals(id TEXT PRIMARY KEY,message_id TEXT NOT NULL,source_hash TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,pending_since TEXT);
             CREATE TABLE IF NOT EXISTS operations(id TEXT PRIMARY KEY,proposal_id TEXT NOT NULL UNIQUE,payload TEXT NOT NULL,status TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,result TEXT,last_error TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY,calendar_id TEXT NOT NULL,message_id TEXT NOT NULL,proposal_id TEXT NOT NULL,snapshot TEXT NOT NULL,fingerprint TEXT,marker TEXT NOT NULL,updated_at TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'active');
             CREATE INDEX IF NOT EXISTS messages_status ON messages(status);
@@ -285,6 +285,8 @@ class AppStore:
                 self.db.execute('ALTER TABLE messages ADD COLUMN discovered_at TEXT')
             if 'pending_since' not in {row[1] for row in self.db.execute('PRAGMA table_info(messages)')}:
                 self.db.execute('ALTER TABLE messages ADD COLUMN pending_since TEXT')
+            if 'pending_since' not in {row[1] for row in self.db.execute('PRAGMA table_info(proposals)')}:
+                self.db.execute('ALTER TABLE proposals ADD COLUMN pending_since TEXT')
             for column in ('analysis_metadata', 'analyzed_at'):
                 if column not in {row[1] for row in self.db.execute('PRAGMA table_info(messages)')}:
                     self.db.execute('ALTER TABLE messages ADD COLUMN ' + column + ' TEXT')
@@ -294,6 +296,10 @@ class AppStore:
             self.db.execute("INSERT OR IGNORE INTO settings VALUES ('writes_paused','true')")
             self.db.execute("INSERT OR IGNORE INTO settings VALUES ('health_initialized_at',?)", (utcnow(),))
             self.db.execute("UPDATE messages SET pending_since=COALESCE(discovered_at,fetched_at,?) WHERE pending_since IS NULL AND status IN ('fetch_pending','fetch_failed','analysis_pending','analysis_failed')", (self._setting('health_initialized_at'),))
+            # Legacy rows cannot prove their eligibility transition. Keep a
+            # conservative creation baseline without resetting known queue age.
+            self.db.execute("UPDATE proposals SET pending_since=created_at WHERE status='pending' AND pending_since IS NULL")
+            self.db.execute("UPDATE proposals SET pending_since=NULL WHERE status<>'pending' AND pending_since IS NOT NULL")
             if self._setting('writes_paused') == 'true':
                 self.db.execute("INSERT OR IGNORE INTO settings VALUES ('writes_paused_since',?)", (utcnow(),))
             # Safe migration only for never-attempted local operations; external intent is immutable after an attempt.
@@ -446,7 +452,7 @@ class AppStore:
             self.db.execute('INSERT INTO messages(id,payload,payload_hash,status,sent_at,fetched_at,last_error,pending_since) VALUES (?,?,?,?,?,?,NULL,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,payload_hash=excluded.payload_hash,status=excluded.status,sent_at=excluded.sent_at,fetched_at=excluded.fetched_at,last_error=NULL,pending_since=excluded.pending_since',
                             (message_id, json.dumps(clean, ensure_ascii=False), hashed, state, clean['sent_at'], utcnow(), pending_since if state == 'analysis_pending' else None))
             if changed and row and row['payload_hash']:
-                self.db.execute("UPDATE proposals SET status='ignored',updated_at=? WHERE message_id=? AND status IN ('pending','review')", (utcnow(), message_id))
+                self.db.execute("UPDATE proposals SET status='ignored',updated_at=?,pending_since=NULL WHERE message_id=? AND status IN ('pending','review')", (utcnow(), message_id))
                 self.db.execute("UPDATE operations SET status='review',last_error='Source message changed; reanalysis required.',updated_at=? WHERE proposal_id IN (SELECT id FROM proposals WHERE message_id=?) AND status='pending'", (utcnow(), message_id))
         return changed
 
@@ -526,7 +532,9 @@ class AppStore:
         stamp = utcnow()
         metadata = analysis_metadata(metadata, len(normalized))
         for item in normalized:
-            self.db.execute('INSERT OR IGNORE INTO proposals VALUES (?,?,?,?,?,?,?)', (item['id'], message['id'], message['payload_hash'], json.dumps(item, ensure_ascii=False), item['status'], stamp, stamp))
+            self.db.execute('INSERT OR IGNORE INTO proposals(id,message_id,source_hash,payload,status,created_at,updated_at,pending_since) VALUES (?,?,?,?,?,?,?,?)',
+                            (item['id'], message['id'], message['payload_hash'], json.dumps(item, ensure_ascii=False), item['status'], stamp, stamp,
+                             stamp if item['status'] == 'pending' else None))
         self.db.execute("UPDATE messages SET analyzed_hash=payload_hash,status='analyzed',last_error=NULL,pending_since=NULL,analysis_metadata=?,analyzed_at=? WHERE id=?",
                         (json.dumps(metadata, ensure_ascii=False), stamp, message['id']))
         self.db.execute('INSERT INTO analysis_audit VALUES (?,?,?,?,?,?,?,?)',
@@ -588,7 +596,7 @@ class AppStore:
                 replacement_ids = {item['id'] for item in normalized}
                 superseded = [item for item in scope['proposal_ids'] if item not in replacement_ids]
                 for proposal_id in superseded:
-                    self.db.execute("UPDATE proposals SET status='superseded',updated_at=? WHERE id=?", (utcnow(), proposal_id))
+                    self.db.execute("UPDATE proposals SET status='superseded',updated_at=?,pending_since=NULL WHERE id=?", (utcnow(), proposal_id))
                     self.db.execute("UPDATE operations SET status='superseded',last_error='Superseded by explicitly requested cached reanalysis.',updated_at=? WHERE proposal_id=? AND status='pending' AND attempts=0", (utcnow(), proposal_id))
                 self._save_analysis(self.get_message(message_id), normalized, metadata, 'cached_reanalysis', superseded)
                 return {'proposals': normalized, 'superseded_ids': superseded}
@@ -679,7 +687,10 @@ class AppStore:
                 self._rebase_reviewed_conflict(item)
                 # An edited, definitely-unwritten operation can be rebuilt from the new proposal.
                 self.db.execute("DELETE FROM operations WHERE proposal_id=? AND status IN ('pending','review')", (row['id'],))
-            self.db.execute('UPDATE proposals SET payload=?,status=?,updated_at=? WHERE id=?', (json.dumps(item, ensure_ascii=False), item['status'], utcnow(), row['id']))
+            stamp = utcnow()
+            pending_since = ((row['pending_since'] or row['created_at']) if row['status'] == 'pending' else stamp) if item['status'] == 'pending' else None
+            self.db.execute('UPDATE proposals SET payload=?,status=?,updated_at=?,pending_since=? WHERE id=?',
+                            (json.dumps(item, ensure_ascii=False), item['status'], stamp, pending_since, row['id']))
             from .data_admin import remember_decision
             remember_decision(self, row, item, original=self._proposal(row))
             return item
@@ -703,7 +714,7 @@ class AppStore:
 
     def _review_unwritten_locked(self, item, reason):
         item.update(status='review', needs_review=True, review_reason=reason)
-        self.db.execute("UPDATE proposals SET payload=?,status='review',updated_at=? WHERE id=?", (json.dumps(item, ensure_ascii=False), utcnow(), item['id']))
+        self.db.execute("UPDATE proposals SET payload=?,status='review',updated_at=?,pending_since=NULL WHERE id=?", (json.dumps(item, ensure_ascii=False), utcnow(), item['id']))
         self.db.execute("UPDATE operations SET status='review',last_error=?,updated_at=? WHERE proposal_id=? AND status='pending'", (reason, utcnow(), item['id']))
 
     def queue_operations(self, current=None):
@@ -734,7 +745,7 @@ class AppStore:
                     self._review_unwritten_locked(item, 'Invalid or ambiguous event date; manual correction required.')
                     continue
                 if checked['status'] != 'pending':
-                    self.db.execute('UPDATE proposals SET status=?,updated_at=? WHERE id=?', (checked['status'], utcnow(), item['id']))
+                    self.db.execute('UPDATE proposals SET status=?,updated_at=?,pending_since=NULL WHERE id=?', (checked['status'], utcnow(), item['id']))
                     self.db.execute("UPDATE operations SET status='review',last_error=?,updated_at=? WHERE proposal_id=? AND status='pending'", (checked.get('review_reason') or 'Proposal no longer eligible for a calendar write.', utcnow(), item['id']))
                     continue
                 item = {**checked, 'id': item['id'], 'message_id': item['message_id']}
@@ -902,7 +913,7 @@ class AppStore:
                 snapshot = result['snapshot']
                 self.db.execute('INSERT INTO events(id,calendar_id,message_id,proposal_id,snapshot,fingerprint,marker,updated_at,state) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET proposal_id=excluded.proposal_id,snapshot=excluded.snapshot,fingerprint=excluded.fingerprint,marker=excluded.marker,updated_at=excluded.updated_at,state=excluded.state',
                                 (str(result['event_id']), self.calendar_id, operation['message_id'], operation['proposal_id'], json.dumps(snapshot, ensure_ascii=False), result.get('fingerprint') or digest(snapshot), owned_marker, utcnow(), 'cancelled' if operation['action'] == 'cancel' else 'active'))
-                self.db.execute("UPDATE proposals SET status='applied',updated_at=? WHERE id=?", (utcnow(), operation['proposal_id']))
+                self.db.execute("UPDATE proposals SET status='applied',updated_at=?,pending_since=NULL WHERE id=?", (utcnow(), operation['proposal_id']))
                 decision_row = self.db.execute('SELECT * FROM proposals WHERE id=?', (operation['proposal_id'],)).fetchone()
                 if decision_row:
                     from .data_admin import remember_decision
@@ -912,7 +923,7 @@ class AppStore:
                 if proposal_row:
                     proposal = json.loads(proposal_row[0])
                     proposal.update(needs_review=True, review_reason=str(result.get('error') or 'Calendar conflict requires manual review.')[:1000])
-                    self.db.execute("UPDATE proposals SET payload=?,status='review',updated_at=? WHERE id=?", (json.dumps(proposal, ensure_ascii=False), utcnow(), operation['proposal_id']))
+                    self.db.execute("UPDATE proposals SET payload=?,status='review',updated_at=?,pending_since=NULL WHERE id=?", (json.dumps(proposal, ensure_ascii=False), utcnow(), operation['proposal_id']))
 
     def backup(self, destination=None):
         self.set_setting('last_backup_attempt_at', utcnow())

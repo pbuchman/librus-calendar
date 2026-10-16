@@ -108,9 +108,14 @@ def read_connection_state(db, now=None):
     metadata_pending = count('metadata_refresh', "status IN ('pending','inflight')") if 'metadata_refresh' in tables else 0
     metadata_unknown = count('metadata_refresh', "status='unknown'") if 'metadata_refresh' in tables else 0
     operations_pending += metadata_pending
+    proposal_columns = {row[1] for row in db.execute('PRAGMA table_info(proposals)')}
+    # The reader also supports unmigrated databases without initializing them.
+    # Preparation/retry updates are not new eligibility transitions.
+    proposal_stamp = 'COALESCE(p.pending_since,p.created_at)' if 'pending_since' in proposal_columns else 'p.created_at'
     oldest = db.execute("""SELECT MIN(stamp) FROM (
-        SELECT created_at AS stamp FROM operations WHERE status='pending'
-        UNION ALL SELECT p.created_at FROM proposals p WHERE """ + pending_clause + ')').fetchone()[0]
+        SELECT COALESCE(""" + proposal_stamp + """,o.created_at) AS stamp FROM operations o
+        LEFT JOIN proposals p ON p.id=o.proposal_id AND p.status='pending' WHERE o.status='pending'
+        UNION ALL SELECT """ + proposal_stamp + ' FROM proposals p WHERE ' + pending_clause + ')').fetchone()[0]
     message_columns = {row[1] for row in db.execute('PRAGMA table_info(messages)')}
     available_stamps = [column for column in ('pending_since', 'discovered_at', 'fetched_at') if column in message_columns]
     message_stamp = 'COALESCE(' + ','.join(available_stamps + ['?']) + ')'
