@@ -2,7 +2,7 @@
 
 [English](README.md) · [Konfiguracja](docs/setup.pl.md) · [Demo](docs/demo.pl.md) · [Architektura i zabezpieczenia](docs/architecture.pl.md)
 
-Prywatna skrzynka szkolna, która zamienia wiadomości z **Librus Synergia** na wpisy w Google Calendar. Osobna kolejka pozwala sprawdzić decyzje wymagające udziału rodzica.
+Prywatna skrzynka szkolna, która zamienia wiadomości, ogłoszenia i wpisy terminarza z **Librus Synergia** na działania w Google Calendar. Osobna kolejka pozwala sprawdzić decyzje wymagające udziału rodzica.
 
 Wiadomości są pobierane **bezpośrednio z Librusa**. Powiadomienia Gmail nie są źródłem danych ani wyzwalaczem. Interfejs aplikacji jest obecnie po polsku.
 
@@ -56,7 +56,7 @@ Analiza i narzędzia kalendarza domyślnie używają `gpt-6.1-sol` z rozumowanie
 
 ## Prywatność i ograniczenia
 
-To **nieoficjalna**, niezależna integracja, niezwiązana z Librusem, Google ani OpenAI. Korzysta z nieudokumentowanych interfejsów logowania i wiadomości Librusa, które mogą się zmienić. Obsługuje wiadomości, a nie cały plan lekcji, oceny czy wszystkie funkcje szkoły; zawartość załączników nie jest analizowana.
+To **nieoficjalna**, niezależna integracja, niezwiązana z Librusem, Google ani OpenAI. Korzysta z nieudokumentowanych interfejsów logowania i wiadomości Librusa, które mogą się zmienić. Obsługuje wiadomości, ogłoszenia, wpisy terminarza i informacyjne zastępstwa w zakresie dostępnym dla uwierzytelnionego ucznia. Nie importuje całego planu lekcji, ocen ani wszystkich funkcji szkoły. Treść załączników, obrazy, OCR i PDF-y nie są analizowane ani wysyłane do usług zewnętrznych.
 
 Treść wiadomości jest prywatna. Rzeczywista analiza przesyła przekazaną treść i kontekst zapisanych wydarzeń do skonfigurowanej usługi AI; zapis w Google Calendar przekazuje wybrane szczegóły wydarzeń i cytaty źródłowe. Przechowuj dane logowania, bazę i kopie poza repozytorium, z ograniczonymi uprawnieniami, a interfejs udostępniaj przez Tailscale wyłącznie właścicielowi. Zobacz [prywatność i granice działania](docs/architecture.pl.md).
 
@@ -71,3 +71,11 @@ AI może błędnie zinterpretować daty i kontekst. Testy automatyczne oraz demo
 Projekt powstał jako osobisty prototyp. Wersja publiczna zawiera konfigurowalny kod, ogólne przykłady wdrożenia i fikcyjne dane; wyklucza produkcyjne dane logowania, wiadomości, stan i prywatne materiały z wdrożenia. Zobacz [architekturę](docs/architecture.pl.md) i wewnętrzny [kontrakt aplikacji](app/CONTRACT.md).
 
 Licencja [MIT](LICENSE).
+
+## Wiele źródeł Librusa
+
+Nowe źródła domyślnie mają `multi_source_mode=off`. W trybie `preview` ogłoszenia i terminarz trafiają do osobnej kolejki analizy tylko do odczytu; nie mogą zatwierdzać propozycji, zmieniać decyzji rodzica ani zapisywać w Calendar. Aktywacja wymaga świeżego pobrania i walidacji. W trybie `active` zweryfikowane źródła mogą zostać połączone z jednym wspólnym działaniem zamiast tworzyć duplikat wpisu. Dopasowanie semantyczne sprawdza kompletny ograniczony zbiór kandydatów i niezależnie weryfikuje dosłowne dowody. Brakujący starszy dowód może być osobno odtworzony z pochodzenia o dokładnie zgodnych skrótach, bez wymyślania historycznego cytatu. Starsze źródło z nieznanym adresatem może jedynie dodać oznaczone potwierdzenie jednoznacznie zweryfikowanego wystąpienia zatwierdzonego przez rodzica i powiązanego z własnym wydarzeniem; nie uprawnia do zapisów ani przyszłego dopasowania. Niepewne powiązania trafiają do sprawdzenia. Ponowne przetworzenie zachowuje identyfikatory wydarzeń i decyzje.
+
+Dla zwykłych działań szkolnych zweryfikowany widok terminarza klasy, udostępniony w uwierzytelnionym kontekście wybranego ucznia, może potwierdzić adresatów klasowych nawet bez powtórzenia klasy w treści. Ten kontekst jest zapisywany oddzielnie od dosłownych dowodów działania. Nie potwierdza wyłącznej roli konta, nie rozstrzyga nieznanego uczestnictwa, nie zastępuje innego adresata i nie zmienia decyzji rodzica. Załączniki nadal są wyłączone z analizy.
+
+Panel **Wszystkie źródła** filtruje wiadomości, ogłoszenia i terminarz, pokazuje wynik i powód dla źródła oraz prowadzi do wspólnego działania ze wszystkimi źródłami i oceną pewności. **Podgląd źródeł** pozostaje osobny od decyzji. Zwykłe szkolne przypomnienia mogą być oznaczone jako opcjonalne; zajęcia dodatkowe i nieznany udział wymagają sprawdzenia. Warunkowe informacje bez daty pozostają informacją. Załączniki mają etykietę **załącznik nieanalizowany**. Zobacz [tryby źródeł i odbiór](docs/setup.pl.md#wdrożenie-wielu-źródeł).

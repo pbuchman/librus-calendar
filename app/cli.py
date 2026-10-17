@@ -40,6 +40,13 @@ def main(argv=None, *, config=None):
     grouping.add_argument('--request-file', type=Path, help='Private JSON containing message_id, proposal_ids and source_evidence; preview only.')
     grouping.add_argument('--plan-file', type=Path, required=True)
     grouping.add_argument('--apply', action='store_true')
+    activation = sub.add_parser('source-activate', help='Plan or apply fresh source analysis under the sync lock; never execute saved preview payloads.')
+    activation.add_argument('--plan-file', type=Path, required=True)
+    activation.add_argument('--apply', action='store_true')
+    cleanup = sub.add_parser('cleanup-existing', help='Retire explicit stale local proposals using a private snapshot-bound plan; no Calendar changes.')
+    cleanup.add_argument('--request-file', type=Path)
+    cleanup.add_argument('--plan-file', type=Path, required=True)
+    cleanup.add_argument('--apply', action='store_true')
     pause = sub.add_parser('pause-writes')
     pause.add_argument('--resume', action='store_true')
     args = parser.parse_args(argv)
@@ -67,12 +74,32 @@ def main(argv=None, *, config=None):
             result = {'status': 'backed_up', 'path': store.backup(args.destination)}
         elif args.command == 'pause-writes':
             result = store.set_writes_paused(not args.resume)
-        elif args.command in ('migrate-decisions', 'prune', 'group-existing'):
+        elif args.command in ('migrate-decisions', 'prune', 'group-existing','source-activate','cleanup-existing'):
             from .data_admin import migrate_decisions, prune_state
             from .sync import sync_lock
             with sync_lock(store.path) as acquired:
                 if not acquired:
                     result = {'status': 'already_running', 'calendar_writes': 0}
+                elif args.command in ('source-activate','cleanup-existing'):
+                    from .source_admin import activate_sources, cleanup_existing, read_private_json
+                    if args.command=='source-activate':
+                        from .codex_runtime import CodexRuntime
+                        def activation_client():
+                            from .librus_client import LibrusClient,load_credentials
+                            credentials=load_credentials(config.credentials_path)
+                            account=hashlib.sha256(credentials['login'].encode()).hexdigest()
+                            old=store._setting('librus_account_hash')
+                            if old and old!=account:
+                                raise ValueError('Librus account binding mismatch.')
+                            client=LibrusClient(credentials['login'],credentials['password'])
+                            store.set_setting('librus_account_hash',account)
+                            return client
+                        result=activate_sources(store,CodexRuntime(config,read_only=True),plan_path=args.plan_file,apply=args.apply,client_factory=activation_client if args.apply else None)
+                    else:
+                        if args.apply and args.request_file:
+                            raise ValueError('Cleanup apply accepts only the exact saved plan.')
+                        request=read_private_json(args.request_file) if args.request_file and not args.apply else None
+                        result=cleanup_existing(store,plan_path=args.plan_file,request=request,apply=args.apply)
                 elif args.command == 'group-existing':
                     from .offer_groups import group_existing, read_private_json
                     if args.apply:

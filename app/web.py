@@ -10,13 +10,86 @@ from dataclasses import replace
 from urllib.parse import urlsplit
 from .config import AppConfig, ConfigurationError, load_config
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 ROOT = Path(__file__).parent
 WARSAW = ZoneInfo('Europe/Warsaw')
+SOURCE_KINDS = {'message': 'Wiadomości', 'announcement': 'Ogłoszenia',
+                'school_event': 'Terminarz', 'substitution': 'Zastępstwa'}
+SOURCE_OUTCOMES = {'added': 'Dodano', 'linked': 'Powiązano', 'enriched': 'Uzupełniono',
+                   'review': 'Do sprawdzenia', 'ignored': 'Pominięto',
+                   'analysis_incomplete': 'Analiza niepełna', 'pending': 'Czeka na analizę',
+                   'analyzed': 'Przeanalizowano', 'failed': 'Analiza niepełna',
+                   'deleted': 'Usunięto u źródła', 'retained': 'Zachowano decyzję',
+                   'ready': 'Podgląd gotowy', 'stale': 'Nieaktualny podgląd', 'activated': 'Aktywowano',
+                   'applied': 'W kalendarzu'}
+
+
+SOURCE_LABELS = {
+    'confidence': {'high': 'wysoka', 'medium': 'średnia', 'low': 'niska', 'unknown': 'nieznana'},
+    'activity_scope': {'school': 'wydarzenie szkolne', 'extracurricular': 'zajęcia dodatkowe',
+                       'unknown': 'nieznany udział'},
+    'relation': {'origin': 'Źródło pierwotne', 'added': 'Dodano', 'linked': 'Powiązano',
+                 'enriched': 'Uzupełniono', 'retained': 'Zachowano powiązanie',
+                 'corroborates_unverified_recipient': 'Potwierdzenie bez uprawnień do zmian; odbiorca niezweryfikowany',
+                 'expired_unverified_fact': 'Historyczna informacja bez uprawnień; odbiorca niezweryfikowany',
+                 'retains_closed_offer_decision': 'Zachowano wcześniejszą decyzję; nowe źródło nie zatwierdza udziału'},
+    'decision': {'approve': 'zatwierdzono', 'approved': 'zatwierdzono',
+                 'reject': 'odrzucono', 'rejected': 'odrzucono', 'ignore': 'odrzucono',
+                 'ignored': 'odrzucono', 'select': 'wybrano termin', 'selected': 'wybrano termin',
+                 'confirm_cancel': 'potwierdzono odwołanie', 'cancelled': 'potwierdzono odwołanie'},
+}
+SOURCE_FALLBACKS = {'confidence': 'nieznana', 'activity_scope': 'nieznany udział',
+                    'relation': 'Powiązanie źródłowe', 'decision': 'zapisana'}
+
+
+def source_label(value, family):
+    fallback = SOURCE_FALLBACKS.get(family, 'Brak danych')
+    return SOURCE_LABELS.get(family, {}).get(value, fallback) if isinstance(value, str) else fallback
+
+
+def source_outcome(source):
+    if source.get('current_preview'):
+        return 'Podgląd gotowy'
+    metadata = source.get('metadata') or {}
+    return SOURCE_OUTCOMES.get(source.get('outcome') or metadata.get('outcome') or source.get('status'), 'Brak danych')
+
+
+
+def retained_decision(record):
+    if not isinstance(record, dict):
+        return None
+    proposal = record.get('proposal') or record
+    if isinstance(proposal, dict):
+        for field, label in (('user_rejected', 'odrzucono'), ('user_edited', 'zachowano edycję'),
+                             ('user_approved', 'zatwierdzono')):
+            if proposal.get(field) is True:
+                return label
+    return source_label(record.get('decision') or record.get('action'), 'decision')
+
+
+def preview_changes(previous, planned):
+    if not isinstance(previous, dict) or not isinstance(planned, dict):
+        return []
+    fields = {'title': 'Tytuł', 'start': 'Początek', 'end': 'Koniec', 'due_at': 'Termin',
+              'all_day': 'Cały dzień', 'optional': 'Opcjonalne przypomnienie',
+              'description': 'Opis', 'activity_scope': 'Udział'}
+    def display(key, value):
+        if value in (None, ''):
+            return 'brak'
+        if key in {'start', 'end', 'due_at'}:
+            return human_date(value)
+        if key in {'all_day', 'optional'}:
+            return 'tak' if value is True else 'nie'
+        if key == 'activity_scope':
+            return source_label(value, 'activity_scope')
+        return str(value)
+    return [{'label': label, 'before': display(key, previous.get(key)),
+             'after': display(key, planned.get(key))}
+            for key, label in fields.items() if previous.get(key) != planned.get(key)]
 
 
 def human_date(value):
@@ -92,6 +165,9 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
     templates.env.filters['human_date'] = human_date
     templates.env.filters['event_date'] = event_date
     templates.env.filters['calendar_probe_status'] = calendar_probe_status
+    templates.env.filters['source_outcome'] = source_outcome
+    templates.env.filters['source_label'] = source_label
+    templates.env.filters['retained_decision'] = retained_decision
 
     @application.middleware('http')
     async def private_access(request: Request, call_next):
@@ -120,7 +196,7 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
 
     application.mount('/static', StaticFiles(directory=str(ROOT / 'static')), name='static')
 
-    def page(request, section='messages', selected=None, notice=None):
+    def page(request, section='messages', selected=None, notice=None, extra=None):
         csrf = request.cookies.get(cookie_name) or secrets.token_urlsafe(32)
         next_sync = (clock().astimezone(WARSAW).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).isoformat()
         groups = store.list_proposal_groups(current=clock())
@@ -130,6 +206,12 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
                             for member in group['members'] if group['status'] == 'selected'
                             and member['id'] == group['selected_proposal_id'] and member['status'] == 'review']
         proposals.extend(selected_reviews)
+        for item in proposals:
+            group_id = item.get('blocked_by_offer_group')
+            original = store.get_proposal_group(group_id, current=clock()) if group_id else None
+            membership = store.get_proposal_group_for_proposal(item['id'], current=clock()) if item.get('alternative_group') else None
+            item['blocked_offer'] = bool(group_id or (item.get('alternative_group') and membership is None))
+            item['blocked_offer_message_id'] = original['message_id'] if original else item.get('message_id')
         selected_review_ids = {member['id'] for member in selected_reviews}
         status = store.status()
         grouped_review_count = sum(member['status'] == 'review' and member['id'] not in selected_review_ids
@@ -146,6 +228,10 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
                    'demo_mode': demo_mode, 'demo_banner': 'Demo — dane fikcyjne / fictional data',
                    'calendar_label': 'calendar@example.test' if demo_mode else (config.calendar_id or 'Nie skonfigurowano'),
                    'selected_proposals': [item for item in proposals if selected and item.get('message_id') == selected.get('id') and not item.get('selected_for_offer')]}
+        context.update({'source_kinds': SOURCE_KINDS, 'source_outcomes': SOURCE_OUTCOMES,
+                        'source_health': status.get('sources') or {}, 'selected_source': None,
+                        'selected_action': None, 'source_items': [], 'preview_items': []})
+        context.update(extra or {})
         response = templates.TemplateResponse(request=request, name='inbox.html', context=context)
         response.set_cookie(cookie_name, csrf, httponly=True, secure=not allow_local,
                             samesite='strict', max_age=86400)
@@ -169,6 +255,102 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
     @application.get('/review', response_class=HTMLResponse)
     def review(request: Request):
         return page(request, section='review')
+
+    def source_kind(kind):
+        if kind == 'school_calendar':
+            kind = 'school_event'
+        if kind is not None and kind not in SOURCE_KINDS:
+            raise HTTPException(400, 'Nieprawidłowy rodzaj źródła.')
+        return kind
+
+    def present_preview(item):
+        results = []
+        for outcome in item.get('outcomes') or []:
+            action = outcome.get('action') or {}
+            payload = action.get('payload') or {}
+            existing = store.get_action(outcome.get('action_id')) if outcome.get('action_id') else None
+            results.append({**outcome, 'action': action, 'payload': payload,
+                            'target_id': existing['id'] if existing else None,
+                            'retained_decision': retained_decision(action.get('decision')),
+                            'changes': preview_changes(existing.get('payload'), payload) if existing else []})
+        return {**item, 'planned_outcomes': results, 'plan_available': 'outcomes' in item}
+
+    def with_source_previews(sources):
+        selected = {source['id']: source for source in sources}
+        found = {}
+        offset = 0
+        while selected:
+            previews = store.list_source_previews(limit=500, offset=offset, status='ready')
+            for item in previews:
+                source = selected.get(item['source_id'])
+                if source and source.get('content_hash') and item.get('source_hash') == source['content_hash']:
+                    found[source['id']] = present_preview(item)
+                    selected.pop(source['id'])
+            if len(previews) < 500:
+                break
+            offset += 500
+        return [{**source, 'current_preview': found.get(source['id'])} for source in sources]
+
+    def sources_page(request, *, selected_source=None, selected_action=None):
+        kind = source_kind(request.query_params.get('kind') or None)
+        try:
+            offset = int(request.query_params.get('offset', '0'))
+        except ValueError:
+            raise HTTPException(400, 'Nieprawidłowa strona.') from None
+        if offset < 0:
+            raise HTTPException(400, 'Nieprawidłowa strona.')
+        items = store.list_sources(limit=51, offset=offset, kind=kind)
+        visible = with_source_previews(items[:50] + ([selected_source] if selected_source else []))
+        if selected_source:
+            selected_source = visible[-1]
+        return page(request, section='sources', extra={
+            'source_items': visible[:len(items[:50])], 'source_kind': kind, 'source_offset': offset,
+            'source_more': len(items) > 50, 'selected_source': selected_source,
+            'selected_action': selected_action,
+            'source_actions': [store.get_action(key) for key in (selected_source or {}).get('action_ids', [])]})
+
+    @application.get('/sources', response_class=HTMLResponse)
+    def sources(request: Request):
+        return sources_page(request)
+
+    @application.get('/sources/{source_id}', response_class=HTMLResponse)
+    def source_detail(request: Request, source_id: str):
+        item = store.get_source(source_id)
+        if item is None:
+            raise HTTPException(404, 'Nie znaleziono źródła.')
+        return sources_page(request, selected_source=item)
+
+    @application.get('/actions/{action_id}', response_class=HTMLResponse)
+    def action_detail(request: Request, action_id: str):
+        action = store.get_action(action_id)
+        if action is None:
+            raise HTTPException(404, 'Nie znaleziono działania.')
+        action = {**action, 'sources': [store.get_source(link['source_id']) for link in action.get('source_links', [])]}
+        return sources_page(request, selected_action=action)
+
+    @application.get('/preview', response_class=HTMLResponse)
+    def preview(request: Request):
+        return page(request, section='preview', extra={'preview_items': [present_preview(item) for item in store.list_source_previews(limit=100)]})
+
+    @application.get('/api/sources')
+    def sources_api(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0),
+                    kind: str | None = None, status: str | None = None):
+        items = store.list_sources(limit=limit + 1, offset=offset, kind=source_kind(kind), status=status)
+        return {'items': items[:limit], 'limit': limit, 'offset': offset,
+                'next_offset': offset + limit if len(items) > limit else None}
+
+    @application.get('/api/actions/{action_id}')
+    def action_api(action_id: str):
+        action = store.get_action(action_id)
+        if action is None:
+            raise HTTPException(404, 'Nie znaleziono działania.')
+        return {**action, 'sources': [store.get_source(link['source_id']) for link in action.get('source_links', [])]}
+
+    @application.get('/api/source-previews')
+    def source_previews_api(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+        items = store.list_source_previews(limit=limit + 1, offset=offset)
+        return {'items': items[:limit], 'limit': limit, 'offset': offset,
+                'next_offset': offset + limit if len(items) > limit else None}
 
     @application.get('/api/status')
     def status():

@@ -157,6 +157,15 @@ class ProposalGroupsMixin:
                     (items[0]['alternative_group_evidence'], stamp, group_id))
             self.db.execute("INSERT OR IGNORE INTO proposal_groups VALUES (?,?,?,?,?,'open',NULL,1,?,?)",
                 (group_id, message['id'], message['payload_hash'], key, items[0]['alternative_group_evidence'], stamp, stamp))
+            offer = items[0].get('offer_identity')
+            if isinstance(offer,dict):
+                label = _compact(offer.get('label')).casefold()
+                evidence = _compact(offer.get('evidence'))
+                if len(label)>=6 and evidence and evidence in _compact(message.get('text')) and label in evidence.casefold():
+                    # Only a literal participation-offer identity may connect
+                    # groups across sources. It never transfers a selected date.
+                    offer_key=digest(['source-offer',self._setting('source_learner_id',''),label,(items[0].get('action_identity') or {}).get('occasion','')])
+                    self.db.execute('INSERT OR IGNORE INTO canonical_offer_groups VALUES (?,?)',(group_id,offer_key))
             for position, item in enumerate(items):
                 prior = self.db.execute('SELECT group_id FROM proposal_group_members WHERE proposal_id=?', (item['id'],)).fetchone()
                 if prior and prior[0] != group_id:
@@ -165,17 +174,28 @@ class ProposalGroupsMixin:
 
     def _group_write_reason(self, proposal_id):
         proposal = self.db.execute('SELECT payload FROM proposals WHERE id=?',(str(proposal_id),)).fetchone()
+        if proposal and json.loads(proposal['payload']).get('blocked_by_offer_group'):
+            return 'Existing offer membership must be reconciled before this option can write.'
         if proposal and json.loads(proposal['payload']).get('blocked_by_group_decision'):
             return 'A prior alternative decision blocks this ambiguous replacement.'
         row = self.db.execute('''SELECT g.* FROM proposal_groups g JOIN proposal_group_members m ON m.group_id=g.id
                                WHERE m.proposal_id=?''', (str(proposal_id),)).fetchone()
         if not row:
-            return None
+            return 'Complete alternative membership must be reconciled before writing.' if proposal and json.loads(proposal['payload']).get('alternative_group') else None
         message = self.db.execute('SELECT payload_hash,status FROM messages WHERE id=?', (row['message_id'],)).fetchone()
         if not message or message['payload_hash'] != row['source_hash'] or message['status'] == 'retained':
             return 'Alternative source is unavailable or changed; review required.'
         if row['status'] != 'selected' or row['selected_proposal_id'] != str(proposal_id):
             return 'Choose one alternative through its complete offer group before writing.'
+        offer=self.db.execute('SELECT offer_key FROM canonical_offer_groups WHERE group_id=?',(row['id'],)).fetchone()
+        if offer:
+            related=[r[0] for r in self.db.execute('SELECT group_id FROM canonical_offer_groups WHERE offer_key=? AND group_id<>?',(offer[0],row['id']))]
+            for other_id in related:
+                other=self.db.execute('SELECT status,selected_proposal_id FROM proposal_groups WHERE id=?',(other_id,)).fetchone()
+                if other and other['status'] in ('selected','rejected'):
+                    return 'A cross-source offer already has a human decision; reconcile the complete offer before another write.'
+                if self.db.execute("SELECT 1 FROM operations o JOIN proposal_group_members m ON m.proposal_id=o.proposal_id WHERE m.group_id=? AND (o.attempts>0 OR o.status IN ('inflight','unknown','applied')) LIMIT 1",(other_id,)).fetchone():
+                    return 'Another cross-source alternative has write evidence; no second offer event is permitted.'
         # Corrupted/injected local statuses cannot queue a second member.
         conflict = self.db.execute('''SELECT 1 FROM operations o JOIN proposal_group_members m ON m.proposal_id=o.proposal_id
             WHERE m.group_id=? AND m.proposal_id<>? AND (o.attempts>0 OR o.status IN ('inflight','unknown','applied')) LIMIT 1''',

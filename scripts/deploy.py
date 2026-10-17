@@ -26,7 +26,12 @@ UNITS = ('librus-web.service', 'librus-sync.service', 'librus-sync.timer',
 BACKUP_UNITS = ('librus-backup.service', 'librus-backup.timer')
 MARKER = '# Managed by librus-calendar deployment v1\n'
 RESOURCES = ('templates/inbox.html', 'static/style.css', 'schemas/analysis.json',
-             'schemas/tool.json', 'schemas/analysis.md', 'schemas/executor.md')
+             'schemas/tool.json', 'schemas/analysis.md', 'schemas/executor.md',
+             'schemas/source_analysis.json', 'schemas/source_match.json',
+             'schemas/source_facts.md', 'schemas/source_match.md',
+             'schemas/source_verify.json', 'schemas/source_verify.md',
+             'schemas/source_recovery.json', 'schemas/source_recovery.md',
+             'templates/sources.html', 'templates/source_preview.html')
 
 
 class DeploymentError(RuntimeError):

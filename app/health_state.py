@@ -93,6 +93,44 @@ def error_code(error, stage=None):
             'discovery': 'discovery_failed', 'fetch': 'fetch_failed', 'analysis': 'analysis_failed'}.get(stage, 'operation_failed')
 
 
+SOURCE_KINDS = ('message', 'announcement', 'school_event', 'substitution')
+SOURCE_MODES = ('off', 'preview', 'active')
+SOURCE_ERROR_CODES = frozenset(('source_collection_incomplete', 'source_collection_failed', 'source_analysis_failed', 'source_context_mismatch', 'source_changed', 'source_match_failed', 'source_operation_failed', 'source_response_limit', 'source_markup_invalid', 'source_fields_ambiguous', 'source_date_invalid', 'source_pagination_unsupported', 'announcement_markup_invalid', 'announcement_limit', 'announcement_identity_ambiguous', 'learner_context_ambiguous', 'learner_context_unverified', 'calendar_form_invalid', 'calendar_markup_invalid', 'calendar_date_invalid', 'calendar_detail_route_invalid', 'calendar_identity_unverified', 'calendar_limit', 'calendar_month_incomplete', 'calendar_detail_markup_invalid', 'source_session_invalid', 'calendar_window_unsupported', 'calendar_selection_failed', 'calendar_identity_ambiguous', 'calendar_publication_ambiguous', 'calendar_restore_failed', 'source_window_invalid', 'learner_collection_failed', 'announcement_collection_failed', 'school_event_collection_failed', 'learner_context_changed'))
+SOURCE_ERROR_CODES |= frozenset(('source_preview_time_budget_exhausted', 'source_preview_call_budget_exhausted', 'source_preview_worker_required'))
+
+
+def read_source_health(db, tables):
+    """Optional aggregate extension; never select source payloads or identifiers."""
+    if not {'sources', 'source_health', 'action_sources', 'source_previews'}.issubset(tables):
+        return None
+    row = db.execute("SELECT value FROM settings WHERE key='multi_source_mode'").fetchone()
+    mode = row[0] if row else 'off'
+    if mode not in SOURCE_MODES:
+        raise ValueError('Invalid source mode.')
+    kinds = {}
+    for kind in SOURCE_KINDS:
+        health = db.execute('SELECT last_successful_fetch,last_result,last_error FROM source_health WHERE kind=?', (kind,)).fetchone()
+        counts = dict(db.execute('SELECT status,COUNT(*) FROM sources WHERE kind=? GROUP BY status', (kind,)))
+        links = db.execute('SELECT COUNT(*) FROM action_sources a JOIN sources s ON s.id=a.source_id WHERE s.kind=?', (kind,)).fetchone()[0]
+        result, code = (health[1], health[2]) if health else (None, None)
+        if result is not None and result not in {'ok', 'partial', 'failed', 'running', 'unsupported', 'off'}:
+            raise ValueError('Invalid source result.')
+        if code is not None and code not in SOURCE_ERROR_CODES:
+            code = 'source_operation_failed'
+        pending, failed, preview_ready = counts.get('pending', 0), counts.get('failed', 0), None
+        if mode == 'preview' and kind != 'message':
+            preview_counts = dict(db.execute('SELECT p.status,COUNT(*) FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE s.kind=? AND s.deleted=0 GROUP BY p.status', (kind,)))
+            preview_ready = preview_counts.get('ready', 0)
+            failed = preview_counts.get('failed', 0)
+            pending = int(db.execute("SELECT COUNT(*) FROM sources s WHERE s.kind=? AND s.deleted=0 AND s.status IN ('pending','failed') AND NOT EXISTS (SELECT 1 FROM source_previews p WHERE p.source_id=s.id AND p.source_hash=s.content_hash AND p.status IN ('ready','failed'))", (kind,)).fetchone()[0])
+        kinds[kind] = dict(mode='active' if kind == 'message' else mode,
+            last_successful_fetch=timestamp(health[0]) if health else None,
+            pending=pending, failed=failed, preview_ready=preview_ready, links=links,
+            last_result=result, last_error=code)
+    return dict(mode=mode, kinds=kinds,
+        preview_count=int(db.execute("SELECT COUNT(*) FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE p.status='ready' AND s.deleted=0").fetchone()[0]))
+
+
 def read_connection_state(db, now=None):
     """Read aggregate columns only, on the caller's existing consistent snapshot."""
     tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -167,7 +205,7 @@ def read_connection_state(db, now=None):
                 item = max(latest, key=lambda value: value['attempt_number'])
                 probe.update(calendar_probe_result=item['result'], calendar_probe_attempts=len(latest),
                     calendar_probe_recovered=None if item['result'] == 'running' else item['result'] == 'ok' and item['attempt_number'] == 2)
-    return dict(schema_version=1, **probe, initialized_at=timestamp(settings.get('health_initialized_at')),
+    return dict(schema_version=1, sources=read_source_health(db, tables), **probe, initialized_at=timestamp(settings.get('health_initialized_at')),
         last_attempt_at=timestamp(last['started_at'] if last else settings.get('last_sync')),
         last_successful_sync=timestamp(settings.get('last_successful_sync')),
         last_result=result, last_stage=stage, last_error_code=code, last_duration_seconds=duration,

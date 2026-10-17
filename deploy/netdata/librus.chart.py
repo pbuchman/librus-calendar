@@ -39,6 +39,26 @@ CHARTS = {
 }
 OPTIONAL_METRICS = {'probe_retries_24h', 'probe_recoveries_24h'}
 
+SOURCE_KINDS = ('message', 'announcement', 'school_event', 'substitution')
+SOURCE_MODES = ('off', 'preview', 'active')
+SOURCE_ERROR_CODES = frozenset(('source_collection_incomplete', 'source_collection_failed', 'source_analysis_failed', 'source_context_mismatch', 'source_changed', 'source_match_failed', 'source_operation_failed', 'source_response_limit', 'source_markup_invalid', 'source_fields_ambiguous', 'source_date_invalid', 'source_pagination_unsupported', 'announcement_markup_invalid', 'announcement_limit', 'announcement_identity_ambiguous', 'learner_context_ambiguous', 'learner_context_unverified', 'calendar_form_invalid', 'calendar_markup_invalid', 'calendar_date_invalid', 'calendar_detail_route_invalid', 'calendar_identity_unverified', 'calendar_limit', 'calendar_month_incomplete', 'calendar_detail_markup_invalid', 'source_session_invalid', 'calendar_window_unsupported', 'calendar_selection_failed', 'calendar_identity_ambiguous', 'calendar_publication_ambiguous', 'calendar_restore_failed', 'source_window_invalid', 'learner_collection_failed', 'announcement_collection_failed', 'school_event_collection_failed', 'learner_context_changed'))
+SOURCE_ERROR_CODES |= frozenset(('source_preview_time_budget_exhausted', 'source_preview_call_budget_exhausted', 'source_preview_worker_required'))
+for kind in SOURCE_KINDS:
+    name = 'source_' + kind
+    ORDER.append(name)
+    CHARTS[name] = {'options': [None, 'Librus source: ' + kind, 'minutes / count / mode',
+        'sources', 'librus_local.' + name, 'line'], 'lines': [
+        [name + '_mode', 'mode: off 0, preview 1, active 2'],
+        [name + '_success_age', 'last successful fetch age'],
+        [name + '_pending', 'pending analysis'], [name + '_failed', 'errors'],
+        [name + '_links', 'action links'], [name + '_preview_ready', 'ready preview analyses']]}
+ORDER.append('source_preview')
+CHARTS['source_preview'] = {'options': [None, 'Librus preview queue (no calendar writes)',
+    'count', 'sources', 'librus_local.source_preview', 'line'],
+    'lines': [['source_preview_count', 'ready preview analyses']]}
+OPTIONAL_METRICS.update(line[0] for name, chart in CHARTS.items()
+                        if name.startswith('source_') for line in chart['lines'])
+
 # python.d casts collected values to int before applying chart multiplier/divisor.
 # Encode fixed-point integers on the wire so time thresholds retain sub-unit precision.
 for chart in CHARTS.values():
@@ -129,6 +149,32 @@ def validate_snapshot(snapshot, now):
             raise ValueError('pause age unavailable')
     elif state is not None:
         raise ValueError('invalid unavailable database state')
+    sources = state.get('sources') if isinstance(state, dict) else None
+    if sources is not None:
+        if not isinstance(sources, dict) or sources.get('mode') not in SOURCE_MODES:
+            raise ValueError('invalid source mode')
+        kinds = sources.get('kinds')
+        if not isinstance(kinds, dict) or set(kinds) != set(SOURCE_KINDS):
+            raise ValueError('invalid source kinds')
+        preview_count = sources.get('preview_count')
+        if type(preview_count) is not int or not 0 <= preview_count <= MAX_METRIC_VALUE:
+            raise ValueError('invalid preview count')
+        for item in kinds.values():
+            if not isinstance(item, dict) or item.get('mode') not in SOURCE_MODES:
+                raise ValueError('invalid source mode')
+            parsed_time(item.get('last_successful_fetch'), now)
+            for field in ('pending', 'failed', 'links'):
+                if type(item.get(field)) is not int or not 0 <= item[field] <= MAX_METRIC_VALUE:
+                    raise ValueError('invalid source count')
+            ready = item.get('preview_ready')
+            if ready is not None and (type(ready) is not int or not 0 <= ready <= MAX_METRIC_VALUE):
+                raise ValueError('invalid preview ready count')
+            result = item.get('last_result')
+            if result is not None and result not in {'ok', 'partial', 'failed', 'running', 'unsupported', 'off'}:
+                raise ValueError('invalid source result')
+            code = item.get('last_error')
+            if code is not None and (not isinstance(code, str) or code not in SOURCE_ERROR_CODES):
+                raise ValueError('invalid source error')
     return generated, parsed
 
 
@@ -187,6 +233,20 @@ class HealthMetrics:
                                  ('calendar_probe_recoveries_24h', 'probe_recoveries_24h')):
             if state.get(field) is not None:
                 data[dimension] = state[field]
+        sources = state.get('sources')
+        if sources is not None:
+            data['source_preview_count'] = sources['preview_count']
+            for kind in SOURCE_KINDS:
+                item = sources['kinds'][kind]
+                prefix = 'source_' + kind + '_'
+                data[prefix + 'mode'] = SOURCE_MODES.index(item['mode'])
+                for field in ('pending', 'failed', 'links'):
+                    data[prefix + field] = item[field]
+                if item.get('preview_ready') is not None:
+                    data[prefix + 'preview_ready'] = item['preview_ready']
+                fetched = parsed_time(item.get('last_successful_fetch'), now)
+                if fetched is not None:
+                    data[prefix + 'success_age'] = max(0, now - fetched) / 60.0
         paused = state['writes_paused']
         running = state['last_result'] == 'running'
         actually_running = running and snapshot['sync_running']

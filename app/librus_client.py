@@ -183,6 +183,11 @@ class LibrusClient:
                 'read_date_returned': clean_text(data.get('readDate') or ''),
                 'attachment_count': len(data.get('attachments') or [])}
 
+    def collect_sources(self, *, current=None, past_days=30, future_days=60):
+        """Read the selected learner's text sources using this authenticated session."""
+        from .source_collectors import collect_sources
+        return collect_sources(self, current=current, past_days=past_days, future_days=future_days)
+
 
 
 def load_credentials(path=None):

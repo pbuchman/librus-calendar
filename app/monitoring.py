@@ -9,6 +9,7 @@ import re
 import subprocess
 import tempfile
 from .config import ConfigurationError, load_config
+from .health_state import SOURCE_ERROR_CODES
 from datetime import datetime, timezone
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -86,6 +87,48 @@ def sanitize_state(state, now):
         if value is not None and (type(value) is not int or not 0 <= value <= 10**12):
             raise ValueError('invalid probe count')
         clean[name] = value
+    clean['sources'] = sanitize_source_health(state.get('sources'), now)
+    return clean
+
+
+def sanitize_source_health(sources, now):
+    """Closed aggregate extension: unknown legacy data stays unknown."""
+    if sources is None:
+        return None
+    if not isinstance(sources, dict) or sources.get('mode') not in {'off', 'preview', 'active'}:
+        raise ValueError('invalid source mode')
+    kinds = sources.get('kinds')
+    expected = {'message', 'announcement', 'school_event', 'substitution'}
+    if not isinstance(kinds, dict) or set(kinds) != expected:
+        raise ValueError('invalid source kinds')
+    clean = {'mode': sources['mode'], 'kinds': {}}
+    count = sources.get('preview_count')
+    if type(count) is not int or not 0 <= count <= 10**12:
+        raise ValueError('invalid preview count')
+    clean['preview_count'] = count
+    for kind in sorted(expected):
+        item = kinds[kind]
+        if not isinstance(item, dict) or item.get('mode') not in {'off', 'preview', 'active'}:
+            raise ValueError('invalid source mode')
+        record = {'mode': item['mode'], 'last_successful_fetch': timestamp(item.get('last_successful_fetch'), now)}
+        for field in ('pending', 'failed', 'links'):
+            value = item.get(field)
+            if type(value) is not int or not 0 <= value <= 10**12:
+                raise ValueError('invalid source count')
+            record[field] = value
+        ready = item.get('preview_ready')
+        if ready is not None and (type(ready) is not int or not 0 <= ready <= 10**12):
+            raise ValueError('invalid preview ready count')
+        record['preview_ready'] = ready
+        result = item.get('last_result')
+        if result is not None and result not in {'ok', 'partial', 'failed', 'running', 'unsupported', 'off'}:
+            raise ValueError('invalid source result')
+        record['last_result'] = result
+        code = item.get('last_error')
+        if code is not None and (not isinstance(code, str) or code not in SOURCE_ERROR_CODES):
+            raise ValueError('invalid source code')
+        record['last_error'] = code
+        clean['kinds'][kind] = record
     return clean
 
 

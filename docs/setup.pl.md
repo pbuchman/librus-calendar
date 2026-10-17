@@ -77,4 +77,77 @@ release_python="$HOME/.local/lib/librus-calendar/releases/FULL_SHA/.venv/bin/pyt
 
 `rebuild --days 30` przegląda wszystkie strony wiadomości z wybranego okresu, ponawia błędy pobierania/analizy oraz czyta odkryte i przeniesione ID wydarzeń. Wymusza kalendarz tylko do odczytu: nigdy nie kolejkuje ani nie wykonuje zapisów. Zmienia lokalny stan docelowy i przesyła wiadomości do analizy. Brakujące, obce lub niejednoznaczne własności wymagają przeglądu; wyniki partial/review nie oznaczają pełnej odbudowy. Dopuszczalny okres wynosi 1–30 dni.
 
-`prune --days 30` pokazuje podgląd. Dopiero `--apply` usuwa stare treści wiadomości, audyt analizy i zbędne treści wydarzeń/operacji. Zachowuje minimalne ID, skróty, decyzje, własność, dowody konfliktów, tombstones oraz wszystkie wiersze dziennika. Pełne intencje unknown/inflight pozostają do rozstrzygnięcia; przedawnione niewykonane operacje przechodzą do przeglądu. Secure delete i VACUUM działają w miejscu, bez backupu. Pruning nie zmienia zewnętrznego kalendarza. Starą bazę usuń wyłącznie w jawnie określonym punkcie odbioru; skrypt wdrożenia jej nie usuwa. Szczegóły: [kontrakt aplikacji](../app/CONTRACT.md).
+`prune --days 30` pokazuje podgląd. Dopiero `--apply` usuwa stare treści wiadomości, audyt analizy i zbędne treści wydarzeń/operacji. Podglądy i audyty analizy źródeł zawierające opis podlegają 30 dniom retencji treści; 90-dniowa historia dotyczy wyłącznie technicznych przebiegów i prób Calendar. Zachowuje minimalne ID, skróty, decyzje, własność, dowody konfliktów, tombstones oraz wszystkie wiersze dziennika. Pełne intencje unknown/inflight pozostają do rozstrzygnięcia; przedawnione niewykonane operacje przechodzą do przeglądu. Secure delete i VACUUM działają w miejscu, bez backupu. Pruning nie zmienia zewnętrznego kalendarza. Starą bazę usuń wyłącznie w jawnie określonym punkcie odbioru; skrypt wdrożenia jej nie usuwa. Szczegóły: [kontrakt aplikacji](../app/CONTRACT.md).
+
+## Wdrożenie wielu źródeł
+
+`multi_source_mode` przyjmuje `off` (domyślnie), `preview` lub `active`; jawne nadpisanie środowiskowe to `LIBRUS_MULTI_SOURCE_MODE`. Dotychczasowa synchronizacja wiadomości pozostaje dostępna. Użyj tej samej chronionej lokalnej konfiguracji i procedury niezmiennego pakietu opisanej wyżej; identyfikatora ucznia, danych logowania, treści źródeł i wyników podglądu nie umieszczaj w publicznym repozytorium. Zachowaj powiązanie ucznia i kalendarza, uwierzytelnienie właściciela, stan wstrzymania zapisów, harmonogram godzinowy, model/effort i celowo wyłączone kopie bazy.
+
+Podczas prywatnego przeglądu podglądu odróżniaj dosłowną frazę o adresacie od potwierdzonego przez kolektor kontekstu terminarza klasy. Tylko wpisy `school_event` z kompletnego uwierzytelnionego widoku terminarza klasy, z niezmienionym wybranym uczniem i klasą, mogą używać tego osobnego kontekstu dla zwykłego działania szkolnego; treść nadal musi zawierać dosłowny dowód działania i udokumentowaną datę. Brak lub zmiana dowodu, sprzeczni adresaci, ograniczenia roli rodzica i nieznany lub warunkowy udział nie uprawniają do nowych zapisów. Przed aktywacją i wykonaniem kolejki ponownie sprawdź zapisaną podstawę adresata względem bieżącego źródła; zachowaj każdą decyzję rodzica. Wykonanie oparte na dowodzie adresatów wymaga potwierdzenia aktywacji dla bieżącej klasy: stare działanie oraz świeży dowód nowej klasy przy starym potwierdzeniu pozostają odłożone do świeżej zweryfikowanej aktywacji. Sama trasa uwierzytelnionej sesji lub udane pobranie nie potwierdzają adresatów. Załączniki pozostają wyłączone z analizy.
+
+Pobieranie i analiza podglądu zaczynają się po dotychczasowej analizie wiadomości, uzgadnianiu wyników i zapisach Calendar. Ta osobna faza ma limit dziesięciu minut, połowy pozostałego czasu całej synchronizacji oraz 31 wywołań modelu łącznie na ekstrakcję, dopasowanie, odzyskiwanie starszych dowodów i niezależną weryfikację semantyczną. Dla małego źródła rezerwacja obejmuje jedną ekstrakcję i do trzech wywołań na działanie inne niż ignore (dopasowanie, odzyskanie i weryfikację): `1 + 3N <= 31`, czyli najwyżej dziesięć takich działań przy dostępnej funkcji odzyskiwania. Bez niej obowiązuje `1 + 2N <= 31`. Na działanie przypada najwyżej jedno grupowe odzyskiwanie dla maksymalnie 12 kandydatów; rezerwa zawsze chroni pozostałe podstawowe dopasowania. Źródło mieszczące się w świeżym budżecie jest odkładane w całości, gdy bieżący budżet nie wystarcza; niepełny wynik nie jest zapisywany jako gotowy. Wyjątkowo duże źródła rezerwują wywołania na podstawowe dopasowanie i mogą pokazać jawny niezweryfikowany wynik do sprawdzenia po wyczerpaniu budżetu opcjonalnej weryfikacji. Taki wynik nie ustala działania docelowego, powiązania, uprawnienia do zapisu ani potwierdzonej tożsamości działania. Gotowe podglądy pozostają zapisane; odłożone lub przerwane wersje źródeł zostają w trwałej kolejce na kolejne przebiegi, z widocznym powodem. Wyczerpanie budżetu podglądu nie zmienia sukcesu synchronizacji wiadomości. Fazę wykonuje główny wątek procesu CLI; wywołania z wątków tła ją odkładają. Pełny sukces trybu aktywnego nadal wymaga kompletnej obsługi wszystkich wymaganych kanałów.
+
+1. Zweryfikuj wydanie testami fikcyjnych kolektorów, ponownego przetwarzania źródeł i działań, migracji i retencji, zachowania decyzji oraz UI. Sprawdź bezpieczne agregaty i dostępność źródeł. Sukces offline nie potwierdza zgodności z rzeczywistą szkołą.
+2. Przygotuj sprawdzony niezmienny pakiet z nowymi źródłami w `preview`. Pobieranie musi potwierdzić wybranego uwierzytelnionego ucznia, wszystkie strony i pełne treści. Nieobsługiwane, częściowe lub niejednoznaczne pobranie pozostaje jawnie niepełne. Analizy podglądu są oddzielone od rzeczywistych propozycji, operacji i decyzji; załączniki pozostają metadanymi, bez żądań obrazów, OCR, PDF i treści załączników.
+3. Zaobserwuj rzeczywisty godzinowy przebieg harmonogramu w podglądzie. Sprawdź pełne pobranie każdego wymaganego źródła, kolejkę, błędy, potwierdzenie ucznia i komplet stron. Prywatnie obejrzyj wyniki i niepewne duplikaty. Potwierdź zero zapisów Calendar z podglądu oraz brak zmian decyzji i identyfikatorów własnych wydarzeń. Ręczne uruchomienie ani przyszły termin timera nie spełniają tej bramki.
+4. Po spełnieniu kryteriów podglądu i rzeczywistego przebiegu harmonogramu zmień wyłącznie zatwierdzony tryb na `active`. Aktywacja musi zawsze ponownie pobrać, przeanalizować i zweryfikować bieżącą treść, zakres ucznia, powiązania działań i decyzje rodzica; zapisany podgląd nie uprawnia do wykonania nieaktualnych działań.
+5. Zaobserwuj rzeczywisty pełny godzinowy przebieg aktywny. Wymagaj pełnego pobrania aktywnych źródeł, braku automatycznej kolejki i nieznanych zapisów, niezmienionych decyzji i braku duplikatu przy pełnym powtórzeniu. Oddzielnie sprawdź UI i monitoring agregatów. Wdrożenie, podgląd, aktywację i pełny odbiór godzinowy opisuj osobno jako oczekujące albo zakończone.
+
+Panel pokazuje wyniki dodano, powiązano, uzupełniono, do sprawdzenia, pominięto i analiza niepełna, z powodami i pochodzeniem. Kształty `/api/messages`, `/api/proposals` i `/api/proposal-groups` pozostają zgodne. `/api/sources?limit=50&offset=0&kind=announcement` zwraca `{items,limit,offset,next_offset}` (limit 1–100); rodzaje to `message`, `announcement`, `school_event`, `substitution` (`school_calendar` jest aliasem). `/api/actions/{id}` zawiera źródła, powiązania i zachowaną decyzję. `/api/source-previews` jest stronicowany i tylko do odczytu; nie ma endpointu aktywacji przez panel.
+
+Netdata otrzymuje wyłącznie dozwolone agregaty dla rodzaju źródła: tryb, ostatnie pełne pobranie, liczbę oczekujących analiz i błędów oraz liczbę powiązań z działaniami, a także osobny licznik gotowych podglądów. Brak danych w starszej bazie lub eksporcie pozostaje nieznany. Świeżość podglądu nie przesuwa daty pełnego sukcesu aktywnej synchronizacji; każde wymagane aktywne źródło musi być kompletne. Progi alarmowe i trasy pozostają niezmienione, wraz z celowym wyłączeniem kopii bazy.
+
+### Dokładne polecenia aktywacji i powrót po odmowie
+
+Po rzeczywistym godzinowym odbiorze podglądu zatrzymaj wyłącznie timer i poczekaj na zakończenie aktywnego zapisu. Nie zatrzymuj ani nie zabijaj pracującego `librus-sync.service`. Zabezpiecz krótki czas planowania i wykonania przed decyzjami w panelu. Zachowaj zapisany stan wstrzymania zapisów. Oba polecenia administracyjne zajmują `sync.lock`; `already_running` oznacza oczekiwanie i ponowienie po zakończeniu bieżącego procesu.
+
+```sh
+systemctl --user stop librus-sync.timer
+systemctl --user show librus-sync.service -p ActiveState -p SubState -p Result -p ExecMainStatus
+release_python="$HOME/.local/lib/librus-calendar/releases/FULL_SHA/.venv/bin/python"
+source_config="$HOME/.config/librus-calendar/config.json"
+source_state="$HOME/.local/share/librus-calendar/current.sqlite3"
+source_admin_dir="$HOME/.local/share/librus-calendar/admin"
+install -d -m 0700 "$source_admin_dir"
+activation_plan="$source_admin_dir/activation-$(date -u +%Y%m%dT%H%M%SZ).json"
+"$release_python" -I -m app.cli --config "$source_config" --state "$source_state" source-activate --plan-file "$activation_plan"
+```
+
+Ostatnie polecenie wykonaj dopiero przy nieaktywnej usłudze. Planowanie wymaga chronionego trybu `preview`, kompletnego zweryfikowanego pobrania trzech nowych kanałów i gotowego podglądu każdej bieżącej oczekującej wersji źródła. Tworzy nowy, nienadpisywany prywatny plan 0600 związany z wersjami źródeł, uczniem i kalendarzem, decyzjami, wydarzeniami i dziennikiem; wynik zawiera agregaty i `calendar_writes=0`. Plan zawiera prywatne identyfikatory; nie wyświetlaj go publicznie, nie zapisuj w Git ani nie udostępniaj.
+
+Obejrzyj chroniony plan prywatnie. Atomowo zmień wyłącznie `multi_source_mode` w chronionej konfiguracji na `active`, zachowując właściciela, uprawnienia i pozostałe pola. Sprawdź również skuteczne nadpisania środowiskowe. Timer pozostaje zatrzymany. **Sama konfiguracja nie dostarcza brakującego potwierdzenia aktywacji.** Rozpoczęcie wykonania aktywacji trwale zawiesza starsze potwierdzenie do ukończenia nowej próby; po błędzie lub restarcie wspólna analiza, kolejka i zajmowanie operacji pozostają zablokowane. Prawidłowe wcześniejsze potwierdzenie zachowuje ważność przy zmianach trybu konfiguracji, gdy nie rozpoczęto nowej próby wykonania. Zapisy wymagają związanego potwierdzenia aktywacji oraz kompletnego pobrania wymaganych źródeł.
+
+```sh
+"$release_python" -I -m app.cli --config "$source_config" --state "$source_state" source-activate --plan-file "$activation_plan" --apply
+```
+
+Wykonanie ponownie pobiera źródła i porównuje ucznia oraz treść z planem, czyta dokładnie dozwolony kalendarz i sprawdza skróty własnych wydarzeń, a następnie ponownie analizuje i dopasowuje działania. Nie wykonuje zapisanych propozycji podglądu. Przed pobieraniem zapisuje trwały znacznik nieukończonej aktywacji. Wszystkie pola potwierdzenia aktywacji oraz usunięcie znacznika zapisują się atomowo dopiero po sukcesie wszystkich kroków; samo polecenie zgłasza zero zapisów Calendar. Częściowa lub przerwana próba pozostawia blokadę wspólnej analizy, kolejki i zajmowania operacji. Świeży plan ponowienia musi obejmować dokładny wybór źródeł z nieudanej próby i ponownie je analizować; wcześniejszy podgląd służy wyłącznie potwierdzeniu wyboru. Po sukcesie sprawdź zachowanie stanu i kolejki przed przywróceniem zapisanego stanu timera:
+
+```sh
+systemctl --user restart librus-web.service
+systemctl --user start librus-monitor.service
+"$release_python" -I -m app.cli --config "$source_config" --state "$source_state" status
+systemctl --user start librus-sync.timer
+systemctl --user list-timers librus-sync.timer
+```
+
+Restart wyłącznie WWW odczytuje tryb wczytywany raz na proces; odświeżenie monitoringu jest osobne. Uruchom timer wyłącznie wtedy, gdy był aktywny w stanie wyjściowym, a następnie wymagaj rzeczywistego pełnego godzinowego przebiegu aktywnego. Ręczne uruchomienie go nie zastępuje. Zachowaj regułę harmonogramu, alarmy i wyłączone kopie bazy.
+
+Przy zmianie źródła lub wersji, ucznia, decyzji, dziennika, skrótu Calendar, niepełnym pobraniu albo błędzie analizy pozostaw timer zatrzymany i zachowaj bazę oraz dzienniki. Przywróć tylko chroniony tryb `preview`, zrestartuj WWW i odśwież monitoring; nie zmieniaj decyzji i nie przywracaj starej bazy. Usuń konkretną przyczynę, uzyskaj świeże kompletne podglądy i utwórz nowy plan pod nową ścieżką. Stary stan jest odrzucany; nie edytuj jego skrótu ani go nie nadpisuj. Odmowa blokady wymaga oczekiwania, nie równoległego procesu. Nie wznawiaj harmonogramu aktywnych zapisów po odmowie lub częściowym wykonaniu.
+
+### Jawne lokalne porządki
+
+Porządki są oddzielone od aktywacji i nie zmieniają Calendar. Używaj ich wyłącznie dla jawnie sprawdzonej ograniczonej listy nieaktualnych lokalnych propozycji. Przed ostatecznym planem aktywacji umieść prywatne żądanie 0600 w katalogu administracyjnym 0700, zgodne z poniższym schematem; rzeczywiste sprawdzone identyfikatory podaj prywatnie:
+
+```json
+{"changes":[{"proposal_id":"REVIEWED_PROPOSAL_ID","reason":"Sprawdzona lokalna propozycja jest nieaktualna; zachowaj Calendar i decyzje."}]}
+```
+
+```sh
+cleanup_request="$source_admin_dir/cleanup-request.json"
+cleanup_plan="$source_admin_dir/cleanup-$(date -u +%Y%m%dT%H%M%SZ).json"
+"$release_python" -I -m app.cli --config "$source_config" --state "$source_state" cleanup-existing --request-file "$cleanup_request" --plan-file "$cleanup_plan"
+"$release_python" -I -m app.cli --config "$source_config" --state "$source_state" cleanup-existing --plan-file "$cleanup_plan" --apply
+```
+
+Sprawdź agregaty podglądu przed wykonaniem; wykonanie przyjmuje wyłącznie zapisany plan, bez `--request-file`. Zmiana stanu, zatwierdzone, edytowane i wykonane działania oraz dowód próby, trwającego lub nieznanego zapisu powodują odmowę. Jawne odrzucenia pozostają odrzucone; wycofywane są tylko dopuszczalne nieaktualne lokalne propozycje, z zachowaniem identyfikatorów, decyzji i dzienników. Zmieniony stan wymaga nowego przeglądu żądania i planu. Wykonaj porządki przed ostatecznym planem aktywacji i w razie potrzeby odśwież podgląd; nie obchodź odmowy przez SQL, wymianę bazy lub kasowanie wydarzeń Calendar.
