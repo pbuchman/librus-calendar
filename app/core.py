@@ -142,6 +142,11 @@ def normalize_proposal(data, current=None):
                     temporal_kind=temporal_kind, due_at=data.get('due_at'), activity_scope=activity_scope,
                     deletion_approved=data.get('deletion_approved') is True, user_approved=data.get('user_approved') is True,
                     user_edited=data.get('user_edited') is True)
+    for key in ('canonical_action_id','source_id','source_hash','source_kind','provenance','recipient','optional','date_certainty','action_identity','match_evidence','source_version_at','offer_identity','informational','alternative_group','alternative_group_evidence','user_rejected','deferred_unknown_operation','blocked_by_offer_group'):
+        if key in data:
+            proposal[key] = data[key]
+    if proposal.get('optional') is True:
+        proposal['description'] = ('Opcjonalne. ' + proposal['description']) if not proposal['description'].startswith('Opcjonalne.') else proposal['description']
     if proposal['confidence'] not in ('high', 'medium', 'low'):
         proposal['confidence'] = 'low'
     if kind == 'ignore':
@@ -199,7 +204,8 @@ def normalize_proposal(data, current=None):
 
 def event_body(proposal, message, marker, synchronization_started_at=None):
     description = proposal['description'].strip()
-    source = '\n\nŹródło: Librus, wiadomość ' + message['id'] + '\n' + (message.get('subject') or '')
+    kind_label={'announcement':'ogłoszenie','school_event':'terminarz szkolny','substitution':'zastępstwo'}.get(message.get('source_kind'),'wiadomość')
+    source = '\n\nŹródło: Librus, ' + kind_label + ' ' + message['id'] + '\n' + (message.get('subject') or '')
     source += '\nNadawca: ' + (message.get('sender') or '') + '\nWysłano: ' + (message.get('sent_at') or '')
     if proposal.get('source_quote'):
         source += '\nFragment: ' + proposal['source_quote']
@@ -216,9 +222,10 @@ def event_body(proposal, message, marker, synchronization_started_at=None):
 
 
 from .offer_groups import GROUP_SCHEMA, ProposalGroupsMixin
+from .source_store import SourceStoreMixin
 
 
-class AppStore(ProposalGroupsMixin):
+class AppStore(SourceStoreMixin, ProposalGroupsMixin):
     def __init__(self, path=None, *, config=None):
         os.umask(0o077)
         self.config = config if config is not None else load_config()
@@ -313,6 +320,9 @@ class AppStore(ProposalGroupsMixin):
                     payload['event'].pop('extendedProperties', None)
                     self.db.execute('UPDATE operations SET payload=? WHERE id=?', (json.dumps(payload, ensure_ascii=False), row['id']))
 
+            self._initialize_sources()
+            self.db.execute("INSERT OR REPLACE INTO settings VALUES ('multi_source_mode',?)", (self.config.multi_source_mode,))
+
     def close(self):
         self.db.close()
 
@@ -331,12 +341,12 @@ class AppStore(ProposalGroupsMixin):
                 self.db.execute('BEGIN')
             try:
                 count = lambda table, clause='': self.db.execute('SELECT COUNT(*) FROM ' + table + clause).fetchone()[0]
-                return {**read_connection_state(self.db), 'messages': count('messages'), 'messages_retry': count('messages', " WHERE status IN ('fetch_pending','fetch_failed','analysis_failed')"),
+                return {**read_connection_state(self.db), 'messages': count('messages'," WHERE NOT EXISTS (SELECT 1 FROM sources s WHERE s.id=messages.id AND s.kind<>'message')"), 'messages_retry': count('messages', " WHERE status IN ('fetch_pending','fetch_failed','analysis_failed')"),
                         'proposals_pending': count('proposals', " WHERE status='pending'"), 'proposals_review': count('proposals', " WHERE status='review'"),
                         'events': count('events', " WHERE state='active'"), 'events_cancelled': count('events', " WHERE state='cancelled'"),
                         'writes_paused': self._setting('writes_paused', 'true') == 'true',
                         'last_sync': self._setting('last_sync'), 'last_error': self._setting('last_error'), 'sync_requested_at': self._setting('sync_requested_at'),
-                        'calendar_id': self.calendar_id, 'timezone': 'Europe/Warsaw'}
+                        'calendar_id': self.calendar_id, 'timezone': 'Europe/Warsaw', 'sources': self.source_status()}
             finally:
                 if own_snapshot:
                     self.db.rollback()
@@ -426,7 +436,7 @@ class AppStore(ProposalGroupsMixin):
 
     def list_messages(self, limit=100):
         with self.lock:
-            return [self._message(row) for row in self.db.execute("SELECT * FROM messages WHERE status!='retained' ORDER BY COALESCE(sent_at,fetched_at) DESC,id LIMIT ?", (min(max(int(limit), 1), 500),))]
+            return [self._message(row) for row in self.db.execute("SELECT * FROM messages WHERE status!='retained' AND NOT EXISTS (SELECT 1 FROM sources s WHERE s.id=messages.id AND s.kind<>'message') ORDER BY COALESCE(sent_at,fetched_at) DESC,id LIMIT ?", (min(max(int(limit), 1), 500),))]
 
     def get_message(self, message_id):
         with self.lock:
@@ -458,6 +468,7 @@ class AppStore(ProposalGroupsMixin):
             if changed and row and row['payload_hash']:
                 self.db.execute("UPDATE proposals SET status='ignored',updated_at=?,pending_since=NULL WHERE message_id=? AND status IN ('pending','review')", (utcnow(), message_id))
                 self.db.execute("UPDATE operations SET status='review',last_error='Source message changed; reanalysis required.',updated_at=? WHERE proposal_id IN (SELECT id FROM proposals WHERE message_id=?) AND status='pending'", (utcnow(), message_id))
+            self._mirror_message_source(self.db.execute('SELECT * FROM messages WHERE id=?', (message_id,)).fetchone())
         return changed
 
     def fail_message(self, message_id, stage, error):
@@ -546,6 +557,7 @@ class AppStore(ProposalGroupsMixin):
 
     def _save_analysis(self, message, normalized, metadata, mode, superseded_ids=()):
         stamp = utcnow()
+        self.db.execute("UPDATE sources SET status='analyzed',analyzed_at=?,outcome='added',reason=NULL WHERE id=?",(stamp,'message:'+message['id']))
         metadata = analysis_metadata(metadata, len(normalized))
         self._retire_open_groups(message['id'], keep_source_hash=message['payload_hash'])
         for item in normalized:
@@ -553,6 +565,8 @@ class AppStore(ProposalGroupsMixin):
                             (item['id'], message['id'], message['payload_hash'], json.dumps(item, ensure_ascii=False), item['status'], stamp, stamp,
                              stamp if item['status'] == 'pending' else None))
         self._save_proposal_groups(message, normalized)
+        for item in normalized:
+            self._register_legacy_action(self.db.execute('SELECT * FROM proposals WHERE id=?',(item['id'],)).fetchone())
         self.db.execute("UPDATE messages SET analyzed_hash=payload_hash,status='analyzed',last_error=NULL,pending_since=NULL,analysis_metadata=?,analyzed_at=? WHERE id=?",
                         (json.dumps(metadata, ensure_ascii=False), stamp, message['id']))
         self.db.execute('INSERT INTO analysis_audit VALUES (?,?,?,?,?,?,?,?)',
@@ -576,9 +590,20 @@ class AppStore(ProposalGroupsMixin):
     def cached_reanalysis_scope(self, message_id):
         """Reject any source carrying an external write or a human decision."""
         with self.lock:
+            if self.config.multi_source_mode=='active':
+                raise ValueError('Active multi-source mode requires the canonical source workflow.')
             message = self.get_message(message_id)
             if not message or not message.get('payload_hash'):
                 raise ValueError('Cached reanalysis requires a fully fetched message.')
+            linked=self.db.execute("""SELECT 1 FROM action_sources s JOIN canonical_actions a ON a.id=s.action_id
+                WHERE s.source_id=? AND (s.relation<>'origin' OR EXISTS
+                    (SELECT 1 FROM action_sources other WHERE other.action_id=s.action_id AND other.source_id<>s.source_id)) LIMIT 1""",('message:'+str(message_id),)).fetchone()
+            if linked:
+                raise ValueError('Cached reanalysis refuses a message linked to a canonical source action.')
+            if self.db.execute("SELECT 1 FROM sources WHERE id=? AND kind<>'message'",(str(message_id),)).fetchone():
+                raise ValueError('Use the source preview workflow for non-message sources.')
+            if any(self._proposal(r).get('canonical_action_id') for r in self.db.execute('SELECT * FROM proposals WHERE message_id=?',(str(message_id),))):
+                raise ValueError('Use the source preview workflow for canonical actions.')
             if self.db.execute('SELECT 1 FROM events WHERE message_id=? OR proposal_id IN (SELECT id FROM proposals WHERE message_id=?)',
                                (message['id'], message['id'])).fetchone():
                 raise ValueError('Cached reanalysis refuses a source with historical calendar events.')
@@ -679,9 +704,13 @@ class AppStore(ProposalGroupsMixin):
             row = self.db.execute('SELECT * FROM proposals WHERE id=?', (str(proposal_id),)).fetchone()
             if not row:
                 raise ValueError('Unknown proposal.')
+            if json.loads(row['payload']).get('blocked_by_offer_group') and decision != 'ignore':
+                raise ValueError('This option belongs to an existing offer; reconcile the complete membership before approval.')
             if json.loads(row['payload']).get('blocked_by_group_decision') and decision != 'ignore':
                 raise ValueError('A prior group decision blocks this ambiguous replacement.')
             group = self.get_proposal_group_for_proposal(proposal_id)
+            if not group and json.loads(row['payload']).get('alternative_group') and decision != 'ignore':
+                raise ValueError('Complete alternative membership must be reconciled before this option can be approved.')
             if group:
                 if group['status'] != 'selected' or group['selected_proposal_id'] != str(proposal_id) or row['status'] != 'review':
                     raise ValueError('Use the complete alternative group to choose or reject this proposal.')
@@ -727,6 +756,8 @@ class AppStore(ProposalGroupsMixin):
                             (json.dumps(item, ensure_ascii=False), item['status'], stamp, pending_since, row['id']))
             from .data_admin import remember_decision
             remember_decision(self, row, item, original=self._proposal(row))
+            self.remember_canonical_decision(row['id'])
+            self.db.execute('UPDATE canonical_actions SET payload=?,status=?,updated_at=? WHERE proposal_id=?', (json.dumps(item,ensure_ascii=False),item['status'],stamp,row['id']))
             return item
 
     def set_writes_paused(self, paused):
@@ -764,7 +795,9 @@ class AppStore(ProposalGroupsMixin):
                 if not row:
                     continue
                 item = self._proposal(row)
-                group_reason = self._group_write_reason(item['id'])
+                if self.source_mode_blocked(item) or self.source_write_deferred(item):
+                    continue
+                group_reason = self._source_write_reason(item) or self._group_write_reason(item['id'])
                 if group_reason:
                     self._review_unwritten_locked(item, group_reason)
                     continue
@@ -793,7 +826,7 @@ class AppStore(ProposalGroupsMixin):
                 if item['kind'] not in ('create','update','cancel') or (item['kind'] == 'cancel' and not item.get('deletion_approved')):
                     continue
                 message = self.get_message(item['message_id'])
-                if item['kind'] == 'create' and not item.get('user_approved'):
+                if item['kind'] == 'create' and not item.get('user_approved') and not item.get('canonical_action_id'):
                     other_proposals = self.list_proposals(limit=500)
                     duplicate = any(p['id'] != item['id'] and p.get('kind') != 'ignore' and p.get('status') in ('pending','review','applied') and start_key(p) == start_key(item) for p in other_proposals)
                     duplicate = duplicate or any(start_key(saved['snapshot']) == start_key(item) for saved in self.list_events(500, include_cancelled=True))
@@ -818,6 +851,7 @@ class AppStore(ProposalGroupsMixin):
                 operation = {'operation_id': operation_id, 'proposal_id': item['id'], 'message_id': item['message_id'],
                              'action': item['kind'], 'calendar_id': self.calendar_id, 'marker': marker, 'event_id': item.get('event_id'),
                              'expected_fingerprint': event.get('fingerprint') if event else None, 'event': body, 'source_message_ids': [item['message_id']],
+                             **({'source_ids': [r[0] for r in self.db.execute("SELECT source_id FROM action_sources WHERE action_id=? AND relation NOT IN ('corroborates_unverified_recipient','expired_unverified_fact','retains_closed_offer_decision')",(item['canonical_action_id'],))]} if item.get('canonical_action_id') else {}),
                              'deletion_approved': item.get('deletion_approved') is True,
                              'synchronization_started_at': synchronization_started_at}
                 if item['kind'] == 'cancel':
@@ -873,7 +907,9 @@ class AppStore(ProposalGroupsMixin):
             if not proposal_row:
                 return False
             item = self._proposal(proposal_row)
-            group_reason = self._group_write_reason(item['id'])
+            if self.source_mode_blocked(item) or self.source_write_deferred(item):
+                return False
+            group_reason = self._source_write_reason(item) or self._group_write_reason(item['id'])
             if group_reason:
                 self._review_unwritten_locked(item, group_reason)
                 return False
@@ -960,12 +996,25 @@ class AppStore(ProposalGroupsMixin):
                 if decision_row:
                     from .data_admin import remember_decision
                     remember_decision(self, decision_row, self._proposal(decision_row))
+                    self.remember_canonical_decision(decision_row['id'])
+                for deferred in self.db.execute("SELECT * FROM proposals WHERE status='review'").fetchall():
+                    item=self._proposal(deferred)
+                    if item.get('deferred_unknown_operation')!=operation_id:continue
+                    item.update(event_id=str(result['event_id']),kind='cancel' if item.get('kind')=='cancel' else 'update',review_reason='Prior unknown write reconciled; confirm this newer source correction.')
+                    item.pop('deferred_unknown_operation',None)
+                    self.db.execute('UPDATE proposals SET payload=?,updated_at=? WHERE id=?',(json.dumps(item,ensure_ascii=False),utcnow(),deferred['id']))
+                    self.db.execute('UPDATE canonical_actions SET payload=?,updated_at=? WHERE proposal_id=?',(json.dumps(item,ensure_ascii=False),utcnow(),deferred['id']))
             elif status == 'review':
                 proposal_row = self.db.execute('SELECT payload FROM proposals WHERE id=?', (operation['proposal_id'],)).fetchone()
                 if proposal_row:
                     proposal = json.loads(proposal_row[0])
                     proposal.update(needs_review=True, review_reason=str(result.get('error') or 'Calendar conflict requires manual review.')[:1000])
                     self.db.execute("UPDATE proposals SET payload=?,status='review',updated_at=?,pending_since=NULL WHERE id=?", (json.dumps(proposal, ensure_ascii=False), utcnow(), operation['proposal_id']))
+
+            current_proposal=self.db.execute('SELECT * FROM proposals WHERE id=?',(operation['proposal_id'],)).fetchone()
+            if current_proposal:
+                current_item=self._proposal(current_proposal)
+                self.db.execute('UPDATE canonical_actions SET payload=?,status=?,updated_at=? WHERE proposal_id=?',(json.dumps(current_item,ensure_ascii=False),current_item['status'],utcnow(),operation['proposal_id']))
 
     def backup(self, destination=None):
         self.set_setting('last_backup_attempt_at', utcnow())

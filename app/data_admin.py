@@ -26,8 +26,10 @@ def intent_signature(item):
 def minimal_proposal(item):
     """Keep a chosen action, never the original teacher quote or AI reasoning."""
     keep = ('id', 'message_id', 'kind', 'title', 'start', 'end', 'all_day', 'temporal_kind',
-            'due_at', 'activity_scope', 'event_id', 'default_duration', 'alternative_group_id', 'blocked_by_group_decision', *FLAGS)
+            'due_at', 'activity_scope', 'canonical_action_id', 'source_id', 'source_hash', 'source_kind', 'source_version_at', 'optional', 'deferred_unknown_operation', 'action_identity', 'recipient', 'event_id', 'default_duration', 'alternative_group_id', 'blocked_by_group_decision', 'blocked_by_offer_group', *FLAGS)
     result = {key: item[key] for key in keep if key in item}
+    if isinstance(result.get('action_identity'),dict):result['action_identity']={k:v for k,v in result['action_identity'].items() if k!='evidence'}
+    if isinstance(result.get('recipient'),dict):result['recipient']={k:v for k,v in result['recipient'].items() if k!='evidence'}
     result.update(description=item.get('description', '') if item.get('user_approved') or item.get('user_edited') else '',
                   source_quote='', confidence='high' if item.get('user_approved') else 'low',
                   needs_review=False, review_reason='', status=item.get('status', 'review'))
@@ -395,7 +397,9 @@ def _prune_state_locked(store, *, days=30, apply=False, current=None):
     old = []
     for row in store.db.execute('SELECT id,sent_at,status,payload FROM messages'):
         try:
-            if row['sent_at'] and as_datetime(row['sent_at']) < cutoff:
+            projected=store.db.execute("SELECT content_since,fetched_at FROM sources WHERE id=? AND kind<>'message'",(row['id'],)).fetchone()
+            projection_expired=projected and as_datetime(projected['content_since'] or projected['fetched_at']) < cutoff
+            if projection_expired or (row['sent_at'] and as_datetime(row['sent_at']) < cutoff):
                 old.append(row)
         except (ValueError, TypeError):
             # Unknown dates may be unresolved evidence; never guess their age.
@@ -406,6 +410,7 @@ def _prune_state_locked(store, *, days=30, apply=False, current=None):
               'analysis_records_pruned': 0, 'calendar_writes': 0}
     if ids:
         result['analysis_records_pruned'] = sum(store.db.execute('SELECT COUNT(*) FROM analysis_audit WHERE message_id=?', (mid,)).fetchone()[0] for mid in ids)
+    result.update(store.prune_source_content(current,apply=False))
     if not apply:
         return result
     with store.lock:
@@ -463,8 +468,9 @@ def _prune_state_locked(store, *, days=30, apply=False, current=None):
                             'expected_fingerprint','message_id','proposal_id','source_message_ids','synchronization_started_at')}
                         store.db.execute('UPDATE metadata_refresh SET payload=?,result=?,last_error=NULL WHERE id=?',
                             (json.dumps(kept), json.dumps({key: outcome.get(key) for key in ('status','event_id','fingerprint')}), journal['id']))
+            result.update(store.prune_source_content(current,apply=True))
             store.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('retention_last_applied_at', utcnow()))
-        if dirty_ids or result['analysis_records_pruned']:
+        if dirty_ids or result['analysis_records_pruned'] or result.get('sources_pruned') or result.get('source_previews_pruned') or result.get('source_audits_pruned'):
             # Erase freed SQLite pages too; this is an in-place rewrite, no backup.
             store.db.execute('VACUUM')
     return result

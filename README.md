@@ -2,7 +2,7 @@
 
 [Polski](README.pl.md) · [Setup](docs/setup.md) · [Demo](docs/demo.md) · [Architecture & safeguards](docs/architecture.md)
 
-A private school inbox that turns messages from **Librus Synergia** into Google Calendar entries, with a review queue for decisions that need a parent.
+A private school inbox that turns messages, announcements and school-calendar entries from **Librus Synergia** into Google Calendar actions, with a review queue for decisions that need a parent.
 
 It reads messages **directly from Librus**. Gmail notifications are not the ingestion source or a trigger. The web interface is currently in Polish.
 
@@ -56,7 +56,7 @@ Analysis and calendar tools default to `gpt-6.1-sol` with `high` reasoning. Only
 
 ## Privacy and limitations
 
-This is an **unofficial**, independently maintained integration, unaffiliated with Librus, Google or OpenAI. It uses undocumented Librus authentication/message interfaces, which can change. It handles messages, not the full timetable, grades or every school feature; attachment contents are not analyzed.
+This is an **unofficial**, independently maintained integration, unaffiliated with Librus, Google or OpenAI. It uses undocumented Librus authentication/message interfaces, which can change. It supports messages, announcements, school-calendar entries and informational substitutions, subject to the capabilities available to the authenticated learner. It does not import the full timetable, grades or every school feature. Attachment contents, images, OCR and PDFs are not analyzed or sent to external services.
 
 Message text is private data. Real analysis sends supplied message text and relevant cached event context to the configured AI service; calendar writes send selected event details and source quotes to Google Calendar. Store credentials, database files and backups outside the repository, use restricted file permissions, and keep the interface behind owner-restricted Tailscale access. See [privacy and operating boundaries](docs/architecture.md).
 
@@ -71,3 +71,9 @@ AI can misinterpret dates and context. Automated tests and this offline UI demo 
 The project originated as a personal proof of concept. This public edition contains configurable source code, generic deployment examples and synthetic fixtures; production credentials, messages, state and private deployment evidence are excluded. See [architecture](docs/architecture.md) and the internal [application contract](app/CONTRACT.md).
 
 Licensed under [MIT](LICENSE).
+
+## Multiple Librus sources
+
+New sources default to `multi_source_mode=off`. In `preview`, announcements and school-calendar items are collected and analyzed into a separate read-only queue; they cannot approve proposals, alter human decisions or write Calendar. Activation requires fresh collection and validation. In `active`, verified sources can link to one canonical action instead of duplicating a calendar entry. Semantic matching checks a complete bounded candidate inventory and independently verifies literal evidence. Missing legacy evidence may be separately recovered from an exact hash-bound origin without inventing a historical quote. Older sources with an unknown recipient can only add a labeled corroboration link to a uniquely verified, human-confirmed owned occurrence; they grant no write or future matching authority. Uncertain matches go to review. Replays preserve existing event identities and decisions.
+
+The **Wszystkie źródła** panel filters messages, announcements and school calendar, shows each source's result and reason, and links to the canonical action with all supporting sources and certainty. **Podgląd źródeł** stays separate from decisions. Ordinary school reminders may be labeled optional; extracurricular or unknown participation requires review. Conditional information without a date stays informational. Attachments are labeled **załącznik nieanalizowany**. See [source modes and acceptance](docs/setup.md#multiple-source-rollout).

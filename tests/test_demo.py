@@ -79,6 +79,32 @@ class DemoTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_source_demo_shows_all_outcomes_and_is_read_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with patch('requests.sessions.Session.request',side_effect=AssertionError('No external requests')):
+                store=seed_store(Path(directory)/'state.sqlite3')
+                try:
+                    client=TestClient(make_demo_app(store),client=('127.0.0.1',50000))
+                    sources=client.get('/sources')
+                    self.assertEqual(sources.status_code,200)
+                    for label in ('Dodano','Powiązano','Uzupełniono','Do sprawdzenia','Pominięto','Analiza niepełna','Załącznik nieanalizowany'):
+                        self.assertIn(label,sources.text)
+                    preview=client.get('/preview').text
+                    self.assertIn('Opcjonalne przypomnienie',preview)
+                    self.assertIn('Podgląd: Powiązano',preview)
+                    self.assertIn('Podgląd: Pominięto',preview)
+                    self.assertIn('Zachowana decyzja rodzica: odrzucono',preview)
+                    self.assertNotIn('/actions/demo-virtual-optional',preview)
+                    self.assertNotIn('<form',preview)
+                    self.assertEqual(client.get('/api/source-previews').json()['items'][0]['status'],'ready')
+                    item=next(i for i in store.list_sources() if i['outcome']=='linked')
+                    self.assertEqual(client.get('/sources/'+item['id']).status_code,200)
+                    action=client.get('/actions/'+item['action_ids'][0])
+                    self.assertEqual(action.status_code,200)
+                    self.assertIn('Wszystkie źródła działania',action.text)
+                    self.assertEqual(len(store.list_events()),len(CALENDAR_EVENTS))
+                finally: store.close()
+
     def test_calendar_is_explicit_illustration_from_same_fixture(self):
         illustration = calendar_illustration()
         self.assertIn(DEMO_LABEL, illustration)

@@ -19,7 +19,7 @@ Ilustracja kalendarza zawiera szkolne wyjście, spotkanie rodziców i całodniow
 
 Otwórz `/review` lub `/messages/demo-training-choice`. Fikcyjne szkolenie pierwszej pomocy ma trzy terminy, w tym jeden miniony — nadal widoczny, ale nieaktywny. Żaden nie jest domyślnie zaznaczony. Wybierz przyszły termin i naciśnij **Dodaj wybrany termin**, aby zakolejkować tylko ten wybór; karta pokaże wybrany termin i zamknie pozostałe opcje. **Odrzuć całą ofertę** odrzuca wszystkie opcje bez zaznaczania terminu. Rozstrzygnięta oferta znika z kolejki decyzji; stan wyboru albo odrzucenia pozostaje w szczególe wiadomości źródłowej. Licznik nawigacji liczy jedną otwartą ofertę zamiast każdej daty. Jeśli wybrany termin później wymaga sprawdzenia po konflikcie zapisu, do kolejki wraca wyłącznie ten termin z kontrolowanym zatwierdzeniem lub odrzuceniem; pozostałe opcje pozostają zamknięte. Niejednoznaczne nowe propozycje po wcześniejszej decyzji o ofercie pokazują kontekst źródłowy i pozwalają na odrzucenie, a zatwierdzenie jest zablokowane. Odświeżenie zachowuje decyzję w bieżącym procesie demo; ponowne uruchomienie zeruje fikcyjne dane.
 
-Osobna wiadomość `/messages/demo-training-series` opisuje dwa spotkania cyklu teatralnego. Pozostają zwykłymi osobnymi propozycjami; cykl nie jest wyborem alternatywnych dat. Istniejąca robotyka nadal wymaga zwykłego potwierdzenia udziału. Demo zawiera siedem fikcyjnych wiadomości napisanych od podstaw.
+Osobna wiadomość `/messages/demo-training-series` opisuje dwa spotkania cyklu teatralnego. Pozostają zwykłymi osobnymi propozycjami; cykl nie jest wyborem alternatywnych dat. Istniejąca robotyka nadal wymaga zwykłego potwierdzenia udziału. Rozszerzone demo zawiera osiem fikcyjnych wiadomości napisanych od podstaw, w tym zachowane odrzucenie klubu. Dotychczasowe zrzuty pochodzą z wcześniejszej wersji z siedmioma wiadomościami.
 
 Odczyt `/api/proposals` zachowuje dotychczasowy limit. `/api/proposal-groups` zwraca komplet opcji oferty niezależnie od tego limitu. Decyzja korzysta z `POST /api/proposal-groups/{id}/decision`, pól `decision=select|reject`, `proposal_id` przy wyborze i `expected_revision`, nagłówka tego samego źródła oraz ciasteczka i pola CSRF. Decyzja o pojedynczej propozycji nie omija zasady jednego wyboru. Zmiana źródła, nieaktualna wersja, miniony termin i sprzeczna decyzja o zamkniętej ofercie są odrzucane przez bazę aplikacji.
 
@@ -45,3 +45,11 @@ Testy izolacji:
 ```
 
 Sprawdzają brak odszukiwania konfiguracji/domowego katalogu oraz tworzenia rzeczywistych klientów, powtarzalność wiadomości, propozycji i wydarzeń, stały czas rozpoczęcia synchronizacji i brak niezatwierdzonej robotyki na ilustracji. Potwierdza to fikcyjne dane oraz przepływ interfejsu; zgodność rzeczywistych kont, modeli i kalendarza wymaga osobnych testów.
+
+## Widoki źródeł i podglądu
+
+Otwórz `/sources`, aby filtrować fikcyjne wiadomości, ogłoszenia i terminarz oraz przejść ze źródła do wspólnego działania. Szczegół działania pokazuje źródła, dowody i pewność. `/preview` przedstawia osobne fikcyjne analizy bez przycisku zatwierdzania ani aktywacji. Załączniki mają etykietę **załącznik nieanalizowany** i nie są pobierane. Przygotowane wyniki służą wyłącznie demonstracji; dotychczasowe cztery zrzuty powstały przed dodaniem widoków źródeł i nie potwierdzają ich wdrożenia.
+
+Podgląd pokazuje planowane dopasowania, zachowane decyzje rodzica i różnice wobec obecnych działań. Fikcyjna powtórzona wycieczka wskazuje istniejące działanie; powtórzone zaproszenie do klubu zachowuje rzeczywiste odrzucenie zapisane w fikcyjnej bazie. Wirtualne działania podglądu nie mają odnośnika do aktywnego działania. Gotowy podgląd bieżącej wersji źródła ma osobną etykietę; stary podgląd nie zastępuje stanu bieżącego źródła.
+
+Te fikcyjne widoki nie sprawdzają odzyskiwania starszych dowodów, niezależnej jednoznacznej weryfikacji ani blokady przerwanej aktywacji. Takie mechanizmy wymagają osobnych testów; zapisany podgląd i dodatkowe źródło bez potwierdzonego adresata nie uprawniają do zapisów Calendar.

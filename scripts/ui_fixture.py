@@ -16,7 +16,7 @@ from app.web import create_app
 DEMO_NOW = datetime(2030, 3, 6, 10, 15, tzinfo=ZoneInfo('Europe/Warsaw'))
 DEMO_STAMP = DEMO_NOW.isoformat()
 DEMO_LABEL = 'Demo — dane fikcyjne / fictional data'
-DEMO_CONFIG = AppConfig(calendar_id='calendar@example.test', calendar_owner='owner@example.test',
+DEMO_CONFIG = AppConfig(multi_source_mode='preview', calendar_id='calendar@example.test', calendar_owner='owner@example.test',
                         state_path=Path('demo-state-unused.sqlite3'), credentials_path=Path('demo-credentials-unused.json'))
 
 # Newly authored synthetic messages; no private source messages were reused.
@@ -43,6 +43,11 @@ MESSAGES = [
      'sent_at': '2030-03-04T11:00:00+01:00',
      'text': 'W bibliotece pojawiła się nowa półka z opowieściami o kosmosie. Zapraszamy do czytania w wolnej chwili. Ta informacja nie zawiera terminu wydarzenia.\n\nEwa Demonstracyjna\nWiadomość demonstracyjna — dane fikcyjne.', 'attachment_count': 0},
 ]
+MESSAGES.append({'id':'demo-rejected-club','subject':'Klub szachowy — zaproszenie',
+    'sender':'Jan Demonstracyjny · nauczyciel demo','sent_at':'2030-03-04T09:00:00+01:00',
+    'text':'Dobrowolny klub szachowy spotyka się 14 marca 2030 od 16:00 do 17:00. Udział wymaga zapisu rodzica. Wiadomość demonstracyjna — dane fikcyjne.',
+    'attachment_count':0})
+
 CALENDAR_EVENTS = [
     {'message_id': 'demo-trip', 'title': 'Wyjście do planetarium', 'start': '2030-03-08T08:30:00+01:00', 'end': '2030-03-08T12:00:00+01:00', 'all_day': False,
      'quote': '8 marca 2030 klasa odwiedzi planetarium. Zbiórka przed szkołą o 08:30, powrót o 12:00.'},
@@ -89,6 +94,12 @@ def _seed_store(path: Path) -> AppStore:
                              review_reason='Potwierdź udział w zajęciach dodatkowych.',
                              source_quote='Uczestnicy biorą udział w obu spotkaniach.', event_id=None)
                           for index, day in enumerate(('11', '18'), 1)]
+        elif message['id'] == 'demo-rejected-club':
+            proposals=[dict(kind='create',title='Dobrowolny klub szachowy',description=DEMO_LABEL,
+                start='2030-03-14T16:00:00+01:00',end='2030-03-14T17:00:00+01:00',all_day=False,
+                activity_scope='extracurricular',confidence='high',needs_review=True,
+                review_reason='Potwierdź udział w klubie.',event_id=None,
+                source_quote='Dobrowolny klub szachowy spotyka się 14 marca 2030 od 16:00 do 17:00.')]
         elif message['id'] == 'demo-robotics':
             proposals = [{'kind': 'create', 'title': 'Dodatkowe warsztaty robotyki', 'description': DEMO_LABEL,
                           'start': '2030-03-09T15:00:00+01:00', 'end': '2030-03-09T16:30:00+01:00',
@@ -98,6 +109,8 @@ def _seed_store(path: Path) -> AppStore:
         store.save_proposals(message['id'], proposals, current=DEMO_NOW, metadata={
             'model': 'synthetic-fixture (no model called)', 'effort': 'none',
             'prompt_version': 'demo-v1', 'decision_reason': 'Synthetic fixture; no AI analysis or calendar write occurred.'})
+    rejected=next(item for item in store.list_proposals() if item['message_id']=='demo-rejected-club')
+    store.resolve_proposal(rejected['id'],'ignore')
     # Fake locally verified snapshots; never contact an external calendar.
     for operation in store.queue_operations(current=DEMO_NOW):
         snapshot = {**operation['event'], 'id': 'demo-event-' + operation['message_id']}
@@ -112,7 +125,77 @@ def _seed_store(path: Path) -> AppStore:
                        'last_successful_sync': DEMO_STAMP, 'writes_paused': 'false',
                        'writes_paused_since': '', 'consecutive_sync_failures': '0'}.items():
         store.set_setting(key, value)
+    seed_sources(store)
     return store
+
+
+def seed_sources(store):
+    """Synthetic multi-source state; no collector, attachment or model calls."""
+    from app.source_store import source_identity
+    fixtures = [
+        ('announcement', 'demo-trip-announcement', 'Wyjście do planetarium — ogłoszenie',
+         '8 marca 2030 klasa odwiedzi planetarium. Zbiórka przed szkołą o 08:30.', 'linked',
+         'Ta sama szkolna wycieczka: powiązano z istniejącym działaniem.'),
+        ('school_event', 'demo-trip-calendar', 'Planetarium — terminarz',
+         '8 marca 2030 od 08:30 do 12:00. Zbiórka przed szkołą, sala P.', 'enriched',
+         'Terminarz uzupełnia miejsce tej samej wycieczki.'),
+        ('announcement', 'demo-optional-reminder', 'Materiały na lekcję plastyki',
+         'Na 11 marca 2030 chętni mogą przynieść kolorowy papier.', 'added',
+         'Opcjonalne szkolne przypomnienie; fikcyjny wynik bez zapisu.'),
+        ('school_event', 'demo-extra-review', 'Zajęcia dodatkowe — nieznany udział',
+         'Warsztaty dodatkowe 12 marca 2030 o 16:00; udział po zapisaniu.', 'review',
+         'Udział w zajęciach dodatkowych wymaga decyzji rodzica.'),
+        ('announcement', 'demo-undated', 'Możliwe nowe koło szachowe',
+         'Jeżeli zbierze się grupa, rozważymy nowe koło. Termin nieustalony.', 'ignored',
+         'Warunkowa informacja bez daty: bez wpisu w kalendarzu.'),
+        ('announcement', 'demo-attachment', 'Materiały biblioteczne w załączniku',
+         'Przesyłamy materiały do samodzielnego przejrzenia. Bez terminu wydarzenia.', 'ignored',
+         'Załącznik nieanalizowany; informacja bez daty pozostaje poza kalendarzem.'),
+        ('announcement', 'demo-rejected-announcement', 'Klub szachowy — ponowne ogłoszenie',
+         'Dobrowolny klub szachowy spotyka się 14 marca 2030 od 16:00 do 17:00. Udział wymaga zapisu rodzica.',
+         'ignored', 'Zachowano wcześniejsze odrzucenie udziału przez rodzica.'),
+        ('school_event', 'demo-incomplete', 'Wpis wymagający ponowienia analizy',
+         'Szkolny konkurs odbędzie się 13 marca 2030 o 10:00.', 'analysis_incomplete',
+         'Fikcyjny limit czasu analizy; wynik nie jest kompletny.'),
+    ]
+    batch = {'learner': {'id':'demo-learner','class_id':'demo-class'}, 'status':'ok',
+             'complete_kinds':['announcement','school_event','substitution'], 'sources':[
+        {'kind':kind,'upstream_id':upstream,'learner_id':'demo-learner','title':title,
+         'sender':'Sekretariat demonstracyjny','published_at':DEMO_STAMP,'updated_at':None,
+         'text':text,'url':'','metadata':{'attachment_count':int(upstream=='demo-attachment')}}
+        for kind,upstream,title,text,outcome,reason in fixtures]}
+    store.ingest_sources(batch)
+    trip = next(item for item in store.list_proposals() if item['message_id']=='demo-trip')
+    with store.db:
+        for kind,upstream,title,text,outcome,reason in fixtures:
+            sid=source_identity(kind,upstream,'demo-learner')
+            store.db.execute("UPDATE sources SET status=?,outcome=?,reason=?,analyzed_at=? WHERE id=?",
+                             ('failed' if outcome=='analysis_incomplete' else 'analyzed',outcome,reason,DEMO_STAMP,sid))
+            if outcome in {'linked','enriched'}:
+                source=store.get_source(sid)
+                store.db.execute('INSERT INTO action_sources VALUES (?,?,?,?,?,?)',
+                                 (trip['id'],sid,source['content_hash'],text,outcome,DEMO_STAMP))
+    optional=source_identity('announcement','demo-optional-reminder','demo-learner')
+    planned={'kind':'create','title':'Przynieść kolorowy papier (opcjonalnie)',
+        'start':'2030-03-11','end':None,'all_day':True,'optional':True,'confidence':'high',
+        'activity_scope':'school','source_quote':'Na 11 marca 2030 chętni mogą przynieść kolorowy papier.',
+        'review_reason':'Opcjonalne zwykłe przypomnienie szkolne; wyłącznie podgląd.'}
+    provenance={'model':'synthetic-fixture (no model called)','effort':'none','decision_reason':DEMO_LABEL}
+    store.save_source_preview(optional,[planned],metadata=provenance,outcomes=[{
+        'action_id':'demo-virtual-optional','proposal_id':'demo-virtual-optional','outcome':'added',
+        'reason':'Opcjonalne szkolne przypomnienie, bez zapisu w podglądzie.',
+        'action':{'id':'demo-virtual-optional','payload':planned,'decision':None,'event_ids':[],'source_links':[]}}])
+    linked=source_identity('announcement','demo-trip-announcement','demo-learner')
+    trip_action=store.get_action(trip['id'])
+    store.save_source_preview(linked,[],metadata=provenance,outcomes=[{
+        'action_id':trip['id'],'proposal_id':trip['id'],'outcome':'linked',
+        'reason':'To samo wyjście: zachowano wspólne działanie bez drugiego wpisu.', 'action':trip_action}])
+    rejected=next(item for item in store.list_proposals() if item['message_id']=='demo-rejected-club')
+    rejected_source=source_identity('announcement','demo-rejected-announcement','demo-learner')
+    store.save_source_preview(rejected_source,[],metadata=provenance,outcomes=[{
+        'action_id':rejected['id'],'proposal_id':rejected['id'],'outcome':'ignored',
+        'reason':'Zachowano wcześniejsze odrzucenie udziału przez rodzica.',
+        'action':store.get_action(rejected['id'])}])
 
 
 def make_demo_app(store: AppStore, port=8795):

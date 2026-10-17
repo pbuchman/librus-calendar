@@ -31,13 +31,16 @@ class AppConfig:
     analysis_effort: str = 'high'
     tool_model: str = 'gpt-6.1-sol'
     tool_effort: str = 'high'
+    multi_source_mode: str = 'off'
+    learner_id: str = ''
+    class_id: str = ''
     timeout: int = 300
     monitor_url: str = 'http://127.0.0.1:8795/api/status'
     monitor_output: Path = Path('/var/lib/librus-monitor/status.json')
 
     def __post_init__(self):
         for name in ('calendar_id', 'calendar_owner', 'calendar_connector', 'tailscale_owner',
-                     'codex_binary', 'analysis_model', 'analysis_effort', 'tool_model', 'tool_effort', 'monitor_url'):
+                     'multi_source_mode', 'learner_id', 'class_id', 'codex_binary', 'analysis_model', 'analysis_effort', 'tool_model', 'tool_effort', 'monitor_url'):
             value = getattr(self, name)
             if not isinstance(value, str) or any(ord(char) < 32 for char in value) or value != value.strip():
                 raise ConfigurationError('invalid_' + name)
@@ -49,6 +52,8 @@ class AppConfig:
         for name in ('analysis_model', 'tool_model'):
             if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:-]{0,119}', getattr(self, name)):
                 raise ConfigurationError('invalid_' + name)
+        if self.multi_source_mode not in {'off','preview','active'}:
+            raise ConfigurationError('invalid_multi_source_mode')
         efforts = {'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'}
         if self.analysis_effort not in efforts or self.tool_effort not in efforts:
             raise ConfigurationError('invalid_reasoning_effort')

@@ -21,6 +21,95 @@ class SyncInterrupted(BaseException):
         self.code = code
 
 
+class _PreviewBudgetExceeded(BaseException):
+    """Unwind read-only preview work without disguising a whole-run signal."""
+    def __init__(self, code):
+        self.code = code
+
+
+@contextmanager
+def _preview_deadline(seconds):
+    """A nested soft alarm preserves the earlier whole-run alarm on unwind."""
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    previous_timer = signal.getitimer(signal.ITIMER_REAL)
+    started = time.monotonic()
+    outer_end = started + previous_timer[0] if previous_timer[0] else None
+
+    def restore_outer():
+        signal.signal(signal.SIGALRM, previous_handler)
+        remaining = max(0.000001, outer_end - time.monotonic()) if outer_end else 0
+        signal.setitimer(signal.ITIMER_REAL, remaining, previous_timer[1])
+
+    def expired(signum, frame):
+        # Re-arm before raising: child-process cleanup is also subject to the
+        # whole-run timeout, and must never turn that timeout into soft expiry.
+        outer_expired = outer_end is not None and time.monotonic() >= outer_end
+        restore_outer()
+        if outer_expired:
+            raise SyncInterrupted('sync_timeout')
+        raise _PreviewBudgetExceeded('source_preview_time_budget_exhausted')
+
+    try:
+        signal.signal(signal.SIGALRM, expired)
+        signal.setitimer(signal.ITIMER_REAL, min(seconds, previous_timer[0]) if previous_timer[0] else seconds)
+        yield
+    finally:
+        restore_outer()
+
+
+class _PreviewBudget:
+    def __init__(self, seconds, max_calls):
+        self.deadline = time.monotonic() + seconds
+        self.max_calls, self.calls = max_calls, 0
+        self.source, self.source_started = None, False
+
+    def check(self):
+        if time.monotonic() >= self.deadline:
+            raise _PreviewBudgetExceeded('source_preview_time_budget_exhausted')
+
+    def call(self, operation, *args, **kwargs):
+        self.check()
+        if self.calls >= self.max_calls:
+            raise _PreviewBudgetExceeded('source_preview_call_budget_exhausted')
+        self.calls += 1
+        self.source_started = True
+        result = operation(*args, **kwargs)
+        self.check()
+        return result
+
+
+class _PreviewRuntime:
+    """Share the extraction/matching/verification budget and forward metadata."""
+    def __init__(self, runtime, budget):
+        object.__setattr__(self, '_runtime', runtime)
+        object.__setattr__(self, '_budget', budget)
+
+    def __getattr__(self, name):
+        operation = getattr(self._runtime, name)
+        if name in ('analyze_source', 'match_source_action', 'verify_source_action','recover_source_action_evidence'):
+            return lambda *args, **kwargs: self._budget.call(operation, *args, **kwargs)
+        return operation
+
+    def __setattr__(self, name, value):
+        setattr(self._runtime, name, value)
+
+    def can_verify_source_action(self,reserve_calls=0):
+        self._budget.check()
+        return self._budget.calls+1+max(0,int(reserve_calls))<=self._budget.max_calls
+
+    def can_recover_source_action_evidence(self,reserve_calls=0):
+        self._budget.check()
+        return self._budget.calls+2+max(0,int(reserve_calls))<=self._budget.max_calls
+
+    def reserve_source_plan(self,action_count):
+        self._budget.check()
+        # Small sources fit a fresh run even if every action needs both checks.
+        # Do not cache them permanently unverified due only to queue position.
+        needed=(3 if hasattr(self._runtime,'recover_source_action_evidence')else 2)*max(0,int(action_count))
+        if 1+needed<=self._budget.max_calls and self._budget.calls+needed>self._budget.max_calls:
+            raise _PreviewBudgetExceeded('source_preview_call_budget_exhausted')
+
+
 @contextmanager
 def execution_deadline(seconds):
     """CLI workers record systemd termination and a whole-run 45 minute timeout."""
@@ -107,6 +196,100 @@ class SyncController:
         metadata = analysis_metadata(getattr(self.runtime, 'last_analysis_metadata', None), len(proposals))
         return proposals, metadata
 
+    def _source_collection(self,current,*,preview_budget=None,result=None):
+        """Supplement existing message discovery without widening its credentials."""
+        mode=self.store.config.multi_source_mode
+        if mode=='off':return {'mode':'off','status':'off','analyzed':0,'failures':0}
+        result=result if result is not None else {'mode':mode,'status':'ok','analyzed':0,'failures':0}
+        if mode=='active'and self.store._setting('source_activation_incomplete',''):
+            result.update(status='partial',activation_required=True,activation_incomplete=True)
+            return result
+        try:
+            batch=self.client.collect_sources(current=current,past_days=30,future_days=60)
+            result.update(self.store.ingest_sources(batch,current))
+        except Exception:
+            from .source_store import KINDS
+            from .core import utcnow
+            stamp=utcnow()
+            with self.store.lock,self.store.db:
+                for kind in KINDS-{'message'}:
+                    self.store.db.execute('INSERT INTO source_health VALUES (?,?,NULL,?,?,0) ON CONFLICT(kind) DO UPDATE SET last_attempt_at=excluded.last_attempt_at,last_result=excluded.last_result,last_error=excluded.last_error,learner_verified=0',
+                        (kind,stamp,'failed','source_collection_failed'))
+                for key,value in (('source_last_collection_at',stamp),('source_last_collection_result','failed'),('source_last_error','source_collection_failed'),('source_learner_verified','false')):
+                    self.store.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)',(key,value))
+            result.update(status='partial',failures=1)
+            return result
+        from .source_planner import SourcePlanner
+        planner=SourcePlanner(self.store,_PreviewRuntime(self.runtime,preview_budget) if preview_budget else self.runtime)
+        if mode=='active' and not self.store._setting('source_activation_at'):
+            result.update(status='partial',activation_required=True)
+            return result
+        for source in self.store.pending_sources(self.max_messages,preview=mode=='preview'):
+            if preview_budget:
+                preview_budget.check()
+                # Informational substitutions need no model call. Leave other
+                # unstarted sources pending when the shared call budget is full.
+                if source['kind']!='substitution' and preview_budget.calls>=preview_budget.max_calls:
+                    result.update(status='partial',error_code='source_preview_call_budget_exhausted')
+                    continue
+                preview_budget.source,preview_budget.source_started=source,False
+            try:
+                planner.analyze(source,current,preview=mode=='preview')
+                result['analyzed']+=1
+            except Exception:
+                self.store.fail_source(source['id'],preview=mode=='preview')
+                result['failures']+=1
+            if preview_budget:
+                preview_budget.source=None
+        if result['failures'] or (mode=='active' and self.store.pending_sources(1)):
+            result['status']='partial'
+        if preview_budget and self.store.pending_sources(1,preview=True):
+            result['status']='partial'
+        return result
+
+    def _record_preview_deferred(self,code):
+        """Persist technical evidence without changing active queues or health."""
+        from .source_store import KINDS
+        stamp=utcnow()
+        with self.store.lock,self.store.db:
+            for kind in KINDS-{'message'}:
+                self.store.db.execute('INSERT INTO source_health VALUES (?,?,NULL,?,?,?) ON CONFLICT(kind) DO UPDATE SET last_attempt_at=excluded.last_attempt_at,last_result=excluded.last_result,last_error=excluded.last_error',
+                    (kind,stamp,'partial',code,int(self.store._setting('source_learner_verified')=='true')))
+            for key,value in (('source_last_collection_result','partial'),('source_last_error',code)):
+                self.store.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)',(key,value))
+
+    def _preview_sources(self,current):
+        result={'mode':'preview','status':'ok','analyzed':0,'failures':0}
+        # Python alarms can preempt blocking collectors/model calls only on the
+        # main thread. Other callers leave preview queued for the CLI worker.
+        if threading.current_thread() is not threading.main_thread():
+            result.update(status='partial',error_code='source_preview_worker_required')
+            self._record_preview_deferred(result['error_code'])
+            return result
+        remaining=self._run_deadline-time.monotonic()
+        if remaining<=0:
+            raise SyncInterrupted('sync_timeout')
+        seconds=min(10*60,remaining/2)
+        budget=_PreviewBudget(seconds,31)
+        try:
+            with _preview_deadline(seconds):
+                self._source_collection(current,preview_budget=budget,result=result)
+        except _PreviewBudgetExceeded as error:
+            if budget.source is not None and budget.source_started:
+                # The alarm can arrive after the planner's transaction commits
+                # but before control returns here. Never downgrade durable work.
+                with self.store.lock:
+                    completed=self.store.db.execute("SELECT 1 FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE s.id=? AND s.content_hash=? AND p.status='ready' AND s.deleted=0",
+                        (budget.source['id'],budget.source['content_hash'])).fetchone()
+                    if not completed:
+                        self.store.fail_source(budget.source['id'],code=error.code,preview=True)
+                        result['failures']+=1
+            result.update(status='partial',error_code=error.code)
+        if result.get('error_code'):
+            self._record_preview_deferred(result['error_code'])
+        result['model_calls']=budget.calls
+        return result
+
     def reanalyze(self, message_ids, *, apply=False, current=None):
         """No discovery, login, probe, queue, recovery or calendar execution."""
         with sync_lock(self.store.path) as acquired:
@@ -120,6 +303,9 @@ class SyncController:
         if not ids or any(not value for value in ids) or len(ids) > 30:
             raise ValueError('Select between one and thirty explicit cached message IDs.')
         result = {'status': 'applied' if apply else 'preview', 'apply': bool(apply), 'calendar_writes': 0, 'messages': []}
+        if self.store.config.multi_source_mode=='active':
+            result.update(status='refused',messages=[{'message_id':mid,'status':'refused','reason':'Active multi-source mode requires canonical source analysis; cached legacy reanalysis is disabled.'} for mid in ids])
+            return result
         # Validate every selected source before initializing external analysis. A
         # protected target makes the whole explicit request a refusal.
         scopes = {}
@@ -170,6 +356,7 @@ class SyncController:
             self.run_id = self.store.start_sync_run()
             self.stage = 'starting'
             started = time.monotonic()
+            self._run_deadline = started + self.timeout_seconds
             result = {}
             try:
                 with execution_deadline(self.timeout_seconds):
@@ -302,11 +489,31 @@ class SyncController:
                 result['read_marking_observation'] = 'unverified_after_fetch_error'
         else:
             result['read_marking_observation'] = 'unverified_no_unread_message_observed'
+        stamp=utcnow()
+        message_fetch_complete=(not list_failed and not result['fetch_failures'] and
+            (finished or (self.store._setting('discovery_initialized_at') and result['changed']==0)))
+        with self.store.lock,self.store.db:
+            self.store.db.execute('INSERT INTO source_health VALUES (?,?,?,?,?,?) ON CONFLICT(kind) DO UPDATE SET last_attempt_at=excluded.last_attempt_at,last_successful_fetch=COALESCE(excluded.last_successful_fetch,source_health.last_successful_fetch),last_result=excluded.last_result,last_error=excluded.last_error,learner_verified=excluded.learner_verified',
+                ('message',stamp,stamp if message_fetch_complete else None,'ok' if message_fetch_complete else 'partial',None if message_fetch_complete else 'source_collection_incomplete',int(self.store._setting('source_learner_verified')=='true')))
         self._stage('analysis')
+        if self.store.config.multi_source_mode!='preview':
+            result['sources']=self._source_collection(current)
         for message in self.store.analysis_messages(self.max_messages):
+            if self.store.config.multi_source_mode=='active'and self.store._setting('source_activation_incomplete',''):
+                # Never route a failed canonical activation through the legacy
+                # analyzer. Leave its pending analysis and human intent intact.
+                result['sources'].update(status='partial',activation_required=True,activation_incomplete=True)
+                continue
             try:
-                proposals, metadata = self._analyze(message)
-                self.store.save_proposals(message['id'], proposals, current, metadata)
+                if self.store.config.multi_source_mode=='active' and self.store._setting('source_activation_at'):
+                    from .source_planner import SourcePlanner
+                    if self.store._setting('source_learner_verified')!='true':
+                        raise ValueError('Selected learner context is unverified.')
+                    source=self.store.get_source('message:'+message['id'])
+                    SourcePlanner(self.store,self.runtime).analyze(source,current)
+                else:
+                    proposals, metadata = self._analyze(message)
+                    self.store.save_proposals(message['id'], proposals, current, metadata)
                 result['analyzed'] += 1
             except Exception as error:
                 self.store.fail_message(message['id'], 'analysis', safe_error(error))
@@ -355,6 +562,10 @@ class SyncController:
                     if status in ('applied','review','unknown'):
                         result['operations_' + status] += 1
                     result['calendar_writes'] += int(status == 'applied' and not outcome.get('reconciled', False))
+        if self.store.config.multi_source_mode=='preview':
+            result['sources']=self._preview_sources(current)
+        if self.store.config.multi_source_mode=='active' and result['sources']['status']!='ok':
+            result.update(status='partial',error_code='analysis_failed',error_stage='analysis')
         if result['fetch_failures'] or result['analysis_failures']:
             result['status'] = 'partial'
         state = self.store.status()

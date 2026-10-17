@@ -1,0 +1,77 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "facts"
+  ],
+  "properties": {
+    "facts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 12,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "action_id",
+          "source_id",
+          "source_hash",
+          "decision",
+          "source_quote",
+          "purpose_quote",
+          "date_quote",
+          "day",
+          "same_purpose",
+          "same_day",
+          "recipient_compatible"
+        ],
+        "properties": {
+          "action_id": {
+            "type": "string",
+            "maxLength": 160
+          },
+          "source_id": {
+            "type": "string",
+            "maxLength": 200
+          },
+          "source_hash": {
+            "type": "string",
+            "maxLength": 100
+          },
+          "decision": {
+            "type": "string",
+            "enum": [
+              "fact",
+              "uncertain"
+            ]
+          },
+          "source_quote": {
+            "type": "string",
+            "maxLength": 1200
+          },
+          "purpose_quote": {
+            "type": "string",
+            "maxLength": 300
+          },
+          "date_quote": {
+            "type": "string",
+            "maxLength": 300
+          },
+          "day": {
+            "type": "string",
+            "maxLength": 40
+          },
+          "same_purpose": {
+            "type": "boolean"
+          },
+          "same_day": {
+            "type": "boolean"
+          },
+          "recipient_compatible": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  }
+}
