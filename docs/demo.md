@@ -52,4 +52,4 @@ Open `/sources` to filter fictional messages, announcements and school-calendar 
 
 Preview shows planned matching outcomes, retained human decisions and differences from existing actions. A fictional repeated trip links to its existing action; a repeated club invitation retains an actual seeded rejection. Virtual preview actions have no active-action link. A ready preview of the current source version is labeled separately from active analysis; stale versions do not override current source state.
 
-These fictional views do not test legacy-evidence recovery, independent unique matching or the interrupted-activation guard. Those mechanisms need separate checks; a saved preview and corroborating source without verified recipient applicability grant no Calendar write authority.
+These fictional views do not test authenticated served-class-calendar audience provenance, legacy-evidence recovery, independent unique matching or the interrupted-activation guard. Those mechanisms need separate checks; a saved preview and corroborating source without verified recipient applicability grant no Calendar write authority.

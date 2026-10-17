@@ -52,4 +52,4 @@ Otwórz `/sources`, aby filtrować fikcyjne wiadomości, ogłoszenia i terminarz
 
 Podgląd pokazuje planowane dopasowania, zachowane decyzje rodzica i różnice wobec obecnych działań. Fikcyjna powtórzona wycieczka wskazuje istniejące działanie; powtórzone zaproszenie do klubu zachowuje rzeczywiste odrzucenie zapisane w fikcyjnej bazie. Wirtualne działania podglądu nie mają odnośnika do aktywnego działania. Gotowy podgląd bieżącej wersji źródła ma osobną etykietę; stary podgląd nie zastępuje stanu bieżącego źródła.
 
-Te fikcyjne widoki nie sprawdzają odzyskiwania starszych dowodów, niezależnej jednoznacznej weryfikacji ani blokady przerwanej aktywacji. Takie mechanizmy wymagają osobnych testów; zapisany podgląd i dodatkowe źródło bez potwierdzonego adresata nie uprawniają do zapisów Calendar.
+Te fikcyjne widoki nie sprawdzają uwierzytelnionego pochodzenia dowodu adresatów terminarza klasy, odzyskiwania starszych dowodów, niezależnej jednoznacznej weryfikacji ani blokady przerwanej aktywacji. Takie mechanizmy wymagają osobnych testów; zapisany podgląd i dodatkowe źródło bez potwierdzonego adresata nie uprawniają do zapisów Calendar.

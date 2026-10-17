@@ -111,6 +111,7 @@ def activate_sources(store,runtime,*,plan_path,apply=False,current=None,client_f
         if (activation_snapshot(store)!=plan['snapshot']or
                 plan.get('activation_guard',digest(''))!=digest(store._setting('source_activation_incomplete',''))):
             raise ValueError('Activation state changed before collection.')
+        attempt_context=store.source_context_snapshot()
         store.db.execute("INSERT OR REPLACE INTO settings VALUES ('source_activation_incomplete',?)",(attempt,))
     client=client_factory()
     batch=client.collect_sources(current=current,past_days=30,future_days=60)
@@ -131,7 +132,7 @@ def activate_sources(store,runtime,*,plan_path,apply=False,current=None,client_f
     # cannot be silently accepted under the previous plan's fingerprint.
     if activation_snapshot(store)!=plan['snapshot']:raise ValueError('Activation state changed during Calendar validation.')
     from .source_planner import SourcePlanner
-    planner=SourcePlanner(store,runtime)
+    planner=SourcePlanner(store,runtime,expected_context=attempt_context)
     outcomes=[]
     for selected in plan['sources']:
         source=store.get_source(selected['id'])
@@ -139,9 +140,11 @@ def activate_sources(store,runtime,*,plan_path,apply=False,current=None,client_f
         outcomes.append(planner.analyze(source,current))
     with store.lock,store.db:
         store.db.execute('BEGIN IMMEDIATE')
-        if store._setting('source_activation_incomplete','')!=attempt:
+        if (store._setting('source_activation_incomplete','')!=attempt
+                or store.source_context_snapshot()!=attempt_context):
             raise ValueError('Activation attempt changed before completion.')
-        for key,value in (('source_activation_at',utcnow()),('source_activation_learner',store._setting('source_learner_id')),
+        for key,value in (('source_activation_at',utcnow()),('source_activation_learner',attempt_context['pinned_id']),
+                ('source_activation_class',attempt_context['class_id']or''),
                 ('source_activation_binding',digest([store.config.calendar_id,store.config.calendar_owner])),('source_activation_plan',plan['fingerprint'])):
             store.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)',(key,value))
         store.db.execute("DELETE FROM settings WHERE key='source_activation_incomplete'")

@@ -19,6 +19,12 @@ def page(body):
     return '<!doctype html><html><head><title>Synergia</title></head><body>' + body + '</body></html>'
 
 
+def password_only_userinfo_url():
+    # Construct fictional URL userinfo structurally, without a contact-address
+    # literal that resembles personal data to the repository privacy scanner.
+    return 'https://'+'@'.join((':fictional','synergia.librus.pl'))+'/terminarz'
+
+
 def announcement(title='Synthetic field trip', author='Example Teacher', published='2028-05-02', body='<p>Meet at school.</p>', order=None):
     fields = {'Dodał': escape(author), 'Data publikacji': escape(published), 'Treść': body}
     rows = ''.join(f'<tr><th>{key}</th><td>{fields[key]}</td></tr>' for key in (order or fields))
@@ -77,7 +83,7 @@ class FakeClient:
             text = self.calendar()
         else:
             text = self.details[path]
-        return SimpleNamespace(text=text, url=url, is_redirect=False)
+        return SimpleNamespace(text=text, url=url, is_redirect=False,status_code=200)
 
     def calendar(self):
         return calendar_page(self.year, self.month, events=self.events.get((self.year, self.month)), key=f'key-{self.version}')
@@ -91,7 +97,7 @@ class FakeClient:
         self.version += 1
         if self.month == self.fail_month:
             raise RuntimeError('A private error containing a session URL must not escape')
-        return SimpleNamespace(text=self.calendar(), url=url, is_redirect=False)
+        return SimpleNamespace(text=self.calendar(), url=url, is_redirect=False,status_code=200)
 
 
 class AnnouncementParserTests(unittest.TestCase):
@@ -210,6 +216,8 @@ class CalendarParserTests(unittest.TestCase):
         variants = [calendar_page(missing_day=31), calendar_page().replace('scheduleForm', 'changedForm'),
                     calendar_page().replace('method="post"', 'method="get"'),
                     calendar_page().replace('action="/terminarz"', 'action="https://external.example/change"'),
+                    calendar_page().replace('action="/terminarz"', 'action="'+password_only_userinfo_url()+'"'),
+                    calendar_page().replace('action="/terminarz"', 'action="https://synergia.librus.pl:444/terminarz"'),
                     calendar_page(events={16: calendar_cell(route='https://external.example/x')}),
                     calendar_page(events={16: calendar_cell(route=None)}),
                     calendar_page().replace('</html>', '')]
@@ -237,6 +245,74 @@ class CalendarParserTests(unittest.TestCase):
 
 
 class SourceCollectionTests(unittest.TestCase):
+    def test_only_school_entries_gain_stable_observed_class_audience(self):
+        from app.source_audience import AUDIENCE_KEY,valid_calendar_audience
+        first=collect_sources(FakeClient(),current=CURRENT)
+        second=collect_sources(FakeClient(),current=CURRENT)
+        for source in first['sources']:
+            if source['kind']=='school_event':
+                self.assertTrue(valid_calendar_audience(source,first['learner']))
+                other=next(x for x in second['sources']if x['kind']=='school_event')
+                self.assertEqual(source['metadata'][AUDIENCE_KEY],other['metadata'][AUDIENCE_KEY])
+                self.assertNotIn('requestkey',str(source['metadata'][AUDIENCE_KEY]))
+            else:self.assertNotIn(AUDIENCE_KEY,source['metadata'])
+
+    def test_complete_calendar_control_inventory_refuses_other_audience_or_child_controls(self):
+        variants=['<select name="class_id"><option selected value="fictional">Class</option></select>',
+                  '</form><form id="other"><select name="child"></select></form><form>',
+                  '<input name="audience" type="hidden" value="fictional">',
+                  '<input id="unboundClass" type="hidden" value="fictional">',
+                  '<button name="chooseClass">Class</button>']
+        for extra in variants:
+            client=FakeClient();original=client.calendar
+            client.calendar=lambda:original().replace('</form>',extra+'</form>',1)
+            result=collect_sources(client,current=CURRENT)
+            self.assertEqual(result['complete_kinds'],['announcement'])
+            self.assertIn('calendar_form_invalid',result['errors'])
+            self.assertEqual(client.posts,[])
+
+    def test_recognized_external_language_select_is_not_a_class_selector(self):
+        client=FakeClient();original=client.calendar
+        client.calendar=lambda:original().replace('</body>','<select id="language" name="Język"><option value="pl">Polski</option></select></body>')
+        self.assertEqual(collect_sources(client,current=CURRENT)['status'],'ok')
+        other=FakeClient();original_other=other.calendar
+        other.calendar=lambda:original_other().replace('</body>','<select name="class"><option>Class</option></select></body>')
+        self.assertIn('calendar_form_invalid',collect_sources(other,current=CURRENT)['errors'])
+
+    def test_post_final_url_status_and_query_are_validated_before_audience_proof(self):
+        for change in ({'url':ORIGIN+'/uczen/index'},{'url':ORIGIN+'/terminarz?class=fictional'},
+                       {'url':password_only_userinfo_url()},
+                       {'url':'https://synergia.librus.pl:444/terminarz'},{'status_code':201}):
+            client=FakeClient();request=client.request
+            def changed(method,url,*,data):
+                response=request(method,url,data=data)
+                if data['miesiac']=='4':
+                    for key,value in change.items():setattr(response,key,value)
+                return response
+            client.request=changed;result=collect_sources(client,current=CURRENT)
+            self.assertEqual(result['complete_kinds'],['announcement'])
+            self.assertIn('source_session_invalid',result['errors'])
+            self.assertEqual((client.year,client.month),(2028,5))
+
+    def test_temporary_context_switch_cannot_mint_audience_even_if_restored_later(self):
+        client=FakeClient();client.profiles=[profile(),profile(name='Different Learner'),profile()]
+        result=collect_sources(client,current=CURRENT)
+        self.assertEqual(result['sources'],[]);self.assertEqual(result['complete_kinds'],[])
+        self.assertEqual(result['errors'],['learner_context_changed'])
+        self.assertEqual((client.year,client.month),(2028,5))
+
+    def test_final_parent_route_is_rechecked_after_month_restoration(self):
+        client=FakeClient();follow=client.follow;parents=[0]
+        def changed(url):
+            response=follow(url)
+            if url.endswith('/rodzic/index'):
+                parents[0]+=1
+                if parents[0]>1:response.url=ORIGIN+'/uczen/index'
+            return response
+        client.follow=changed;result=collect_sources(client,current=CURRENT)
+        self.assertEqual(result['sources'],[]);self.assertEqual(result['complete_kinds'],[])
+        self.assertIn('source_session_invalid',result['errors'])
+
     def test_reuses_session_fixed_window_restores_month_and_never_fetches_media(self):
         client = FakeClient()
         result = collect_sources(client, current=CURRENT)

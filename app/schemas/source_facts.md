@@ -149,6 +149,15 @@ never group updates, cancellations, deadlines or reminders.
 
 
 Typed source contract:
+- Observed metadata.served_class_calendar is a separately verified served CLASS
+  audience, not a literal quotation or a participation decision. For an ordinary
+  school action applying through that view use recipient.scope=class, the exact
+  verified class_id, condition=none, and evidence="" if no literal audience phrase
+  exists. The body still needs literal action_identity.evidence/source_quote and
+  grounded dates. Never invent a class phrase or infer an exclusive account role.
+  Other-class/person/role restrictions override visibility. Unknown participation,
+  extracurricular offers and condition=unknown remain guarded/review. Do not
+  output recipient_basis; only the application computes that observed basis.
 - Return the source_analysis.json schema, with recipient, optional, date_certainty,
   informational, action_identity and offer_identity on every item. No tools.
 - Recipient scope learner/class must use the verified context ID. Other classes,

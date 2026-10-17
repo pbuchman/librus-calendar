@@ -119,6 +119,18 @@ class EvaluatorTests(unittest.TestCase):
             status=evaluator.main(arguments)
         return status,[json.loads(line)for line in output.getvalue().splitlines()],factory
 
+    def test_isolated_class_receipt_supports_observed_audience_without_fabricated_quote(self):
+        from app.source_audience import AUDIENCE_KEY,mint_calendar_audience
+        body=TEXT.removeprefix('Klasa 1x ');row=source(kind='school_event',text=body)
+        row['metadata'][AUDIENCE_KEY]=mint_calendar_audience(row,LEARNER)
+        raw=action(source_quote=body,recipient={'scope':'class','class_id':'1x','learner_id':None,'condition':'none','evidence':''},
+            action_identity={'action_type':'submit','object':'papierowe serce','occasion':'kiermasz wiosenny','evidence':body})
+        case={'id':'fictional-served-audience','source':row,'expected':[{'start':'2030-03-12','source_quote':body}],
+              'current':NOW.isoformat(),'expected_new_operations':1,'repeat':True}
+        status,outputs,_=self.run_evaluation(self.document(case),SyntheticRuntime({row['upstream_id']:[raw]}),details=True)
+        self.assertEqual(status,0);self.assertEqual(outputs[-1]['results'][0]['new_local_operations'],1)
+        self.assertEqual(outputs[-1]['results'][0]['repeat_model_calls'],0)
+
     def target_document(self,legacy=False):
         seed={'source':source('seed',kind='message'if legacy else'announcement'),
               'proposals':[action(action_identity=None)if legacy else action()],

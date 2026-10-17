@@ -481,6 +481,7 @@ def main(argv=None):
                 # path, connector probe or Calendar call.
                 store.set_setting('source_activation_at','isolated-evaluation')
                 store.set_setting('source_activation_learner',str(learner['id']))
+                store.set_setting('source_activation_class',str(learner.get('class_id')or''))
                 store.set_setting('source_activation_binding',digest([config.calendar_id,config.calendar_owner]))
                 def ingest_fixture(data,current):
                     from app.source_store import source_identity

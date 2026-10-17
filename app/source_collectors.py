@@ -250,20 +250,35 @@ def parse_learner_context(html):
 
 
 def _calendar_form(doc):
-    forms = [node for node in doc.root.walk('form') if node.attrs.get('id') == 'scheduleForm']
-    if len(forms) != 1:
+    forms = list(doc.root.walk('form'))
+    if len(forms) != 1 or forms[0].attrs.get('id')!='scheduleForm':
         raise SourceCollectionError('calendar_form_invalid')
     form = forms[0]
     target = urlsplit(urljoin(ORIGIN + '/terminarz', form.attrs.get('action', '')))
-    if (target.scheme, target.hostname, target.path.rstrip('/'), target.query, target.fragment) != ('https', 'synergia.librus.pl', '/terminarz', '', ''):
+    if not _trusted_view_url(target.geturl(),'/terminarz'):
         raise SourceCollectionError('calendar_form_invalid')
     if form.attrs.get('method', 'get').lower() != 'post':
         raise SourceCollectionError('calendar_form_invalid')
     selected, choices = {}, {}
+    external_languages=0
+    for node in doc.root.walk():
+        if node.tag in {'button','textarea'}:
+            raise SourceCollectionError('calendar_form_invalid')
+        if node.tag in {'input','select'}and node.ancestor('form')is not form:
+            if (node.tag!='select'or node.ancestor('form')is not None
+                    or node.attrs.get('id')!='language'or node.attrs.get('name')!='Język'):
+                raise SourceCollectionError('calendar_form_invalid')
+            external_languages+=1
+            if external_languages>1 or not 1<=len(list(node.walk('option')))<=32:
+                raise SourceCollectionError('calendar_form_invalid')
+        for attribute in ('href','onclick','onchange'):
+            value=node.attrs.get(attribute,'').casefold()
+            if re.search(r'(?:switch.{0,20}(?:child|student|user)|(?:zmien|zmień|wybierz).{0,30}(?:uczn|dziec|klas|oddzia))',value):
+                raise SourceCollectionError('calendar_form_invalid')
     for select in form.walk('select'):
         key = select.attrs.get('name')
         if key not in {'miesiac', 'rok'}:
-            continue
+            raise SourceCollectionError('calendar_form_invalid')
         if key in selected:
             raise SourceCollectionError('calendar_form_invalid')
         options = list(select.walk('option'))
@@ -278,7 +293,7 @@ def _calendar_form(doc):
     for node in form.walk('input'):
         name = node.attrs.get('name')
         if not name:
-            continue
+            raise SourceCollectionError('calendar_form_invalid')
         if node.attrs.get('type', '').casefold() != 'hidden' or name not in {'requestkey'} or name in hidden:
             raise SourceCollectionError('calendar_form_invalid')
         hidden[name] = node.attrs.get('value', '')
@@ -364,12 +379,24 @@ def parse_calendar_detail(html, *, holiday=False):
     return result
 
 
-def _read(client, path):
-    response = client.follow(ORIGIN + path)
-    final = urlsplit(getattr(response, 'url', '') or ORIGIN + path)
-    if final.scheme != 'https' or final.hostname != 'synergia.librus.pl' or final.path.rstrip('/') != path.rstrip('/') or final.query or final.fragment:
+def _trusted_view_url(value,path):
+    try:
+        final=urlsplit(value)
+        return (final.scheme=='https'and final.hostname=='synergia.librus.pl'and final.port in (None,443)
+                and final.username is None and final.password is None and final.path==path
+                and not final.query and not final.fragment)
+    except (ValueError,TypeError):return False
+
+
+def _checked_response(response,path):
+    if (getattr(response,'status_code',None)!=200 or getattr(response,'is_redirect',False)
+            or not _trusted_view_url(getattr(response,'url',''),path)):
         raise SourceCollectionError('source_session_invalid')
     return response.text
+
+
+def _read(client, path):
+    return _checked_response(client.follow(ORIGIN + path),path)
 
 
 def _select_month(client, form, year, month):
@@ -377,13 +404,12 @@ def _select_month(client, form, year, month):
         raise SourceCollectionError('calendar_window_unsupported')
     data = dict(form['hidden'], miesiac=str(month), rok=str(year))
     response = client.request('POST', ORIGIN + '/terminarz', data=data)
-    if response.is_redirect:
-        raise SourceCollectionError('source_session_invalid')
+    html=_checked_response(response,'/terminarz')
     # A successful POST is not proof that the view changed. Parse and verify it.
-    selected = _calendar_form(Document(response.text))
+    selected = _calendar_form(Document(html))
     if (selected['year'], selected['month']) != (year, month):
         raise SourceCollectionError('calendar_selection_failed')
-    return response.text, selected
+    return html, selected
 
 
 def _months(start, end):
@@ -397,7 +423,7 @@ def _months(start, end):
     return result
 
 
-def collect_calendar(client, *, learner_id, fetched_at, start, end):
+def collect_calendar(client, *, learner_id, fetched_at, start, end, learner=None):
     html = _read(client, '/terminarz')
     form, unused = parse_calendar_month(html, start=start, end=end)
     original = (form['year'], form['month'])
@@ -411,6 +437,8 @@ def collect_calendar(client, *, learner_id, fetched_at, start, end):
                 moved = True
                 html, form = _select_month(client, form, year, month)
             form, entries = parse_calendar_month(html, start=start, end=end)
+            if learner is not None and parse_learner_context(_read(client,'/informacja'))!=learner:
+                raise SourceCollectionError('learner_context_changed')
             for entry in entries:
                 identity = entry['kind'] + ':' + entry['upstream_id']
                 if identity in seen:
@@ -446,6 +474,8 @@ def collect_calendar(client, *, learner_id, fetched_at, start, end):
                     _select_month(client, latest, *original)
                 except Exception:
                     raise SourceCollectionError('calendar_restore_failed') from None
+            if learner is not None and parse_learner_context(_read(client,'/informacja'))!=learner:
+                raise SourceCollectionError('learner_context_changed')
     return result
 
 
@@ -473,7 +503,7 @@ def collect_sources(client, *, current=None, past_days=30, future_days=60):
     for kinds, collect in (
         (('announcement',), lambda: parse_announcements(_read(client, '/ogloszenia'), learner_id=learner['id'], fetched_at=fetched_at)),
         (('school_event', 'substitution'), lambda: collect_calendar(client, learner_id=learner['id'], fetched_at=fetched_at,
-            start=date.fromisoformat(result['window_start']), end=date.fromisoformat(result['window_end']))),
+            start=date.fromisoformat(result['window_start']), end=date.fromisoformat(result['window_end']),learner=learner)),
     ):
         try:
             sources = collect()
@@ -482,10 +512,18 @@ def collect_sources(client, *, current=None, past_days=30, future_days=60):
         except Exception as error:
             result['errors'].append(error.code if isinstance(error, SourceCollectionError) else kinds[0] + '_collection_failed')
     try:
+        _read(client,'/rodzic/index')
         if parse_learner_context(_read(client, '/informacja')) != learner:
             raise SourceCollectionError('learner_context_changed')
     except Exception as error:
         result['sources'], result['complete_kinds'] = [], []
         result['errors'].append(error.code if isinstance(error, SourceCollectionError) else 'learner_collection_failed')
+    result['errors']=list(dict.fromkeys(result['errors']))
+    if 'learner_context_changed'in result['errors']:
+        result['sources'],result['complete_kinds']=[],[]
+    if not result['errors']:
+        from .source_audience import AUDIENCE_KEY,mint_calendar_audience
+        for source in result['sources']:
+            if source['kind']=='school_event':source['metadata'][AUDIENCE_KEY]=mint_calendar_audience(source,learner)
     result['status'] = 'ok' if not result['errors'] and set(result['complete_kinds']) == set(KINDS) else 'partial'
     return result

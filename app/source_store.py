@@ -186,6 +186,9 @@ class SourceStoreMixin:
                 payload[field] = str(payload.get(field) or '')
             if len(payload['text'])>100000 or not isinstance(payload['metadata'],dict):
                 raise ValueError('Invalid source body.')
+            from .source_audience import AUDIENCE_KEY,valid_calendar_audience
+            if AUDIENCE_KEY in payload['metadata']and not valid_calendar_audience(payload,learner):
+                raise ValueError('Invalid observed calendar audience proof.')
             # Fetch timestamps / pagination positions are observation metadata,
             # not a content edit that warrants another model invocation.
             hashed_payload = {k:v for k,v in payload.items() if k!='metadata'}
@@ -419,7 +422,13 @@ class SourceStoreMixin:
                for table in ('decision_intents','proposal_groups','proposal_group_members','events','canonical_actions','canonical_decisions','canonical_offer_groups','action_sources')}
         state['source_authority']=[tuple(r)for r in self.db.execute('SELECT id,content_hash,deleted,status,published_at,updated_at FROM sources ORDER BY id')]
         state['proposal_authority']=[tuple(r)for r in self.db.execute('SELECT id,message_id,source_hash,payload,status FROM proposals ORDER BY id')]
+        state['selected_context']=self.source_context_snapshot()
         return digest(state)
+
+    def source_context_snapshot(self):
+        context=json.loads(self._setting('source_learner_context','{}'))
+        return {'id':context.get('id'),'class_id':context.get('class_id'),
+                'pinned_id':self._setting('source_learner_id'),'verified':self._setting('source_learner_verified')}
 
     def candidate_actions(self,proposal,limit=12,additional=()):
         """Bounded relevant facts only; never all inboxes or all Calendar events."""
@@ -467,6 +476,12 @@ class SourceStoreMixin:
         source=self.get_source(item.get('source_id'))
         if not source or source['deleted'] or source['content_hash']!=item.get('source_hash') or source['status'] not in ('analyzed','retained'):
             return 'Source version changed or is unavailable; reanalysis required.'
+        if item.get('recipient_basis',{}).get('kind')=='served_class_calendar':
+            from .source_audience import calendar_recipient_basis
+            context=json.loads(self._setting('source_learner_context','{}'))
+            context['verified']=self._setting('source_learner_verified')=='true'
+            if item['recipient_basis']!=calendar_recipient_basis(source,context):
+                return 'Observed calendar audience context changed; fresh analysis required.'
         canonical=self.db.execute('SELECT proposal_id FROM canonical_actions WHERE id=?',(item['canonical_action_id'],)).fetchone()
         if not canonical or canonical[0]!=item['id']:
             return 'A newer canonical action supersedes this proposal.'
@@ -505,7 +520,7 @@ class SourceStoreMixin:
             for actionrow in self.db.execute('SELECT c.* FROM canonical_actions c JOIN action_sources a ON a.action_id=c.id WHERE a.source_id=? AND a.relation NOT IN (?,?,?)',(sid,CORROBORATION_RELATION,EXPIRED_FACT_RELATION,CLOSED_OFFER_RELATION)).fetchall():
                 item=json.loads(actionrow['payload'])
                 minimal=minimal_proposal(item)
-                for key in ('canonical_action_id','source_id','source_hash','source_kind','source_version_at','optional'):
+                for key in ('canonical_action_id','source_id','source_hash','source_kind','source_version_at','optional','recipient_basis'):
                     if key in item:minimal[key]=item[key]
                 # Minimal typed anchors enable later evidence-assisted retrieval;
                 # no original body/quote/analysis reasoning remains.
@@ -517,7 +532,7 @@ class SourceStoreMixin:
                     proposal=self.db.execute('SELECT * FROM proposals WHERE id=?',(actionrow['proposal_id'],)).fetchone()
                     if proposal:
                         clean=minimal_proposal(self._proposal(proposal))
-                        clean.update({k:v for k,v in minimal.items() if k in ('canonical_action_id','source_id','source_hash','source_kind','source_version_at','optional','action_identity','recipient')})
+                        clean.update({k:v for k,v in minimal.items() if k in ('canonical_action_id','source_id','source_hash','source_kind','source_version_at','optional','recipient_basis','action_identity','recipient')})
                         self.db.execute('UPDATE proposals SET payload=? WHERE id=?',(json.dumps(clean,ensure_ascii=False),proposal['id']))
             # An expired, unverified fact owns its own diagnostic canonical row.
             # Supporting low-authority links must never minimize somebody else's
@@ -558,6 +573,14 @@ class SourceStoreMixin:
             return False
         if self._setting('source_activation_incomplete',''):return True
         if self.config.multi_source_mode!='active':return False
+        if item.get('recipient_basis',{}).get('kind')=='served_class_calendar':
+            from .source_audience import calendar_recipient_basis
+            context=json.loads(self._setting('source_learner_context','{}'))
+            context['verified']=self._setting('source_learner_verified')=='true'
+            source=self.get_source(item.get('source_id'))
+            if (not source or self._setting('source_activation_class')!=context.get('class_id')
+                    or item['recipient_basis']!=calendar_recipient_basis(source,context)):
+                return True
         if self._setting('source_last_collection_result')!='ok':
             return True
         health={r['kind']:r['last_result'] for r in self.db.execute('SELECT kind,last_result FROM source_health')}

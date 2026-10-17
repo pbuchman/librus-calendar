@@ -71,6 +71,16 @@ def _participation_research(item,source,context):
         for key,known in (('learner_id',context.get('id')),('class_id',context.get('class_id'))))
 
 
+def _calendar_audience_applies(item,source,context):
+    from .source_audience import valid_calendar_audience
+    recipient=item.get('recipient')or{}
+    return (item.get('activity_scope')=='school'and recipient.get('condition')=='none'
+            and recipient.get('scope')=='class'and recipient.get('class_id')==context.get('class_id')
+            and all(not recipient.get(key)or str(recipient[key])==str(known or'')
+                    for key,known in (('learner_id',context.get('id')),('class_id',context.get('class_id'))))
+            and valid_calendar_audience(source,context))
+
+
 def _source_action_reason(item,source,context):
     reason=_source_fact_reason(item,source)
     if reason:return reason
@@ -79,7 +89,9 @@ def _source_action_reason(item,source,context):
     if recipient.get('scope') not in {'learner','class','all'}:return 'Conditional or unknown recipient requires review.'
     if recipient.get('scope')=='learner' and str(recipient.get('learner_id')or'')!=str(context.get('id')or''):return 'Recipient learner is not the verified selected learner.'
     if recipient.get('scope')=='class' and str(recipient.get('class_id')or'')!=str(context.get('class_id')or''):return 'Recipient class is not the verified selected class.'
-    if not _recipient_evidence(recipient.get('evidence'),source):return 'Recipient applicability lacks literal evidence.'
+    if any(recipient.get(key)and str(recipient[key])!=str(known or'')for key,known in
+           (('learner_id',context.get('id')),('class_id',context.get('class_id')))):return 'Recipient identifiers conflict with the verified selected context.'
+    if not _recipient_evidence(recipient.get('evidence'),source)and not _calendar_audience_applies(item,source,context):return 'Recipient applicability lacks literal evidence.'
     return None
 
 
@@ -89,6 +101,7 @@ def prepare_source_proposals(source,raws,context,current=None):
     prepared=[]
     for raw in raws:
         if not isinstance(raw,dict):raise ValueError('Invalid source action.')
+        raw={key:value for key,value in raw.items()if key not in {'recipient_basis','audience_basis'}}
         raw=dict(raw,source_id=source['id'],source_hash=source['content_hash'],source_kind=source['kind'],
                  user_approved=False,user_edited=False,user_rejected=False,deletion_approved=False,
                  provenance={'source_id':source['id'],'source_hash':source['content_hash'],'quote':raw.get('source_quote','')},
@@ -103,6 +116,10 @@ def prepare_source_proposals(source,raws,context,current=None):
             item={**raw,'kind':'create','status':'review','needs_review':True,'review_reason':'Invalid or uncertain date; manual correction required.',
                   'start':raw.get('start'),'end':raw.get('end'),'title':str(raw.get('title') or 'Niejasny termin')[:250]}
         if item['kind']!='ignore':
+            if (not _source_fact_reason(item,source)and _calendar_audience_applies(item,source,context)
+                    and not _recipient_evidence((item.get('recipient')or{}).get('evidence'),source)):
+                from .source_audience import calendar_recipient_basis
+                item['recipient_basis']=calendar_recipient_basis(source,context)
             # Past facts still require applicability before attaching provenance.
             reason=_source_action_reason(item,source,context)
             if reason:
@@ -298,10 +315,16 @@ def _synthetic_match(source,item,candidates):
 
 
 class SourcePlanner:
-    def __init__(self,store,runtime):self.store,self.runtime=store,runtime
+    def __init__(self,store,runtime,*,expected_context=None):
+        self.store,self.runtime,self.expected_context=store,runtime,expected_context
 
     def analyze(self,source,current=None,preview=False):
-        context=json.loads(self.store._setting('source_learner_context','{}'))
+        with self.store.lock:
+            if self.expected_context is not None and self.store.source_context_snapshot()!=self.expected_context:
+                raise ValueError('Selected activation context changed before source analysis.')
+            context=json.loads(self.store._setting('source_learner_context','{}'))
+            context['verified']=self.store._setting('source_learner_verified')=='true'
+            snapshot=self.store.source_decision_snapshot()
         if source['kind']=='substitution':
             raws=[];metadata={'model':None,'effort':None,'prompt_version':'substitution-policy-v1','decision_reason':'Substitutions are informational; no personal events.'}
         else:
@@ -313,7 +336,6 @@ class SourcePlanner:
         prepared=prepare_source_proposals(source,raws,context,current)
         if preview and hasattr(self.runtime,'verify_source_action')and hasattr(self.runtime,'reserve_source_plan'):
             self.runtime.reserve_source_plan(sum(item['kind']!='ignore'for item in prepared))
-        snapshot=self.store.source_decision_snapshot()
         virtual=[]
         if preview:
             for row in self.store.db.execute("SELECT p.payload FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE p.status='ready' AND p.source_id<>? ORDER BY p.created_at",(source['id'],)):

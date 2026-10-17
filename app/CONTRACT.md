@@ -204,6 +204,39 @@ normal environment/credential/state discovery is never needed.
 
 ## Additive source UI and monitoring
 
+`metadata.served_class_calendar` version `served-class-calendar-v1` is trusted
+collector observation for `school_event` only. Every collection verifies HTTPS
+host/path and HTTP 200 for the authenticated `/rodzic/index`, `/informacja` and
+`/terminarz` views, including month POST results and form targets. Userinfo,
+unexpected ports/routes/selectors/controls fail closed. The complete calendar
+control contract permits only its month/year form, hidden request key, and the
+recognized external language selector. The selected learner/class must remain
+identical through all month reads and original-month restoration. This proves
+served class-calendar audience, without asserting an exclusive account-role
+label or participation. No account or child switch is performed.
+
+The stable envelope binds its version, view contract, learner/class and observed
+source fingerprint; it excludes its own envelope, fetch/window timestamps and
+nonces. The persisted source content hash includes the envelope. Ingestion rejects
+malformed/wrong-source/context proof. Only an ordinary school action with exact
+verified CLASS scope, `condition=none` and no conflicting IDs may use it in place
+of a literal recipient phrase. Literal body action/identity and grounded dates
+remain mandatory. Other scopes, role/unknown/participation conditions and
+extracurricular activity gain no authority. Model-supplied `recipient_basis` is
+discarded; the application computes that field from the persisted observation,
+separately from `source_quote`. Retention removes the source proof while keeping
+the minimal basis guard, so expired content cannot silently upgrade authority.
+
+Source/decision CAS includes minimal verified learner/class context and is read
+before analysis. Activation pins that context for every analysis and compares it
+again in the final receipt transaction. The receipt records the captured class,
+never a later observed class, and clears its durable incomplete-attempt guard
+only with all receipt fields after full success. Audience-based queue/claim
+revalidate the current source proof/context and class-bound activation receipt;
+missing/old-class receipts or changed proof/context defer without rewriting
+pending intent or a frozen operation. Literal and legacy paths retain their
+existing receipt behavior; unknown journals remain reconciliation-only.
+
 `GET /sources`, `/sources/{source_id}` and `/actions/{action_id}` are owner-authenticated, read-only views. Sources show kind, outcome/reason and text; canonical action details show certainty, optional-reminder labeling, retained decision metadata and every supporting source/quote/relation. Source kinds are `message`, `announcement`, `school_event`, `substitution`; `school_calendar` is accepted as a filter alias. Attachments remain visibly `załącznik nieanalizowany`, never downloaded or analyzed. Existing message/proposal/offer review paths keep their current auth, CSRF, revisions and decision guards.
 
 `GET /api/sources` accepts `limit` (1–100, default 50), nonnegative `offset`, optional `kind` and `status`, returning `{items,limit,offset,next_offset}`. It fetches one sentinel row to determine the next offset. `GET /api/actions/{action_id}` includes canonical state, links and corresponding source records. `GET /api/source-previews` uses the same pagination envelope. `/preview` has no approval/activation path: source preview analyses cannot mutate proposals, operations, human decisions or Calendar. Existing `/api/messages`, `/api/proposals`, `/api/proposal-groups` response shapes remain compatible.

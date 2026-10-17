@@ -142,7 +142,7 @@ def normalize_proposal(data, current=None):
                     temporal_kind=temporal_kind, due_at=data.get('due_at'), activity_scope=activity_scope,
                     deletion_approved=data.get('deletion_approved') is True, user_approved=data.get('user_approved') is True,
                     user_edited=data.get('user_edited') is True)
-    for key in ('canonical_action_id','source_id','source_hash','source_kind','provenance','recipient','optional','date_certainty','action_identity','match_evidence','source_version_at','offer_identity','informational','alternative_group','alternative_group_evidence','user_rejected','deferred_unknown_operation','blocked_by_offer_group'):
+    for key in ('canonical_action_id','source_id','source_hash','source_kind','provenance','recipient','recipient_basis','optional','date_certainty','action_identity','match_evidence','source_version_at','offer_identity','informational','alternative_group','alternative_group_evidence','user_rejected','deferred_unknown_operation','blocked_by_offer_group'):
         if key in data:
             proposal[key] = data[key]
     if proposal.get('optional') is True:
