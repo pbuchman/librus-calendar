@@ -25,7 +25,7 @@ Run from the Librus repository:
 .venv/bin/python scripts/deploy.py prepare --sha FULL_SHA
 ```
 
-Preparation validates the source, runs full offline tests in an isolated temporary home, scans source and complete reachable history, builds a wheel, installs dependencies into a separate release, verifies imports/resources outside the checkout, and records artifact/application hashes. All preparation completes before services stop. An existing verified release is reused; no service commands or production database access occur during preparation.
+Preparation validates the source, runs full offline tests in an isolated temporary home, scans source and complete reachable history, builds a wheel, installs dependencies into a separate release, verifies imports/resources outside the checkout, and records artifact/application hashes and the wheel's resource inventory. Each installed release is validated against its own hash-verified wheel and recorded application files; older manifests derive their resource inventory from their wheel. Preparation, including reuse, and target activation also require the invoking source's full resource list. All preparation completes before services stop. An existing verified release is reused; no service commands or production database access occur during preparation.
 
 Never run real-message evaluation against production state or expose it on the production port. `scripts/evaluate_analysis.py --config PRIVATE_EVAL_CONFIG PRIVATE_CASES_JSON` uses an explicitly read-only runtime and does not discover the production configuration. The offline UI fixture uses temporary synthetic state; use a separate development port when production is running.
 
