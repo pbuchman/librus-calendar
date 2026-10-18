@@ -9,6 +9,9 @@ from datetime import datetime, timedelta, timezone
 import json
 import re
 import uuid
+from .source_matching import candidate_is_distinct
+from .source_preview import (SOURCE_PREVIEW_PLANNER_VERSION, PREVIEW_RETRY_SETTINGS,
+                             current_preview_sql, preview_is_current, preview_queue_sql)
 
 KINDS = frozenset({'message', 'announcement', 'school_event', 'substitution'})
 CORROBORATION_RELATION = 'corroborates_unverified_recipient'
@@ -136,20 +139,21 @@ class SourceStoreMixin:
 
     def source_status(self):
         counts = {}
+        preview_queue,queue_args=preview_queue_sql({key:self._setting(key)for key in PREVIEW_RETRY_SETTINGS})
         for row in self.db.execute('SELECT kind,COUNT(*) AS total,SUM(status=\'pending\') AS pending,SUM(status=\'failed\') AS failed,SUM(deleted) AS deleted FROM sources GROUP BY kind'):
             counts[row['kind']] = {key:row[key] for key in ('total','pending','failed','deleted')}
-            ready=self.db.execute("SELECT COUNT(*) FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE s.kind=? AND p.status='ready'",(row['kind'],)).fetchone()[0]
-            failed=self.db.execute("SELECT COUNT(*) FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE s.kind=? AND p.status='failed' AND s.deleted=0",(row['kind'],)).fetchone()[0]
+            ready=self.db.execute(f"SELECT COUNT(*) FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE s.kind=? AND p.status='ready' AND s.deleted=0 AND ({current_preview_sql()})",(row['kind'],)).fetchone()[0]
+            failed=self.db.execute(f"SELECT COUNT(*) FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE s.kind=? AND p.status='failed' AND s.deleted=0 AND ({current_preview_sql()})",(row['kind'],)).fetchone()[0]
             counts[row['kind']]['preview_ready']=ready
             counts[row['kind']]['preview_failed']=failed
-            counts[row['kind']]['preview_pending']=max(0,row['pending']+row['failed']-ready-failed) if self.config.multi_source_mode=='preview' and row['kind']!='message' else 0
+            counts[row['kind']]['preview_pending']=self.db.execute(f"SELECT COUNT(*) FROM sources s WHERE s.kind=? AND s.deleted=0 AND ({preview_queue}) AND NOT EXISTS (SELECT 1 FROM source_previews p WHERE p.source_id=s.id AND p.source_hash=s.content_hash AND p.status IN ('ready','failed') AND ({current_preview_sql()}))",(row['kind'],*queue_args)).fetchone()[0] if self.config.multi_source_mode=='preview' and row['kind']!='message' else 0
             counts[row['kind']]['active_pending']=row['pending']+row['failed'] if self.config.multi_source_mode=='active' else 0
         health = {r['kind']:{**dict(r),'learner_verified':bool(r['learner_verified'])} for r in self.db.execute('SELECT * FROM source_health')}
         return {'mode':self.config.multi_source_mode,'counts':counts,'health':health,
                 'active_pending':sum(x['pending']+x['failed'] for x in counts.values()) if self.config.multi_source_mode=='active' else 0,
                 'preview_pending':sum(x['preview_pending'] for x in counts.values()) if self.config.multi_source_mode=='preview' else 0,
                 'preview_failed':sum(x['preview_failed'] for x in counts.values()),
-                'preview_count':self.db.execute("SELECT COUNT(*) FROM source_previews WHERE status='ready'").fetchone()[0],
+                'preview_count':self.db.execute(f"SELECT COUNT(*) FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE p.status='ready' AND s.deleted=0 AND ({current_preview_sql()})").fetchone()[0],
                 'last_collection_at':self._setting('source_last_collection_at'),
                 'last_collection_result':self._setting('source_last_collection_result'),
                 'last_error':self._setting('source_last_error'),
@@ -269,13 +273,14 @@ class SourceStoreMixin:
         return {'changed':changed,'collected':len(clean),'status':self._setting('source_last_collection_result')}
 
     def pending_sources(self, limit=100, include_messages=False, preview=False):
-        sql = "SELECT * FROM sources s WHERE s.status IN ('pending','failed') AND s.deleted=0"
+        queue,args=preview_queue_sql({key:self._setting(key)for key in PREVIEW_RETRY_SETTINGS}) if preview else ("s.status IN ('pending','failed')",())
+        sql = f"SELECT * FROM sources s WHERE ({queue}) AND s.deleted=0"
         if not include_messages:
             sql += " AND s.kind<>'message'"
         if preview:
-            sql += " AND NOT EXISTS (SELECT 1 FROM source_previews p WHERE p.source_id=s.id AND p.source_hash=s.content_hash AND p.status='ready')"
+            sql += f" AND NOT EXISTS (SELECT 1 FROM source_previews p WHERE p.source_id=s.id AND p.source_hash=s.content_hash AND p.status='ready' AND ({current_preview_sql()}))"
         with self.lock:
-            return [self._source(r) for r in self.db.execute(sql+' ORDER BY s.fetched_at,s.id LIMIT ?',(min(int(limit),100),))]
+            return [self._source(r) for r in self.db.execute(sql+' ORDER BY s.fetched_at,s.id LIMIT ?',(*args,min(int(limit),100)))]
 
     def fail_source(self, source_id, code='source_analysis_failed', preview=False):
         from .core import digest,utcnow
@@ -283,8 +288,8 @@ class SourceStoreMixin:
             source=self.get_source(source_id)
             if preview:
                 pid=digest([source_id,source['content_hash']])[:32]
-                self.db.execute('INSERT INTO source_previews VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET status=excluded.status,last_error=excluded.last_error',
-                    (pid,source_id,source['content_hash'],'{}','failed',utcnow(),code))
+                self.db.execute('INSERT INTO source_previews VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,status=excluded.status,created_at=excluded.created_at,last_error=excluded.last_error',
+                    (pid,source_id,source['content_hash'],json.dumps({'planner_version':SOURCE_PREVIEW_PLANNER_VERSION}),'failed',utcnow(),code))
             else:
                 self.db.execute("UPDATE sources SET status='failed',last_error=?,outcome='analysis_incomplete',reason=? WHERE id=?",(code,code,source_id))
 
@@ -298,18 +303,29 @@ class SourceStoreMixin:
             if expected_decisions and self.source_decision_snapshot()!=expected_decisions:
                 raise ValueError('Human decisions changed during preview matching.')
             pid=digest([source_id,source['content_hash']])[:32]
-            payload={'proposals':proposals,'analysis_metadata':metadata or {},'outcomes':outcomes or [],'decision_snapshot':expected_decisions}
-            self.db.execute('INSERT INTO source_previews VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,status=excluded.status,last_error=NULL',
+            payload={'planner_version':SOURCE_PREVIEW_PLANNER_VERSION,'proposals':proposals,'analysis_metadata':metadata or {},'outcomes':outcomes or [],'decision_snapshot':expected_decisions}
+            self.db.execute('INSERT INTO source_previews VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,status=excluded.status,created_at=excluded.created_at,last_error=NULL',
                 (pid,source_id,source['content_hash'],json.dumps(payload,ensure_ascii=False),'ready',utcnow(),None))
             return pid
 
     def list_source_previews(self,limit=100,offset=0,status=None):
         if not 1<=int(limit)<=500 or int(offset)<0:
             raise ValueError('Invalid preview page.')
-        sql='SELECT * FROM source_previews'+(' WHERE status=?' if status else '')+' ORDER BY created_at DESC,id LIMIT ? OFFSET ?'
+        current=f"s.id IS NOT NULL AND s.content_hash=p.source_hash AND s.deleted=0 AND ({current_preview_sql()})"
+        display_status=f"CASE WHEN p.status IN ('ready','failed') AND NOT ({current}) THEN 'stale' ELSE p.status END"
+        sql=f'SELECT p.*,{display_status} AS display_status FROM source_previews p LEFT JOIN sources s ON s.id=p.source_id'
+        sql+=(f' WHERE ({display_status})=?' if status else '')+' ORDER BY p.created_at DESC,p.id LIMIT ? OFFSET ?'
         args=(status,int(limit),int(offset)) if status else (int(limit),int(offset))
         with self.lock:
-            return [{**dict(r),**json.loads(r['payload'])} for r in self.db.execute(sql,args)]
+            result=[]
+            for row in self.db.execute(sql,args):
+                try:payload=json.loads(row['payload'])
+                except (ValueError,TypeError):payload={}
+                if not isinstance(payload,dict):payload={}
+                item={**payload,**dict(row)};item['status']=item.pop('display_status')
+                item['planner_current']=preview_is_current(payload)
+                result.append(item)
+            return result
 
     def get_action(self,action_id):
         with self.lock:
@@ -423,6 +439,7 @@ class SourceStoreMixin:
         state['source_authority']=[tuple(r)for r in self.db.execute('SELECT id,content_hash,deleted,status,published_at,updated_at FROM sources ORDER BY id')]
         state['proposal_authority']=[tuple(r)for r in self.db.execute('SELECT id,message_id,source_hash,payload,status FROM proposals ORDER BY id')]
         state['selected_context']=self.source_context_snapshot()
+        state['preview_planner_version']=SOURCE_PREVIEW_PLANNER_VERSION
         return digest(state)
 
     def source_context_snapshot(self):
@@ -446,6 +463,9 @@ class SourceStoreMixin:
         for action in additional:available.setdefault(action['id'],action)
         for action in available.values():
             item=action['payload']
+            # This is the same proof boundary used by both matching validators.
+            # Unknown human inventory remains a candidate even with default fields.
+            if candidate_is_distinct(proposal,item):continue
             # A retained diagnostic with no human/event authority is not an
             # existing obligation candidate. Human-owned unknown inventory still
             # remains in the complete candidate set and cannot be filtered out.

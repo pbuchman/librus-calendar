@@ -197,7 +197,8 @@ class SourceBudgetTests(unittest.TestCase):
         self.assertEqual(len(self.store.list_source_previews(status='ready')), 1)
         failed = self.store.list_source_previews(status='failed')
         self.assertEqual(len(failed), 1)
-        self.assertEqual(json.loads(failed[0]['payload']), {})
+        from app.source_preview import SOURCE_PREVIEW_PLANNER_VERSION
+        self.assertEqual(json.loads(failed[0]['payload']), {'planner_version': SOURCE_PREVIEW_PLANNER_VERSION})
         self.assertEqual(result['sources']['model_calls'], 2)
 
     def test_soft_expiry_immediately_after_commit_keeps_ready_preview(self):

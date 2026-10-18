@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta, timezone
 import math
 from pathlib import Path
+from .source_preview import PREVIEW_RETRY_SETTINGS, current_preview_sql, preview_queue_sql
 import sqlite3
 import re
 
@@ -100,9 +101,13 @@ SOURCE_ERROR_CODES |= frozenset(('source_preview_time_budget_exhausted', 'source
 
 
 def read_source_health(db, tables):
-    """Optional aggregate extension; never select source payloads or identifiers."""
+    """Emit aggregates only; retry eligibility uses private identity metadata, never source bodies."""
     if not {'sources', 'source_health', 'action_sources', 'source_previews'}.issubset(tables):
         return None
+    # Older read-only schemas have no planner contract; they establish no readiness.
+    current_preview=current_preview_sql() if 'payload' in {r[1] for r in db.execute('PRAGMA table_info(source_previews)')} else '0'
+    settings=dict(db.execute('SELECT key,value FROM settings WHERE key IN (?,?,?,?)',PREVIEW_RETRY_SETTINGS))
+    preview_queue,queue_args=preview_queue_sql(settings)
     row = db.execute("SELECT value FROM settings WHERE key='multi_source_mode'").fetchone()
     mode = row[0] if row else 'off'
     if mode not in SOURCE_MODES:
@@ -119,16 +124,16 @@ def read_source_health(db, tables):
             code = 'source_operation_failed'
         pending, failed, preview_ready = counts.get('pending', 0), counts.get('failed', 0), None
         if mode == 'preview' and kind != 'message':
-            preview_counts = dict(db.execute('SELECT p.status,COUNT(*) FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE s.kind=? AND s.deleted=0 GROUP BY p.status', (kind,)))
+            preview_counts = dict(db.execute(f'SELECT p.status,COUNT(*) FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE s.kind=? AND s.deleted=0 AND ({current_preview}) GROUP BY p.status', (kind,)))
             preview_ready = preview_counts.get('ready', 0)
             failed = preview_counts.get('failed', 0)
-            pending = int(db.execute("SELECT COUNT(*) FROM sources s WHERE s.kind=? AND s.deleted=0 AND s.status IN ('pending','failed') AND NOT EXISTS (SELECT 1 FROM source_previews p WHERE p.source_id=s.id AND p.source_hash=s.content_hash AND p.status IN ('ready','failed'))", (kind,)).fetchone()[0])
+            pending = int(db.execute(f"SELECT COUNT(*) FROM sources s WHERE s.kind=? AND s.deleted=0 AND ({preview_queue}) AND NOT EXISTS (SELECT 1 FROM source_previews p WHERE p.source_id=s.id AND p.source_hash=s.content_hash AND p.status IN ('ready','failed') AND ({current_preview}))", (kind,*queue_args)).fetchone()[0])
         kinds[kind] = dict(mode='active' if kind == 'message' else mode,
             last_successful_fetch=timestamp(health[0]) if health else None,
             pending=pending, failed=failed, preview_ready=preview_ready, links=links,
             last_result=result, last_error=code)
     return dict(mode=mode, kinds=kinds,
-        preview_count=int(db.execute("SELECT COUNT(*) FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE p.status='ready' AND s.deleted=0").fetchone()[0]))
+        preview_count=int(db.execute(f"SELECT COUNT(*) FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE p.status='ready' AND s.deleted=0 AND ({current_preview})").fetchone()[0]))
 
 
 def read_connection_state(db, now=None):

@@ -2,6 +2,7 @@
 from test_web import FakeStore
 from test_support import TEST_CONFIG
 from app.web import create_app
+from app.source_preview import SOURCE_PREVIEW_PLANNER_VERSION
 from fastapi.testclient import TestClient
 import unittest
 
@@ -34,7 +35,7 @@ class SourceStore(FakeStore):
                   {'action_id':'a2','outcome':'linked','reason':'Ten sam obowiązek','action':linked},
                   {'action_id':'a1','outcome':'ignored','reason':'Zachowano wcześniejsze odrzucenie','action':rejected},
                   {'action_id':'a2','outcome':'review','reason':'Nowy termin wymaga sprawdzenia','action':changed}]
-        return [dict(id='preview',source_id='s1',source_hash='current-hash',status='ready',outcomes=outcomes,
+        return [dict(id='preview',source_id='s1',source_hash='current-hash',status='ready',planner_version=SOURCE_PREVIEW_PLANNER_VERSION,outcomes=outcomes,
             proposals=[dict(title='Nieaktualny wynik ekstrakcji')])][offset:offset+limit]
 
 
@@ -103,6 +104,21 @@ class SourcesWebTests(unittest.TestCase):
         self.assertIn('Analiza niepełna',stale)
         self.assertIn('Old extraction failure',stale)
         self.assertNotIn('Zachowano wcześniejsze odrzucenie',stale)
+
+    def test_old_planner_preview_is_visible_as_stale_without_its_outcomes(self):
+        original=self.store.list_source_previews
+        def old_preview(*args,**kwargs):
+            return [{**item,'planner_version':'older-planner','status':'stale','planner_current':False} for item in original(*args,**kwargs)]
+        self.store.list_source_previews=old_preview
+        page=self.client.get('/preview')
+        self.assertIn('Nieaktualny podgląd',page.text)
+        self.assertIn('Podgląd wymaga ponownej analizy po aktualizacji',page.text)
+        self.assertNotIn('Fikcyjny podgląd',page.text)
+        self.assertNotIn('Zachowano wcześniejsze odrzucenie',page.text)
+        self.assertNotIn('Podgląd gotowy',self.client.get('/sources/s1').text)
+        item=self.client.get('/api/source-previews').json()['items'][0]
+        self.assertEqual(item['status'],'stale')
+        self.assertFalse(item['planner_current'])
 
     def test_unknown_presentation_values_are_not_exposed_as_internal_enums(self):
         original=self.store.get_action

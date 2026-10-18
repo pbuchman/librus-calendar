@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import stat
 import uuid
+from .source_preview import SOURCE_PREVIEW_PLANNER_VERSION, current_preview_sql, incomplete_activation_attempt
 
 from .core import WARSAW,digest,utcnow
 
@@ -45,15 +46,7 @@ def activate_sources(store,runtime,*,plan_path,apply=False,current=None,client_f
     """
     current=current or datetime.now(WARSAW)
     def incomplete_attempt():
-        value=store._setting('source_activation_incomplete','')
-        if not value:return None
-        try:attempt=json.loads(value)
-        except (TypeError,ValueError):raise ValueError('Incomplete activation needs a valid fresh retry plan.')from None
-        if (not isinstance(attempt,dict)or set(attempt)!={'token','plan','sources'}
-                or not isinstance(attempt['sources'],list)or not 1<=len(attempt['sources'])<=5000
-                or any(not isinstance(item,dict)or set(item)!={'id','hash'}for item in attempt['sources'])):
-            raise ValueError('Incomplete activation needs a valid fresh retry plan.')
-        return attempt
+        return incomplete_activation_attempt(store._setting('source_activation_incomplete',''))
     def ready_sources():
         from .source_store import KINDS
         required=KINDS-{'message'}
@@ -61,24 +54,26 @@ def activate_sources(store,runtime,*,plan_path,apply=False,current=None,client_f
         if (store._setting('source_last_collection_result')!='ok'
                 or any(k not in health or health[k]['last_result']!='ok' or not health[k]['learner_verified'] for k in required)):
             raise ValueError('Every required source channel must have a complete verified collection.')
-        ready=[dict(r) for r in store.db.execute("SELECT p.* FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE p.status='ready' AND s.deleted=0 AND s.kind<>'message' ORDER BY p.source_id")]
+        ready=[dict(r) for r in store.db.execute(f"SELECT p.* FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE p.status='ready' AND s.deleted=0 AND s.kind<>'message' AND ({current_preview_sql()}) ORDER BY p.source_id")]
         attempt=incomplete_attempt()
         if attempt:
             selected={item['source_id']:item for item in ready}
             for previous in attempt['sources']:
                 source=store.get_source(previous['id'])
                 if not source or source['deleted']:continue
+                if source['content_hash']!=previous['hash']:
+                    raise ValueError('An incomplete activation source needs a fresh current preview.')
                 if source['id']in selected:continue
                 # Only this failed attempt's exact current versions may reuse
                 # their activated preview as a selection receipt. Its payload
                 # is never executed: every selected source is freshly analyzed.
-                preview=store.db.execute("SELECT * FROM source_previews WHERE source_id=? AND source_hash=? AND status IN ('ready','activated')",
+                preview=store.db.execute(f"SELECT p.* FROM source_previews p WHERE source_id=? AND source_hash=? AND status IN ('ready','activated') AND ({current_preview_sql()})",
                     (source['id'],source['content_hash'])).fetchone()
-                if source['content_hash']!=previous['hash']or not preview:
+                if not preview:
                     raise ValueError('An incomplete activation source needs a fresh current preview.')
                 selected[source['id']]=dict(preview)
             ready=[selected[key]for key in sorted(selected)]
-        missing=store.db.execute("SELECT COUNT(*) FROM sources s WHERE s.kind<>'message' AND s.deleted=0 AND s.status IN ('pending','failed') AND NOT EXISTS (SELECT 1 FROM source_previews p WHERE p.source_id=s.id AND p.source_hash=s.content_hash AND p.status='ready')").fetchone()[0]
+        missing=store.db.execute(f"SELECT COUNT(*) FROM sources s WHERE s.kind<>'message' AND s.deleted=0 AND s.status IN ('pending','failed') AND NOT EXISTS (SELECT 1 FROM source_previews p WHERE p.source_id=s.id AND p.source_hash=s.content_hash AND p.status='ready' AND ({current_preview_sql()}))").fetchone()[0]
         if missing or not ready or len(ready)>5000:
             raise ValueError('Every current source version needs a ready preview before activation.')
         return ready
@@ -86,7 +81,7 @@ def activate_sources(store,runtime,*,plan_path,apply=False,current=None,client_f
         if store.config.multi_source_mode!='preview':raise ValueError('Activation planning requires preview mode.')
         ready=ready_sources()
         if not ready or store._setting('source_learner_verified')!='true':raise ValueError('Verified source previews are required.')
-        plan={'version':1,'kind':'source_activation','created_at':utcnow(),'snapshot':activation_snapshot(store),
+        plan={'version':1,'kind':'source_activation','planner_version':SOURCE_PREVIEW_PLANNER_VERSION,'created_at':utcnow(),'snapshot':activation_snapshot(store),
               'activation_guard':digest(store._setting('source_activation_incomplete','')),
               'sources':[{ 'id':p['source_id'],'hash':p['source_hash']} for p in ready]}
         plan['fingerprint']=digest(plan)
@@ -95,6 +90,7 @@ def activate_sources(store,runtime,*,plan_path,apply=False,current=None,client_f
     plan=read_private_json(plan_path)
     signed={k:v for k,v in plan.items() if k!='fingerprint'}
     if plan.get('kind')!='source_activation' or plan.get('version')!=1 or plan.get('fingerprint')!=digest(signed):raise ValueError('Invalid activation plan.')
+    if plan.get('planner_version')!=SOURCE_PREVIEW_PLANNER_VERSION:raise ValueError('Activation planner changed; create fresh previews and a new plan.')
     if store.config.multi_source_mode!='active':raise ValueError('Protected configuration must explicitly enable active mode.')
     if plan.get('activation_guard',digest(''))!=digest(store._setting('source_activation_incomplete','')):
         raise ValueError('Activation attempt changed; create a fresh retry plan.')

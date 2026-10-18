@@ -75,12 +75,13 @@ class SourceMonitoringTests(unittest.TestCase):
         db=sqlite3.connect(':memory:')
         try:
             from app.source_store import SOURCE_SCHEMA
+            from app.source_preview import SOURCE_PREVIEW_PLANNER_VERSION
             db.execute('CREATE TABLE settings(key TEXT,value TEXT)')
             db.executescript(SOURCE_SCHEMA)
             db.execute("INSERT INTO settings VALUES ('multi_source_mode','preview')")
             for sid,status,hashed in [('ready','ready','v1'),('failed','failed','v1'),('stale','ready','v0')]:
                 db.execute("INSERT INTO sources(id,kind,upstream_id,learner_id,payload,content_hash,status,fetched_at) VALUES (?,'announcement',?,'fictional','{}','v1','pending',?)",(sid,sid,stamp()))
-                db.execute('INSERT INTO source_previews VALUES (?,?,?,?,?,?,?)',(sid,sid,hashed,'{}',status,stamp(),None))
+                db.execute('INSERT INTO source_previews VALUES (?,?,?,?,?,?,?)',(sid,sid,hashed,json.dumps({'planner_version':SOURCE_PREVIEW_PLANNER_VERSION}),status,stamp(),None))
             tables={'settings','sources','source_health','action_sources','source_previews'}
             result=read_source_health(db,tables)['kinds']['announcement']
             self.assertEqual((result['pending'],result['failed'],result['preview_ready']),(1,1,1))
@@ -113,9 +114,9 @@ class SourceMonitoringTests(unittest.TestCase):
             self.assertNotIn('private',json.dumps(result))
             self.assertEqual(result['kinds']['announcement']['last_error'],'source_operation_failed')
             self.assertEqual(result['kinds']['announcement']['links'],1)
-            self.assertEqual(result['kinds']['announcement']['pending'],0)
-            self.assertEqual(result['kinds']['announcement']['preview_ready'],1)
-            self.assertEqual(result['preview_count'],1)
+            self.assertEqual(result['kinds']['announcement']['pending'],1)
+            self.assertEqual(result['kinds']['announcement']['preview_ready'],0)
+            self.assertEqual(result['preview_count'],0)
         finally: db.close()
 
 if __name__ == '__main__': unittest.main()
