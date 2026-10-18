@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))  # Operator-side configuration validation only; runtime uses -I/wheel.
@@ -107,15 +108,71 @@ def offline_env(home):
             'LIBRUS_CONFIG_FILE': '', 'HOME': str(home), 'LIBRUS_BACKUP_ENABLED': '0'}
 
 
-def package_probe(release):
+def package_probe(release, *, resources=RESOURCES, app_directory=None):
     python = release / '.venv/bin/python'
+    app_check = f'assert p == Path({str(app_directory)!r}); ' if app_directory else ''
     script = ('from pathlib import Path; import app; '
               'p=Path(app.__file__).resolve().parent; '
               f'assert p.is_relative_to(Path({str(release)!r})); '
-              f'assert all((p/n).is_file() for n in {RESOURCES!r}); '
+              + app_check +
+              f'assert all((p/n).is_file() for n in {resources!r}); '
               'import app.web, app.codex_runtime, app.monitoring; print("package-ok")')
     with tempfile.TemporaryDirectory(prefix='librus-package-probe-') as folder:
         command([python, '-I', '-c', script], cwd=folder)
+
+
+def relative_artifact(name):
+    """Manifest and wheel names must be unambiguous relative POSIX file paths."""
+    if not isinstance(name, str) or not name or '\\' in name or '\x00' in name:
+        raise ValueError()
+    path = Path(name)
+    if not path.parts or path.is_absolute() or '..' in path.parts or path.as_posix() != name:
+        raise ValueError()
+    return path
+
+
+def package_contract(release, manifest):
+    """Bind this release's installed app/resources to its hash-verified wheel.
+
+    Legacy manifests already record the wheel and every installed application file,
+    so their resource inventory can be recovered without consulting the new source.
+    """
+    artifacts = manifest['artifacts']
+    wheels = [name for name in artifacts
+              if re.fullmatch(r'artifacts/librus_calendar-[^/]+\.whl', name)]
+    roots = [str(Path(name).parent) for name in artifacts
+             if re.fullmatch(r'\.venv/lib/python\d+\.\d+/site-packages/app/__init__\.py', name)]
+    if len(wheels) != 1 or len(roots) != 1:
+        raise ValueError()
+    app_prefix = roots[0] + '/'
+    installed = {name.removeprefix(app_prefix): expected for name, expected in artifacts.items()
+                 if name.startswith(app_prefix)}
+    packaged = {}
+    seen = set()
+    with zipfile.ZipFile(release / wheels[0]) as wheel:
+        for member in wheel.infolist():
+            name = member.filename.removesuffix('/') if member.is_dir() else member.filename
+            relative_artifact(name)
+            if name in seen or stat.S_ISLNK(member.external_attr >> 16) or member.flag_bits & 1:
+                raise ValueError()
+            seen.add(name)
+            if not member.is_dir() and name.startswith('app/'):
+                packaged[name.removeprefix('app/')] = hashlib.sha256(wheel.read(member)).hexdigest()
+    if '__init__.py' not in packaged or packaged != installed:
+        raise ValueError()
+    resources = sorted(name for name in packaged
+                       if name.split('/')[0] in {'templates', 'static', 'schemas'})
+    if not resources:
+        raise ValueError()
+    if 'resources' in manifest:
+        declared = manifest['resources']
+        if not isinstance(declared, list):
+            raise ValueError()
+        for name in declared:
+            relative_artifact(name)
+        if sorted(declared) != resources:
+            raise ValueError()
+    return release / roots[0], tuple(resources)
 
 
 def validate_release(home, sha):
@@ -124,18 +181,21 @@ def validate_release(home, sha):
     safe_path(release / 'release.json', directory=False)
     try:
         manifest = json.loads((release / 'release.json').read_text())
-        if manifest['sha'] != sha or manifest['checks'] != ['offline_tests', 'source_privacy', 'package_probe']:
+        if (not isinstance(manifest, dict) or manifest['sha'] != sha
+                or manifest['checks'] != ['offline_tests', 'source_privacy', 'package_probe']
+                or not isinstance(manifest['artifacts'], dict) or not manifest['artifacts']):
             raise ValueError()
         for name, expected in manifest['artifacts'].items():
-            path = release / name
-            if Path(name).is_absolute() or '..' in Path(name).parts:
+            path = release / relative_artifact(name)
+            if not isinstance(expected, str) or not re.fullmatch(r'[0-9a-f]{64}', expected):
                 raise ValueError()
             safe_path(path, directory=False)
             if digest(path) != expected:
                 raise ValueError()
-    except (OSError, ValueError, KeyError, TypeError):
+        app_directory, resources = package_contract(release, manifest)
+    except (OSError, ValueError, KeyError, TypeError, zipfile.BadZipFile, NotImplementedError):
         raise DeploymentError('Release manifest or artifact verification failed.') from None
-    package_probe(release)
+    package_probe(release, resources=resources, app_directory=app_directory)
     return release
 
 
@@ -145,6 +205,7 @@ def prepare(root, home, sha, python=sys.executable):
     safe_path(destination)
     if destination.exists():
         validate_release(home, sha)
+        package_probe(destination)  # Reuse still enforces this source's required resources.
         return destination
     # Privacy history is checked from the source repository, not from an unversioned archive.
     command([python, root / 'scripts/check_public_tree.py', '--working-tree', '--all-history'], cwd=root)
@@ -185,6 +246,8 @@ def prepare(root, home, sha, python=sys.executable):
                             artifacts[path.relative_to(destination).as_posix()] = digest(path)
             manifest = {'sha': sha, 'checks': ['offline_tests', 'source_privacy', 'package_probe'],
                         'artifacts': artifacts, 'backup_policy': 'disabled'}
+            _, resources = package_contract(destination, manifest)
+            manifest['resources'] = list(resources)
             (destination / 'release.json').write_text(json.dumps(manifest, sort_keys=True) + '\n')
         except BaseException:
             shutil.rmtree(destination)
@@ -339,6 +402,7 @@ def stop_if_loaded(unit):
 
 def activate(home, sha, *, migrate=False, no_sync=False):
     release = validate_release(home, sha)
+    package_probe(release)  # The target must also satisfy this source checkout's contract.
     preflight_units(home, release, migrate)
     preflight_runtime_config(home)
     preflight_effective_units(home)
