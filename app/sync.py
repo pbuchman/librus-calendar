@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 from .core import AppStore, WARSAW, analysis_metadata, as_datetime, utcnow
 from .health_state import ERROR_CODES, error_code
+from .source_preview import current_preview_sql
 
 
 def safe_error(error):
@@ -279,7 +280,7 @@ class SyncController:
                 # The alarm can arrive after the planner's transaction commits
                 # but before control returns here. Never downgrade durable work.
                 with self.store.lock:
-                    completed=self.store.db.execute("SELECT 1 FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE s.id=? AND s.content_hash=? AND p.status='ready' AND s.deleted=0",
+                    completed=self.store.db.execute(f"SELECT 1 FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE s.id=? AND s.content_hash=? AND p.status='ready' AND s.deleted=0 AND ({current_preview_sql()})",
                         (budget.source['id'],budget.source['content_hash'])).fetchone()
                     if not completed:
                         self.store.fail_source(budget.source['id'],code=error.code,preview=True)

@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from dataclasses import replace
 from urllib.parse import urlsplit
 from .config import AppConfig, ConfigurationError, load_config
+from .source_preview import preview_is_current
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -264,6 +265,10 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
         return kind
 
     def present_preview(item):
+        if item.get('status') in ('ready','failed') and not preview_is_current(item):
+            item={**item,'status':'stale','planner_current':False}
+        if item.get('status')!='ready':
+            return {**item,'planned_outcomes':[],'plan_available':False}
         results = []
         for outcome in item.get('outcomes') or []:
             action = outcome.get('action') or {}
@@ -283,7 +288,7 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
             previews = store.list_source_previews(limit=500, offset=offset, status='ready')
             for item in previews:
                 source = selected.get(item['source_id'])
-                if source and source.get('content_hash') and item.get('source_hash') == source['content_hash']:
+                if source and source.get('content_hash') and item.get('source_hash') == source['content_hash'] and item.get('status')=='ready' and preview_is_current(item):
                     found[source['id']] = present_preview(item)
                     selected.pop(source['id'])
             if len(previews) < 500:

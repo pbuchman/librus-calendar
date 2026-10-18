@@ -13,6 +13,8 @@ import uuid
 
 from .core import WARSAW, as_datetime, digest, normalize_proposal, utcnow
 from .source_store import normalized_text, source_message, authority_links, CORROBORATION_RELATION, EXPIRED_FACT_RELATION, CLOSED_OFFER_RELATION
+from .source_matching import _hard_match_decision
+from .source_preview import current_preview_sql
 
 
 def _literal(quote,text):
@@ -194,28 +196,6 @@ def verified_match(source,item,candidates,result):
     return (None,reason)if reason else(action,'match')
 
 
-def _hard_match_decision(item,old):
-    """Typed safety boundaries apply to BOTH lexical and semantic proof."""
-    ai,bi=item.get('action_identity') or {},old.get('action_identity') or {}
-    if ai and bi and ai.get('action_type')!=bi.get('action_type'):
-        return 'distinct'
-    if item.get('temporal_kind','event')!=old.get('temporal_kind','event'):
-        return 'distinct'
-    if item.get('closed_offer_research'):
-        from .core import start_key
-        if start_key(item)!=start_key(old):return 'distinct'
-    a_recipient,b_recipient=item.get('recipient') or {},old.get('recipient') or {}
-    for scope,key in (('class','class_id'),('learner','learner_id')):
-        if (a_recipient.get('scope')==b_recipient.get('scope')==scope
-                and a_recipient.get(key) and b_recipient.get(key)
-                and a_recipient[key]!=b_recipient[key]):
-            return 'distinct'
-    # Alternative time choices are separate candidate actions, even for one offer.
-    if item.get('alternative_group') and old.get('alternative_group') and item.get('start')!=old.get('start'):
-        return 'distinct'
-    return None
-
-
 def verified_semantic_match(source,item,candidates,result):
     """Validate independent semantic confirmation against ORIGINAL quotes."""
     if (not isinstance(result,dict)or result.get('decision')!='match'
@@ -338,7 +318,7 @@ class SourcePlanner:
             self.runtime.reserve_source_plan(sum(item['kind']!='ignore'for item in prepared))
         virtual=[]
         if preview:
-            for row in self.store.db.execute("SELECT p.payload FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE p.status='ready' AND p.source_id<>? ORDER BY p.created_at",(source['id'],)):
+            for row in self.store.db.execute(f"SELECT p.payload FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE p.status='ready' AND s.deleted=0 AND ({current_preview_sql()}) AND p.source_id<>? ORDER BY p.created_at",(source['id'],)):
                 virtual.extend(x['action'] for x in json.loads(row[0]).get('outcomes',[]) if isinstance(x.get('action'),dict))
         matches=[];recovery_cache={}
         for item_index,item in enumerate(prepared):

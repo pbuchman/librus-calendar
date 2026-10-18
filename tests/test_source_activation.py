@@ -8,6 +8,7 @@ from unittest.mock import patch
 from app.core import AppStore
 from app.source_admin import activate_sources
 from app.source_planner import SourcePlanner
+from app.health_state import read_connection_state
 from app.sync import SyncController
 import test_source_planner as fixtures
 
@@ -74,6 +75,80 @@ class ActivationAttemptTests(unittest.TestCase):
         self.assertEqual(self.store._setting('source_activation_plan'),result['plan_fingerprint'])
         self.assertEqual(self.store._setting('source_activation_class'),fixtures.LEARNER['class_id'])
         self.assertEqual(len(self.store.queue_operations(fixtures.NOW)),1)
+
+    def test_planner_upgrade_refreshes_only_exact_incomplete_selection_and_retry_completes(self):
+        ordinary_row=fixtures.source('ordinary-analyzed')
+        ordinary=self.ingest(ordinary_row)
+        SourcePlanner(self.store,fixtures.Runtime()).analyze(ordinary,fixtures.NOW)
+        operation=self.store.queue_operations(fixtures.NOW)[0]
+        with self.store.db:
+            self.store.db.execute("UPDATE operations SET status='unknown',attempts=1 WHERE id=?",(operation['operation_id'],))
+        self.prepare();self.rows.append(ordinary_row);self.fail_second();self.reopen()
+        marker=self.store._setting('source_activation_incomplete')
+        selected={item['id'] for item in json.loads(marker)['sources']}
+        self.store.config=replace(self.store.config,multi_source_mode='preview')
+        self.store.set_setting('multi_source_mode','preview')
+        with self.store.db:
+            self.store.db.execute("UPDATE source_previews SET payload='{}'")
+        before={table:[tuple(row)for row in self.store.db.execute('SELECT * FROM '+table+' ORDER BY 1')]
+                for table in ('proposals','operations','events','decision_intents','canonical_actions','action_sources')}
+        self.assertEqual({item['id']for item in self.store.pending_sources(preview=True)},selected)
+        self.assertEqual(self.store.source_status()['preview_pending'],2)
+        self.assertEqual(read_connection_state(self.store.db,fixtures.NOW)['sources']['kinds']['announcement']['pending'],2)
+        activated=next(item for item in self.store.pending_sources(preview=True)if item['status']=='analyzed')
+        self.store.fail_source(activated['id'],preview=True)
+        self.assertEqual({item['id']for item in self.store.pending_sources(preview=True)},selected)
+        for item in self.store.pending_sources(preview=True):
+            SourcePlanner(self.store,fixtures.Runtime()).analyze(item,fixtures.NOW,preview=True)
+        self.assertEqual(self.store.pending_sources(preview=True),[])
+        self.assertEqual(before,{table:[tuple(row)for row in self.store.db.execute('SELECT * FROM '+table+' ORDER BY 1')]
+                                 for table in before})
+        self.assertEqual(self.store._setting('source_activation_incomplete'),marker)
+        retry=self.path.parent/'version-retry.json'
+        activate_sources(self.store,fixtures.Runtime(),plan_path=retry,current=fixtures.NOW)
+        self.assertEqual({item['id']for item in json.loads(retry.read_text())['sources']},selected)
+        self.store.config=replace(self.store.config,multi_source_mode='active')
+        result=activate_sources(self.store,fixtures.Runtime(),plan_path=retry,apply=True,current=fixtures.NOW,client_factory=self.factory)
+        self.assertEqual(result['sources'],2)
+        self.assertFalse(self.store._setting('source_activation_incomplete',''))
+
+    def test_retry_refresh_requires_valid_attempt_current_hash_context_and_existing_receipt(self):
+        self.prepare();self.fail_second()
+        self.store.config=replace(self.store.config,multi_source_mode='preview')
+        marker=self.store._setting('source_activation_incomplete')
+        attempt=json.loads(marker)
+        analyzed=next(item for item in self.store.list_sources()if item['status']=='analyzed')
+        with self.store.db:self.store.db.execute("UPDATE source_previews SET payload='{}'")
+        def queued_analyzed():
+            return [item for item in self.store.pending_sources(preview=True)if item['status']=='analyzed']
+        self.assertEqual(len(queued_analyzed()),1)
+        for value in ('not json','[]',json.dumps({'token':'x','plan':'x','sources':[]}),
+                      json.dumps(dict(attempt,sources=attempt['sources']+[attempt['sources'][0]])),
+                      json.dumps(dict(attempt,sources=[dict(item,hash='changed')for item in attempt['sources']]))):
+            with self.subTest(marker=value):
+                self.store.set_setting('source_activation_incomplete',value)
+                self.assertEqual(queued_analyzed(),[])
+        self.store.set_setting('source_activation_incomplete',marker)
+        self.store.set_setting('source_learner_verified','false')
+        self.assertEqual(queued_analyzed(),[])
+        self.store.set_setting('source_learner_verified','true')
+        self.store.set_setting('source_learner_context',json.dumps(dict(fixtures.LEARNER,id='different-learner')))
+        self.assertEqual(queued_analyzed(),[])
+        self.store.set_setting('source_learner_context',json.dumps(dict(fixtures.LEARNER,class_id=['not-a-class-id'])))
+        self.assertEqual(queued_analyzed(),[])
+        self.store.set_setting('source_learner_context',json.dumps(fixtures.LEARNER))
+        with self.store.db:self.store.db.execute('DELETE FROM source_previews WHERE source_id=?',(analyzed['id'],))
+        self.assertEqual(queued_analyzed(),[])
+
+    def test_changed_current_ready_version_cannot_replace_failed_selection_hash(self):
+        self.prepare();self.fail_second()
+        self.store.config=replace(self.store.config,multi_source_mode='preview')
+        selected=json.loads(self.store._setting('source_activation_incomplete'))['sources'][0]
+        with self.store.db:
+            self.store.db.execute('UPDATE sources SET content_hash=? WHERE id=?',('changed-current-version',selected['id']))
+        self.store.save_source_preview(selected['id'],[])
+        with self.assertRaisesRegex(ValueError,'incomplete activation source'):
+            activate_sources(self.store,fixtures.Runtime(),plan_path=self.path.parent/'changed-retry.json',current=fixtures.NOW)
 
     def test_pending_claim_is_deferred_without_rewriting_operation_or_intent(self):
         src=self.ingest(fixtures.source('existing'))

@@ -278,7 +278,8 @@ class SourcesTests(unittest.TestCase):
         self.assertEqual(self.store.list_proposals(),[])
     def test_activation_fresh_analysis_ignores_poisoned_preview(self):
         src=self.ingest(mode='preview');SourcePlanner(self.store,Runtime()).analyze(src,NOW,preview=True)
-        with self.store.db:self.store.db.execute("UPDATE source_previews SET payload=?",(json.dumps({'proposals':[{'title':'poisoned preview'}]}),))
+        from app.source_preview import SOURCE_PREVIEW_PLANNER_VERSION
+        with self.store.db:self.store.db.execute("UPDATE source_previews SET payload=?",(json.dumps({'planner_version':SOURCE_PREVIEW_PLANNER_VERSION,'proposals':[{'title':'poisoned preview'}]}),))
         plan=self.path.parent/'activation.json';activate_sources(self.store,Runtime(),plan_path=plan)
         self.store.config=replace(self.store.config,multi_source_mode='active');rt=Runtime()
         result=activate_sources(self.store,rt,plan_path=plan,apply=True,current=NOW,client_factory=lambda:type('Client',(),{'collect_sources':lambda *a,**kw:{'sources':[source()],'learner':LEARNER,'complete_kinds':KINDS,'status':'ok'}})())
