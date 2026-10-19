@@ -340,6 +340,28 @@ def _prepare_item(store, snapshot, item, plan_id, index, current):
     if item['operation'] in ('link', 'ignore'):
         item['proposal_id'] = entry['proposal_id'] if entry else None
         return item, None
+    if entry and item['operation'] == 'review' and item['review_change'] == 'cancel':
+        row = store.db.execute('SELECT * FROM proposals WHERE id=?', (entry['proposal_id'],)).fetchone()
+        approved = store._proposal(row) if row else {}
+        active = [event for event in entry['calendar'] if event['state'] == 'active']
+        uncertain = store.db.execute("SELECT 1 FROM operations o JOIN proposals p ON p.id=o.proposal_id WHERE (p.id=? OR json_extract(p.payload,'$.canonical_action_id')=?) AND o.status IN ('unknown','inflight') LIMIT 1",
+                                     (entry['proposal_id'], entry['id'])).fetchone()
+        # A cancellation's executable intent is its exact owned target. Model
+        # prose cannot revoke an unchanged, explicitly confirmed pending intent.
+        if (approved.get('status') == 'pending' and approved.get('kind') == 'cancel'
+                and approved.get('user_approved') and approved.get('deletion_approved')
+                and not item['candidate_action_ids'] and not item['new_offer_key']
+                and item['offer_group_id'] == approved.get('alternative_group_id')
+                and sorted(approved.get('agenda_sources', []), key=lambda ref: ref['source_id'])
+                    == sorted(item['sources'], key=lambda ref: ref['source_id'])
+                and len(active) == 1 and active[0]['id'] == approved.get('event_id')
+                and not active[0]['externally_changed'] and not uncertain
+                and not store._source_write_reason(approved)
+                and not store._group_write_reason(approved['id'])):
+            item.update(operation='link', action=None, review_change=None,
+                        proposal_id=approved['id'], status='pending',
+                        reason='Unchanged approved pending cancellation retained.')
+            return item, None
     reason = item['reason']
     if item['operation'] == 'update' and entry and (_protected(entry) or any(event['externally_changed'] for event in entry['calendar'])):
         item.update(operation='review', review_change='update')
@@ -546,7 +568,12 @@ def checkpoint_before_result(store, calendar, current):
 def checkpoint_after_result(store, calendar, current, advance, result):
     if calendar is None or result.get('status') != 'applied':
         return
-    calendar[result['event_id']] = result['snapshot']
+    # Fresh reads cover active entries only. A settled cancellation must use
+    # that same absence representation when advancing the own-write baseline.
+    if result['snapshot'].get('status') == 'cancelled':
+        calendar.pop(result['event_id'], None)
+    else:
+        calendar[result['event_id']] = result['snapshot']
     if advance:
         snapshot = assemble_agenda_snapshot(store, calendar, current=current, owner_email=store.config.calendar_owner, enforce_budget=False)
         store.db.execute("INSERT OR REPLACE INTO settings VALUES ('agenda_baseline_hash',?)", (snapshot['snapshot_hash'],))
