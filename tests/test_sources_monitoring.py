@@ -97,6 +97,31 @@ class SourceMonitoringTests(unittest.TestCase):
             self.assertEqual((result['pending'],result['failed'],result['preview_ready']),(3,0,None))
         finally: db.close()
 
+    def test_simple_agenda_ignores_legacy_preview_mode_and_exports_safe_failures(self):
+        from app.source_store import SOURCE_SCHEMA
+        from app.health_state import read_agenda_health
+        db=sqlite3.connect(':memory:')
+        try:
+            db.execute('CREATE TABLE settings(key TEXT,value TEXT)')
+            db.executescript(SOURCE_SCHEMA)
+            db.executemany('INSERT INTO settings VALUES (?,?)', [('agenda_engine','simple-agenda'),('multi_source_mode','preview')])
+            db.execute("INSERT INTO sources(id,kind,upstream_id,learner_id,payload,content_hash,status,fetched_at) VALUES ('private_source','announcement','private_upstream','private_learner','private_body','hash','failed',?)",(stamp(),))
+            db.execute("INSERT INTO agenda_plans VALUES ('private_plan','private_hash','private_payload','private_metadata','failed',?,'agenda_context_overflow')",(stamp(),))
+            tables={'settings','sources','source_health','action_sources','source_previews','agenda_plans'}
+            source=read_source_health(db,tables)
+            self.assertEqual(source['engine'],'simple-agenda')
+            self.assertEqual(source['mode'],'active')
+            self.assertEqual(source['preview_count'],0)
+            self.assertEqual(source['kinds']['announcement']['failed'],1)
+            self.assertEqual(source['kinds']['announcement']['preview_ready'],0)
+            data=state();data['sources']=source;data['agenda']=read_agenda_health(db,tables)
+            clean=sanitize_state(data,NOW)
+            self.assertNotIn('private',json.dumps(clean))
+            self.assertEqual(clean['agenda']['latest_plan']['error_code'],'agenda_context_overflow')
+            sample=snapshot();sample['state']=clean
+            self.assertEqual(load_collector().HealthMetrics().calculate(sample,NOW.timestamp())['source_announcement_mode'],2)
+        finally: db.close()
+
     def test_reader_selects_only_aggregates_and_maps_private_error(self):
         db=sqlite3.connect(':memory:')
         try:

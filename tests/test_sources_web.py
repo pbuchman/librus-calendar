@@ -38,6 +38,19 @@ class SourceStore(FakeStore):
         return [dict(id='preview',source_id='s1',source_hash='current-hash',status='ready',planner_version=SOURCE_PREVIEW_PLANNER_VERSION,outcomes=outcomes,
             proposals=[dict(title='Nieaktualny wynik ekstrakcji')])][offset:offset+limit]
 
+    def latest_agenda_plan(self, preview=False):
+        if not preview:
+            return None
+        return dict(id='whole-plan',status='preview',created_at='2030-03-06T10:00:00+01:00',error_code=None,
+                    metadata={'source_collection_at':'2030-03-05T10:00:00+01:00'},
+                    payload={'decision_reason':'Jeden plan <script>plan</script>', 'items':[
+                        {'operation':'create','action_id':None,'action':{'title':'Fikcyjny podgląd','start':'2030-03-11','optional':True},
+                         'reason':'Nowa czynność <script>private</script>','sources':[{'source_id':'s0'},{'source_id':'s1'}]},
+                        {'operation':'update','action_id':'a2','action':{'title':'Istniejące spotkanie','start':'2030-03-09T11:00:00+01:00'},
+                         'reason':'Nowy termin wymaga sprawdzenia','sources':[{'source_id':'s1'}]}]})
+    def agenda_status(self):
+        return {'engine':'simple-agenda','latest_plan':None,'latest_preview':{'status':'preview'}}
+
 
 class SourcesWebTests(unittest.TestCase):
     def setUp(self):
@@ -59,8 +72,8 @@ class SourcesWebTests(unittest.TestCase):
         page = self.client.get('/sources/s1')
         self.assertEqual(page.status_code,200)
         self.assertIn('&lt;script&gt;private',page.text)
-        self.assertIn('Podgląd gotowy',page.text)
-        self.assertIn('Zachowano wcześniejsze odrzucenie',page.text)
+        self.assertIn('Powiązano ten sam obowiązek.',page.text)
+        self.assertNotIn('Podgląd gotowy',page.text)
         self.assertIn('Załącznik nieanalizowany',page.text)
         self.assertIn('/actions/a1',page.text)
         action = self.client.get('/actions/a1')
@@ -80,45 +93,38 @@ class SourcesWebTests(unittest.TestCase):
         self.assertEqual(page.status_code,200)
         self.assertIn('Podgląd — bez zapisu do kalendarza',page.text)
         self.assertIn('Fikcyjny podgląd',page.text)
-        self.assertIn('Pewność: niska · wydarzenie szkolne',page.text)
+        self.assertIn('Opcjonalne przypomnienie',page.text)
         self.assertNotIn('Zatwierdź termin',page.text)
         self.assertNotIn('<form',page.text)
-        self.assertNotIn('action="/proposals/',page.text)
-        self.assertEqual(self.client.get('/api/source-previews').json()['items'][0]['status'],'ready')
-        self.assertEqual(self.store.decisions,[])
-        self.assertIn('Podgląd: Powiązano',page.text)
-        self.assertIn('Podgląd: Pominięto',page.text)
-        self.assertIn('Zachowana decyzja rodzica: odrzucono',page.text)
-        self.assertIn('Planowana różnica wobec obecnego działania',page.text)
+        self.assertIn('nie potwierdza obecnej aktualności',page.text)
+        self.assertIn('05.03.2030, 10:00',page.text)
+        self.assertIn('Proponowana zmiana wobec obecnego działania',page.text)
         self.assertIn('09.03.2030, 11:00',page.text)
         self.assertIn('/actions/a2',page.text)
-        self.assertNotIn('/actions/virtual-demo',page.text)
-        self.assertNotIn('Nieaktualny wynik ekstrakcji',page.text)
-    def test_current_ready_preview_overrides_old_analysis_failure_but_stale_preview_does_not(self):
-        self.store.items[1].update(status='failed',outcome='analysis_incomplete',reason='Old extraction failure')
-        current=self.client.get('/sources/s1').text
-        self.assertIn('Podgląd gotowy',current)
-        self.assertNotIn('Old extraction failure',current)
-        self.store.items[1]['content_hash']='new-version'
-        stale=self.client.get('/sources/s1').text
-        self.assertIn('Analiza niepełna',stale)
-        self.assertIn('Old extraction failure',stale)
-        self.assertNotIn('Zachowano wcześniejsze odrzucenie',stale)
+        self.assertIn('/sources/s0',page.text)
+        self.assertIn('/sources/s1',page.text)
+        self.assertIn('&lt;script&gt;plan',page.text)
+        self.assertNotIn('<script>',page.text)
+        self.assertEqual(self.store.decisions,[])
+        history=self.client.get('/api/source-previews').json()
+        self.assertTrue(history['historical'])
+        self.assertEqual(history['engine'],'legacy-source-planner')
+        self.assertEqual(self.client.get('/api/agenda').json()['engine'],'simple-agenda')
 
-    def test_old_planner_preview_is_visible_as_stale_without_its_outcomes(self):
-        original=self.store.list_source_previews
-        def old_preview(*args,**kwargs):
-            return [{**item,'planner_version':'older-planner','status':'stale','planner_current':False} for item in original(*args,**kwargs)]
-        self.store.list_source_previews=old_preview
-        page=self.client.get('/preview')
-        self.assertIn('Nieaktualny podgląd',page.text)
-        self.assertIn('Podgląd wymaga ponownej analizy po aktualizacji',page.text)
-        self.assertNotIn('Fikcyjny podgląd',page.text)
-        self.assertNotIn('Zachowano wcześniejsze odrzucenie',page.text)
-        self.assertNotIn('Podgląd gotowy',self.client.get('/sources/s1').text)
-        item=self.client.get('/api/source-previews').json()['items'][0]
-        self.assertEqual(item['status'],'stale')
-        self.assertFalse(item['planner_current'])
+    def test_legacy_preview_does_not_override_current_source_failure(self):
+        self.store.items[1].update(status='failed',outcome='analysis_incomplete',reason='Current failure')
+        page=self.client.get('/sources/s1').text
+        self.assertIn('Analiza niepełna',page)
+        self.assertIn('Current failure',page)
+        self.assertNotIn('Podgląd gotowy',page)
+
+    def test_failed_whole_agenda_preview_hides_older_success(self):
+        original=self.store.latest_agenda_plan
+        self.store.latest_agenda_plan=lambda **kw:{**original(**kw),'status':'preview_failed','error_code':'agenda_context_overflow'}
+        page=self.client.get('/preview').text
+        self.assertIn('agenda_context_overflow',page)
+        self.assertIn('Wcześniejszy wynik nie jest bieżącym podglądem',page)
+        self.assertNotIn('Fikcyjny podgląd',page)
 
     def test_unknown_presentation_values_are_not_exposed_as_internal_enums(self):
         original=self.store.get_action
@@ -154,9 +160,47 @@ class SourcesWebTests(unittest.TestCase):
         self.assertEqual(orphan.status_code,200)
         self.assertNotIn('value="approve"',orphan.text)
 
+    def test_agenda_review_shows_all_sources_and_cached_existing_to_proposed_values(self):
+        original=self.store.get_action
+        def proposed_action(key):
+            item=original(key)
+            if item and key == 'a1':
+                item['payload']={'title':'Proponowany tytuł <script>unsafe</script>','start':'2030-03-09T11:00:00+01:00'}
+            return item
+        self.store.get_action=proposed_action
+        proposal=dict(id='review-update',message_id='m1',canonical_action_id='a1',event_id='existing-event',
+                      kind='update',title='Proponowany tytuł <script>unsafe</script>',status='review',
+                      review_reason='Nowy termin wymaga zgody.',source_quote='Pierwszy cytat',
+                      start='2030-03-09T11:00:00+01:00',end='2030-03-09T12:00:00+01:00',all_day=False,
+                      agenda_sources=[{'source_id':'s2'}])
+        self.store.list_proposals=lambda:[proposal]
+        self.store.list_events=lambda:[{'id':'existing-event','snapshot':{'summary':'Zatwierdzony tytuł',
+            'start':{'dateTime':'2030-03-08T10:00:00+01:00'},'end':{'dateTime':'2030-03-08T11:00:00+01:00'}}}]
+        page=self.client.get('/review').text
+        self.assertIn('/actions/a1',page)
+        for sid in ('s0','s1','s2'):
+            self.assertIn('/sources/'+sid,page)
+        self.assertIn('Zatwierdzony tytuł → Proponowany tytuł &lt;script&gt;unsafe',page)
+        self.assertIn('08.03.2030, 10:00 → 09.03.2030, 11:00',page)
+        self.assertIn('ostatnim zapisanym odczytem kalendarza',page)
+        self.assertNotIn('<script>',page)
+        self.assertIn('value="approve"',page)
+        self.assertIn('name="csrf"',page)
+        proposal['kind']='cancel'
+        cancel=self.client.get('/review').text
+        self.assertIn('Obecny zapis → po potwierdzeniu odwołania',cancel)
+        self.assertIn('Zatwierdzony tytuł → brak',cancel)
+        self.assertIn('08.03.2030, 10:00 → brak',cancel)
+        self.assertIn('value="confirm_cancel"',cancel)
+        self.assertNotIn('value="approve"',cancel)
+        self.store.list_events=lambda:[]
+        missing=self.client.get('/review').text
+        self.assertIn('Brak zapisanego stanu wpisu do porównania',missing)
+        self.assertNotIn('Zatwierdzony tytuł →',missing)
+
     def test_new_endpoints_require_owner(self):
         self.client.headers.pop('Tailscale-User-Login')
-        for path in ('/sources','/preview','/api/sources','/api/actions/a1','/api/source-previews'):
+        for path in ('/sources','/preview','/api/sources','/api/actions/a1','/api/source-previews','/api/agenda'):
             self.assertEqual(self.client.get(path).status_code,403)
 
 if __name__ == '__main__': unittest.main()

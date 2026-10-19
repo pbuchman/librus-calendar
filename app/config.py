@@ -31,6 +31,7 @@ class AppConfig:
     analysis_effort: str = 'high'
     tool_model: str = 'gpt-6.1-sol'
     tool_effort: str = 'high'
+    # Deprecated input accepted for existing installations; never selects an engine.
     multi_source_mode: str = 'off'
     learner_id: str = ''
     class_id: str = ''

@@ -9,7 +9,7 @@ import re
 import subprocess
 import tempfile
 from .config import ConfigurationError, load_config
-from .health_state import SOURCE_ERROR_CODES
+from .health_state import SOURCE_ERROR_CODES, ERROR_CODES
 from datetime import datetime, timezone
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -88,6 +88,29 @@ def sanitize_state(state, now):
             raise ValueError('invalid probe count')
         clean[name] = value
     clean['sources'] = sanitize_source_health(state.get('sources'), now)
+    clean['agenda'] = sanitize_agenda_health(state.get('agenda'), now)
+    return clean
+
+
+def sanitize_agenda_health(agenda, now):
+    if agenda is None:
+        return None
+    if not isinstance(agenda, dict) or agenda.get('engine') != 'simple-agenda':
+        raise ValueError('invalid agenda engine')
+    clean = {'engine': 'simple-agenda'}
+    for name, allowed in (('latest_plan', {'applied', 'failed'}),
+                          ('latest_preview', {'preview', 'preview_failed'})):
+        value = agenda.get(name)
+        if value is None:
+            clean[name] = None
+            continue
+        if not isinstance(value, dict) or value.get('status') not in allowed:
+            raise ValueError('invalid agenda status')
+        code = value.get('error_code')
+        if code is not None and code not in ERROR_CODES:
+            raise ValueError('invalid agenda code')
+        clean[name] = {'status': value['status'], 'created_at': timestamp(value.get('created_at'), now),
+                       'error_code': code}
     return clean
 
 
@@ -102,6 +125,8 @@ def sanitize_source_health(sources, now):
     if not isinstance(kinds, dict) or set(kinds) != expected:
         raise ValueError('invalid source kinds')
     clean = {'mode': sources['mode'], 'kinds': {}}
+    if sources.get('engine') == 'simple-agenda':
+        clean['engine'] = 'simple-agenda'
     count = sources.get('preview_count')
     if type(count) is not int or not 0 <= count <= 10**12:
         raise ValueError('invalid preview count')

@@ -9,7 +9,6 @@ from zoneinfo import ZoneInfo
 from dataclasses import replace
 from urllib.parse import urlsplit
 from .config import AppConfig, ConfigurationError, load_config
-from .source_preview import preview_is_current
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -37,6 +36,7 @@ SOURCE_LABELS = {
                  'enriched': 'Uzupełniono', 'retained': 'Zachowano powiązanie',
                  'corroborates_unverified_recipient': 'Potwierdzenie bez uprawnień do zmian; odbiorca niezweryfikowany',
                  'expired_unverified_fact': 'Historyczna informacja bez uprawnień; odbiorca niezweryfikowany',
+                 'agenda_plan': 'Wspólny plan agendy',
                  'retains_closed_offer_decision': 'Zachowano wcześniejszą decyzję; nowe źródło nie zatwierdza udziału'},
     'decision': {'approve': 'zatwierdzono', 'approved': 'zatwierdzono',
                  'reject': 'odrzucono', 'rejected': 'odrzucono', 'ignore': 'odrzucono',
@@ -200,6 +200,7 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
     def page(request, section='messages', selected=None, notice=None, extra=None):
         csrf = request.cookies.get(cookie_name) or secrets.token_urlsafe(32)
         next_sync = (clock().astimezone(WARSAW).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).isoformat()
+        events = store.list_events()
         groups = store.list_proposal_groups(current=clock())
         grouped_ids = {member['id'] for group in groups for member in group['members']}
         proposals = [item for item in store.list_proposals() if item['id'] not in grouped_ids]
@@ -213,6 +214,22 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
             membership = store.get_proposal_group_for_proposal(item['id'], current=clock()) if item.get('alternative_group') else None
             item['blocked_offer'] = bool(group_id or (item.get('alternative_group') and membership is None))
             item['blocked_offer_message_id'] = original['message_id'] if original else item.get('message_id')
+            if item['status'] == 'review' and item.get('canonical_action_id'):
+                event = next((event for event in events if event.get('id') == item.get('event_id')), None)
+                snapshot = (event or {}).get('snapshot') or {}
+                def boundary(value):
+                    return (value.get('dateTime') or value.get('date_time') or value.get('date')) if isinstance(value, dict) else value
+                previous = {'title': snapshot.get('summary') or snapshot.get('title'),
+                            'start': boundary(snapshot.get('start') or snapshot.get('start_time') or snapshot.get('start_date')),
+                            'end': boundary(snapshot.get('end') or snapshot.get('end_time') or snapshot.get('end_date')),
+                            'all_day': len(str(boundary(snapshot.get('start') or snapshot.get('start_time') or snapshot.get('start_date')) or '')) == 10,
+                            'description': snapshot.get('description')} if snapshot else {}
+                item['agenda_context'] = present_agenda_item(
+                    {'action_id': item['canonical_action_id'], 'action': {key: value for key, value in item.items() if key != 'agenda_context'},
+                     'sources': item.get('agenda_sources') or [], 'operation': item['kind'],
+                     'review_change': item['kind']}, previous=previous)
+                item['agenda_context']['has_baseline'] = bool(previous)
+
         selected_review_ids = {member['id'] for member in selected_reviews}
         status = store.status()
         grouped_review_count = sum(member['status'] == 'review' and member['id'] not in selected_review_ids
@@ -222,7 +239,7 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
         selected_groups = [group for group in groups if selected and group['message_id'] == selected['id']]
         context = {'next_sync': next_sync, 'request': request, 'csrf': csrf, 'section': section,
                    'status': status, 'review_count': review_count, 'messages': store.list_messages(),
-                   'events': store.list_events(), 'proposals': proposals, 'proposal_groups': open_groups,
+                   'events': events, 'proposals': proposals, 'proposal_groups': open_groups,
                    'selected_groups': selected_groups,
                    'has_review': bool(open_groups) or any(p['status'] == 'review' for p in proposals),
                    'selected': selected, 'notice': notice or request.query_params.get('notice'),
@@ -231,7 +248,7 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
                    'selected_proposals': [item for item in proposals if selected and item.get('message_id') == selected.get('id') and not item.get('selected_for_offer')]}
         context.update({'source_kinds': SOURCE_KINDS, 'source_outcomes': SOURCE_OUTCOMES,
                         'source_health': status.get('sources') or {}, 'selected_source': None,
-                        'selected_action': None, 'source_items': [], 'preview_items': []})
+                        'selected_action': None, 'source_items': [], 'agenda_preview': None})
         context.update(extra or {})
         response = templates.TemplateResponse(request=request, name='inbox.html', context=context)
         response.set_cookie(cookie_name, csrf, httponly=True, secure=not allow_local,
@@ -264,37 +281,23 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
             raise HTTPException(400, 'Nieprawidłowy rodzaj źródła.')
         return kind
 
-    def present_preview(item):
-        if item.get('status') in ('ready','failed') and not preview_is_current(item):
-            item={**item,'status':'stale','planner_current':False}
-        if item.get('status')!='ready':
-            return {**item,'planned_outcomes':[],'plan_available':False}
-        results = []
-        for outcome in item.get('outcomes') or []:
-            action = outcome.get('action') or {}
-            payload = action.get('payload') or {}
-            existing = store.get_action(outcome.get('action_id')) if outcome.get('action_id') else None
-            results.append({**outcome, 'action': action, 'payload': payload,
-                            'target_id': existing['id'] if existing else None,
-                            'retained_decision': retained_decision(action.get('decision')),
-                            'changes': preview_changes(existing.get('payload'), payload) if existing else []})
-        return {**item, 'planned_outcomes': results, 'plan_available': 'outcomes' in item}
+    def present_agenda_item(item, previous=None):
+        action = item.get('action') or {}
+        existing = store.get_action(item.get('action_id')) if item.get('action_id') else None
+        links = list(item.get('sources') or []) + list((existing or {}).get('source_links') or [])
+        source_ids = dict.fromkeys(link['source_id'] for link in links)
+        baseline = (existing or {}).get('payload') if previous is None else previous
+        change = item.get('review_change') or item.get('operation')
+        return {**item, 'action': action, 'existing': existing,
+                'sources': [store.get_source(key) for key in source_ids],
+                'changes': preview_changes(baseline, {} if change == 'cancel' else action)
+                if baseline and action and change in ('update', 'cancel') else []}
 
-    def with_source_previews(sources):
-        selected = {source['id']: source for source in sources}
-        found = {}
-        offset = 0
-        while selected:
-            previews = store.list_source_previews(limit=500, offset=offset, status='ready')
-            for item in previews:
-                source = selected.get(item['source_id'])
-                if source and source.get('content_hash') and item.get('source_hash') == source['content_hash'] and item.get('status')=='ready' and preview_is_current(item):
-                    found[source['id']] = present_preview(item)
-                    selected.pop(source['id'])
-            if len(previews) < 500:
-                break
-            offset += 500
-        return [{**source, 'current_preview': found.get(source['id'])} for source in sources]
+    def present_agenda(plan):
+        if not plan:
+            return None
+        return {**plan, 'planned_items': [present_agenda_item(item)
+                for item in (plan.get('payload') or {}).get('items') or []]}
 
     def sources_page(request, *, selected_source=None, selected_action=None):
         kind = source_kind(request.query_params.get('kind') or None)
@@ -305,11 +308,9 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
         if offset < 0:
             raise HTTPException(400, 'Nieprawidłowa strona.')
         items = store.list_sources(limit=51, offset=offset, kind=kind)
-        visible = with_source_previews(items[:50] + ([selected_source] if selected_source else []))
-        if selected_source:
-            selected_source = visible[-1]
+        visible = items[:50]
         return page(request, section='sources', extra={
-            'source_items': visible[:len(items[:50])], 'source_kind': kind, 'source_offset': offset,
+            'source_items': visible, 'source_kind': kind, 'source_offset': offset,
             'source_more': len(items) > 50, 'selected_source': selected_source,
             'selected_action': selected_action,
             'source_actions': [store.get_action(key) for key in (selected_source or {}).get('action_ids', [])]})
@@ -335,7 +336,7 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
 
     @application.get('/preview', response_class=HTMLResponse)
     def preview(request: Request):
-        return page(request, section='preview', extra={'preview_items': [present_preview(item) for item in store.list_source_previews(limit=100)]})
+        return page(request, section='preview', extra={'agenda_preview': present_agenda(store.latest_agenda_plan(preview=True)) if hasattr(store, 'latest_agenda_plan') else None})
 
     @application.get('/api/sources')
     def sources_api(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0),
@@ -351,10 +352,15 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
             raise HTTPException(404, 'Nie znaleziono działania.')
         return {**action, 'sources': [store.get_source(link['source_id']) for link in action.get('source_links', [])]}
 
+    @application.get('/api/agenda')
+    def agenda_api():
+        return {**store.agenda_status(), 'preview': store.latest_agenda_plan(preview=True)}
+
     @application.get('/api/source-previews')
     def source_previews_api(limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
         items = store.list_source_previews(limit=limit + 1, offset=offset)
-        return {'items': items[:limit], 'limit': limit, 'offset': offset,
+        return {'engine': 'legacy-source-planner', 'historical': True,
+                'items': items[:limit], 'limit': limit, 'offset': offset,
                 'next_offset': offset + limit if len(items) > limit else None}
 
     @application.get('/api/status')

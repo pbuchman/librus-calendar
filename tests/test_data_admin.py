@@ -257,8 +257,9 @@ class DataAdminTests(unittest.TestCase):
         raw = dict(original, start='2030-11-10T00:00:00', end='2030-11-11T00:00:00')
         hint = dict(raw, start={'dateTime':raw['start']}, end={'dateTime':raw['end']})
         runtime = ProjectionRuntime([hint], {eid:raw})
-        runtime.analyze = lambda source, events: (_ for _ in ()).throw(SyncInterrupted('sync_interrupted'))
-        first = RebuildController(self.store, FakeClient(), runtime).run(current=NOW)
+        client = FakeClient()
+        client.message = lambda mid: (_ for _ in ()).throw(SyncInterrupted('sync_interrupted'))
+        first = RebuildController(self.store, client, runtime).run(current=NOW)
         self.assertEqual(first['status'], 'interrupted')
         self.assertEqual(first['calendar_ambiguities'], 0)
         self.assertEqual(self.store.list_events()[0]['snapshot']['start'], original['start'])
@@ -359,7 +360,7 @@ class DataAdminTests(unittest.TestCase):
         client.fail_ids.clear()
         resumed = RebuildController(self.store, client, runtime).run(current=NOW)
         self.assertEqual(resumed['status'], 'rebuilt')
-        self.assertEqual(len(runtime.analyzed), 125)
+        self.assertEqual(runtime.analyzed, [])  # Rebuild no longer invokes any planner.
         client.messages = lambda **kwargs: ([], 100)
         self.assertEqual(RebuildController(self.store, client, runtime).run(current=NOW)['status'], 'partial')
         prior_completion = self.store._setting('rebuild_completed_at')
@@ -369,25 +370,28 @@ class DataAdminTests(unittest.TestCase):
     def test_interrupted_rebuild_over_100_resumes_without_reanalyzing_completed_sources(self):
         from app.sync import SyncInterrupted
         runtime = ReadRuntime(propose=False)
-        def interrupting(source, events):
-            runtime.analyzed.append(source['id'])
-            if len(runtime.analyzed) == 51:
-                raise SyncInterrupted('sync_interrupted')
-            return []
-        runtime.analyze = interrupting
         client = FakeClient(count=125)
+        original = client.message
+        fetched = []
+        def interrupting(mid):
+            fetched.append(mid)
+            if len(fetched) == 51:
+                raise SyncInterrupted('sync_interrupted')
+            return original(mid)
+        client.message = interrupting
         first = RebuildController(self.store, client, runtime).run(current=NOW)
         self.assertEqual(first['status'], 'interrupted')
-        self.assertEqual(first['analyzed'], 50)
+        self.assertEqual(first['fetched'], 50)
+        self.assertEqual(first['analyzed'], 0)
         self.assertEqual(self.store._setting('rebuild_status'), 'interrupted')
         self.assertIsNone(self.store._setting('rebuild_completed_at'))
-        completed = set(runtime.analyzed[:50])
-        runtime.analyzed.clear()
-        runtime.analyze = lambda source, events: runtime.analyzed.append(source['id']) or []
+        completed_ids = {row[0] for row in self.store.db.execute('SELECT id FROM messages WHERE payload_hash IS NOT NULL')}
+        client.message = original
         second = RebuildController(self.store, client, runtime).run(current=NOW)
         self.assertEqual(second['status'], 'rebuilt')
-        self.assertEqual(second['analyzed'], 75)
-        self.assertTrue(completed.isdisjoint(runtime.analyzed))
+        self.assertEqual(second['analyzed'], 0)
+        self.assertTrue(completed_ids.issubset({row[0] for row in self.store.db.execute('SELECT id FROM messages')}))
+        self.assertEqual(self.store.status()['messages'], 125)
         self.assertIsNotNone(self.store._setting('rebuild_completed_at'))
         self.assertEqual(runtime.executed, [])
 
@@ -416,6 +420,8 @@ class DataAdminTests(unittest.TestCase):
         result = RebuildController(self.store, FakeClient(count=2), runtime).run(current=NOW)
         self.assertEqual(result['status'], 'review')
         self.assertEqual(result['calendar_blocking_ambiguities'], 0)
+        self.assertEqual(runtime.analyzed, [])
+        self.store.save_proposals('1', [proposal(kind='update', event_id='event-0', needs_review=True)], NOW)
         pending_change = next(item for item in self.store.list_proposals('review') if item['kind'] == 'update')
         self.assertEqual(self.store.queue_operations(NOW), [])
         self.store.resolve_proposal(pending_change['id'], 'approve')
@@ -485,7 +491,8 @@ class DataAdminTests(unittest.TestCase):
         runtime = CodexRuntime(TEST_CONFIG)
         runtime.probe = lambda: {'calendar_id':TEST_CONFIG.calendar_id, 'access_role':'owner'}
         calls = []
-        responses = iter((RuntimeFailure('codex_timeout'), {'event':original}, {'event':original}, RuntimeFailure('codex_timeout', possible_write=True)))
+        responses = iter([RuntimeFailure('codex_timeout')] + [{'event':original}] * 5 + [RuntimeFailure('codex_timeout', possible_write=True)])
+        runtime.plan_agenda = lambda snapshot: {'snapshot_hash':snapshot['snapshot_hash'],'decision_reason':'Fictional unchanged agenda.','items':[]}
         def tool(name, args):
             calls.append(name)
             result = next(responses)

@@ -56,7 +56,7 @@ release_python="$HOME/.local/lib/librus-calendar/releases/FULL_SHA/.venv/bin/pyt
 "$release_python" -I -m app.cli sync --dry-run
 ```
 
-The probe is a **real calendar read** and checks access to the configured calendar. Dry-run can fetch private Librus messages and send them to the analysis service; it skips writes. It is not offline. Inspect the local pending proposals and review queue before resuming writes. An automatic update or cancellation of an event governed by a prior human approval, edit or rejection requires fresh approval of that change, including after reconstruction. Cancellation still requires explicit confirmation. New state starts with writes paused. After checking your account, source messages, dates, model and connector behavior:
+The probe is a **real calendar read** and checks access to the configured calendar. Dry-run uses the last complete stored Librus collection and a fresh Calendar read; supplied text goes to the configured planning service. It does not refresh Librus sources. Inspect the local pending proposals and review queue before resuming writes. An automatic update or cancellation of an event governed by a prior human approval, edit or rejection requires fresh approval of that change, including after reconstruction. Cancellation still requires explicit confirmation. New state starts with writes paused. After checking your account, source messages, dates, model and connector behavior:
 
 ```sh
 "$release_python" -I -m app.cli pause-writes --resume
@@ -85,7 +85,7 @@ Private production files remain under `$HOME/.config/librus-calendar` and `$HOME
 
 Activation first stops the sync timer and refuses to switch while a sync worker is running; it never terminates a calendar writer. Retry after the worker completes. Then it installs known units, switches `current`, and enables web, hourly sync and minute monitoring. The sync timer uses Europe/Warsaw, is persistent and limits each worker to 45 minutes. Every deployment validates the prepared package before stopping services.
 
-For an explicitly planned migration from the exact known legacy units, build and validate the new private target state first, then run:
+For an explicitly planned migration from the exact known legacy units, preserve and validate the existing private state first, then run:
 
 ```sh
 .venv/bin/python scripts/deploy.py activate --sha FULL_SHA --migrate-legacy --no-sync
@@ -122,119 +122,26 @@ Probe audit rows contain technical metadata only: sync run/attempt identity, tim
 
 The retry policy covers this initial read probe only. It does not directly retry create/update/delete calls. When a write outcome is uncertain, retain the journal and use read-only reconciliation before any later decision to execute work.
 
-## Isolated development and evaluation
+## Single-agenda operation
 
-The UI fixture uses temporary synthetic state and no accounts. Real-message evaluation requires an explicit private evaluation config and cases file outside Git:
-
-```sh
-.venv/bin/python -m scripts.evaluate_analysis --config PRIVATE_EVAL_CONFIG PRIVATE_CASES_JSON
-```
-
-Evaluation does not discover production config, opens no state DB, invokes an explicitly read-only runtime, and emits a bounded report without message bodies, quotes, titles or model free text. Real analysis still sends supplied messages to the configured AI service. For other real-data development, select a separate private state path and port, use read-only calendar runtime permissions, and never point developer commands at production state. Offline tests and preparation isolate HOME and configuration; they must not access live Librus, credentials or calendar APIs.
-
-## Diagnose and recover
-
-Check installed package status through `$HOME/.local/lib/librus-calendar/current/.venv/bin/python -I -m app.cli status`, user service status/timers, private logs and the read-only monitoring aggregates. Redact private identifiers before sharing. Full success, attempts, pending queues and unknown operations have different meanings; a completed timer does not prove successful synchronization.
-
-Calendar results require verified evidence of the exact authorized MCP tool and arguments, whether the host uses ordinary MCP or code-mode transport; a model's own success statement is insufficient.
-
-Prefer forward recovery: stop new scheduled runs, let a writer finish, preserve the current DB and operation journal, prepare a reviewed fix SHA, and activate/verify it. A compatible prior packaged release can be selected only after checking it supports the current schema/journal: check out that reviewed previous SHA cleanly and use `activate --sha PREVIOUS_FULL_SHA`. Do not roll SQLite backward or create a safety backup automatically. Database rollback can discard idempotency evidence after external calendar writes. Keep writes paused until unknown outcomes are reconciled.
-
-## Decision migration, reconstruction and retention
-
-Quiesce the old sync timer and let its worker finish before changing state. Use the prepared release Python before switching `current`; the target must be distinct from the old database. Configure the target private state path and keep writes paused:
+Normal `sync` collects all required source kinds and reads current owned Calendar state before planning. Collection failure is not an empty successful source list. The selected learner/class must stay verified. The configured planner is `gpt-6.1-sol/high`; no per-source extractor/matcher/verifier chain or activation receipt is used.
 
 ```sh
-release_python="$HOME/.local/lib/librus-calendar/releases/FULL_SHA/.venv/bin/python"
-"$release_python" -I -m app.cli --config "$HOME/.config/librus-calendar/config.json" --state "$HOME/.local/share/librus-calendar/current.sqlite3" pause-writes
-"$release_python" -I -m app.cli --config "$HOME/.config/librus-calendar/config.json" --state "$HOME/.local/share/librus-calendar/current.sqlite3" migrate-decisions --from "$HOME/.local/share/librus-calendar/state.sqlite3"
-"$release_python" -I -m app.cli --config "$HOME/.config/librus-calendar/config.json" --state "$HOME/.local/share/librus-calendar/current.sqlite3" rebuild --days 30
-"$release_python" -I -m app.cli --config "$HOME/.config/librus-calendar/config.json" --state "$HOME/.local/share/librus-calendar/current.sqlite3" prune --days 30
+release_python="$HOME/.local/lib/librus-calendar/current/.venv/bin/python"
+"$release_python" -I -m app.cli status
+"$release_python" -I -m app.cli agenda-preview
 ```
 
-Migration reads the old database directly with read-only SQLite and creates no copy/export. It requires matching bound calendar/owner and Librus account identity. Only for an explicitly reviewed unbound legacy source, append `--allow-legacy-binding`: the CLI first performs a read-only owner-access calendar probe and requires every transferred event's exact calendar to match. Arbitrary unbound sources are refused.
+`agenda-preview` and `sync --dry-run` use the last complete successful stored collection and fresh read-only Calendar state. They do not log into Librus or refresh sources. If no complete collection exists they fail visibly. They save only an isolated preview, not active decisions, groups, operations or Calendar mutations. Inspect `/preview` privately; it records when sources were collected. A normal sync can reuse an exact unchanged preview only after checking current source, agenda, Calendar and decision state. Normal CLI output contains aggregates, not plan text.
 
-Migration retains minimal human approval/edit/rejection choices, exact event IDs and ownership markers, conflict fingerprints, cancellation tombstones and unresolved operation evidence. It does not copy message bodies or bulk analysis history. Existing chosen event associations are not discarded. Inflight writes become unknown; preserve their original intent for reconciliation.
+The private web API keeps `/api/messages`, `/api/proposals`, `/api/proposal-groups` and paginated `/api/sources`. `/api/actions/{id}` shows a shared action and all supporting sources. `/api/agenda` returns separate latest active-plan/preview metadata and the stored whole preview. `/api/source-previews` remains read-only historical data labeled `legacy-source-planner`; it is not current engine readiness. No preview inference or activation endpoint runs in the web process.
 
-`rebuild --days 30` scans all pages of recent Librus messages, retries cached fetch/analysis failures, discovers app-owned calendar candidates and reads exact transferred IDs. Its runtime permits calendar reads only; it never queues or executes calendar writes. It updates the target local database and can send message text to analysis. Foreign, missing, duplicate or ambiguous ownership requires review; partial/review results are not complete reconstruction. Days must be 1–30. Before resuming writes, run a paused dry-run and inspect pending proposals and review items. Reconstruction preserves prior human event choices; a later automatic update or cancellation needs fresh approval even when it comes from another source message.
+Upgrade in place with the existing database path. Stop new hourly runs, let any writer finish and reconcile unknown outcomes. Prepare the reviewed package, then use canonical `activate` and `verify`; preserve configuration, write pause and journals. Initialization idempotently links existing events/proposals/actions without resetting state or creating Calendar events. Do not create a fresh replacement DB, copy/restore SQLite, replay all historical messages or run the retired per-source activation/reanalysis commands. Resume the same hourly app timer after verifying retained IDs/decisions, no duplicates, no unknown operations and healthy source collection. No additional service or Codex acceptance automation is needed.
 
-`prune --days 30` previews content retention; append `--apply` only under the intended retention authorization. It clears old message bodies, analysis records, obsolete automatic proposals and unnecessary event/operation content. Content-bearing source previews and source-analysis audits follow 30-day content retention; the 90-day history window applies only to technical sync/probe records. Minimal IDs, hashes, human decisions, ownership, conflict evidence, cancellation tombstones and every durable journal row remain. Unknown/inflight operation payload is retained in full; expired unexecuted work becomes review. In-place secure deletion and VACUUM remove freed content without making a backup. Preview and apply make zero calendar writes. Keep the old source only until the explicitly defined acceptance/cleanup point; deployment does not remove it automatically. See [the application contract](../app/CONTRACT.md).
+## Retention and recovery
 
-## Multiple-source rollout
+The ordinary sync and `prune --days 30` retain minimal IDs, hashes, human decisions, ownership, future facts, cancellation tombstones and every durable journal. `prune` previews by default; `--apply` clears expired narrative source/plan/audit content in place. Full unknown/inflight operation intent survives. Technical sync/probe history has its separate 90-day window. Pruning never changes Calendar and creates no backup.
 
-`multi_source_mode` accepts `off` (default), `preview`, or `active`; the explicit environment override is `LIBRUS_MULTI_SOURCE_MODE`. Existing message synchronization remains available. Use the same protected local configuration and immutable-package deployment procedure as above; never put a learner identifier, credentials, source text or preview output into a public repository. Preserve the configured learner/calendar binding, owner authentication, write-pause state, hourly schedule, model/effort and intentionally disabled backups.
+Prefer a reviewed forward fix after failure; keep the current database and operation journal. A prior code package is usable only after explicit schema/journal compatibility checks. Never restore an older SQLite database: it can lose proof of external writes and cause duplicates. Review visible `agenda_*` failure codes and pending/failed sources; context overflow and malformed/stale plans refuse writes rather than silently dropping input. The read-only monitor exports fixed technical plan outcomes and source counts only; existing charts and alarm thresholds remain.
 
-During private preview review, distinguish a literal recipient phrase from collector-verified class-calendar audience context. Only `school_event` items from a complete authenticated served class-calendar view with unchanged selected learner/class may use that separate context for an ordinary school action; the body still needs literal action and grounded date evidence. Missing/changed proof, conflicting recipients, parent-role restrictions and unknown or conditional participation do not authorize new writes. Revalidate the stored recipient basis against the current source before activation and queued writes; preserve every human decision. Audience-backed dispatch requires an activation receipt for the current class: old-class work and fresh new-class proof with an old receipt both remain deferred until fresh validated activation. Neither an authenticated route nor a successful fetch alone establishes audience. Attachments remain excluded.
-
-Preview collection and analysis run after the existing message analysis, reconciliation and Calendar writes. This separate phase uses at most ten minutes, half the remaining whole-run time and 31 model calls shared by extraction, matching, legacy-evidence recovery and independent semantic verification. Small-source reservation allows one extraction and up to three calls per non-ignore action (matching, recovery and verification): `1 + 3N <= 31`, or at most ten such actions when recovery is available. Without that capability, `1 + 2N <= 31` applies. Each action can use at most one recovery batch of up to 12 candidates; the reservation always protects remaining primary matching calls. A source that fits a fresh budget is deferred whole when the current budget is insufficient; no incomplete result is cached as ready. Unusually large sources reserve calls for primary matching and may show explicit unverified review outcomes when the optional verifier budget runs out. Such outcomes establish no target, link, write authorization or confirmed action identity. Completed previews stay saved; deferred or interrupted source versions remain in the durable queue for later runs, with a visible reason. Preview expiry does not fail an otherwise successful message sync. The CLI main-thread worker runs this phase; background-thread callers defer it. Active mode still requires complete processing across every required channel for full sync success.
-
-A planner contract version bump makes earlier preview results stale even when source content is unchanged. This explicit version is separate from the release SHA and must be bumped for extraction, prompt, matching or applicability changes. The panel and read-only API label earlier results stale, and readiness/monitoring and virtual matching use only the current planner version. Scheduled preview runs recompute stale results within the same budget; wait for full current coverage before acceptance or activation. A partial activation may refresh only its exact recorded current source selection, without replaying ordinary analyzed history or altering decisions, owned events or journals. Create a fresh activation plan after refresh; an older planner's plan is refused before collection. Candidate retrieval removes only explicitly proven incompatible typed actions before its unchanged 12-candidate bound. Remaining overflow requires review and supplies no duplicate/update authorization.
-
-The virtual-proof contract advances the planner to v3, invalidating older previews and plans. Virtual candidates resolve their origins from current-ready previews with exact source/hash/planner and deterministic source/hash/ordinal/action binding, independent of preview timestamps. Exactly one matching own-source literal quote must agree with the saved prepared action; existing safe store projections then rebuild context and original evidence. Serialized evidence, `original_evidence`, reconstructed-proof/recovery fields and virtual decision/event fields confer no authority. Every prepared non-ignore action remains an obligation even when outcomes are missing, short or malformed; valid ignore/empty previews add no blocker. Invalid bindings remain separate proofless inventory with untrusted exclusion/authority flags cleared, blocking every matching strategy, including closed-offer lookup. Aliases need their own current literal proof and the exact validated target payload/link prefix; an ID or payload alone cannot collapse an obligation. Existing corroboration/closed-offer aliases require freshly rederived policy and real persisted target authority, while an own expired fact may be omitted only after current source/context/clock rederives expiry with no decision/event authority. Persisted canonical authority takes precedence. Existing full-candidate-set eligibility checks for recovery and independent verification, and existing budget limits, remain unchanged; provenance fallback alone does not establish semantic acceptance.
-
-`matching_diagnostics[]` contains only fixed codes for primary response/validation, recovery and verification, with bounded candidate/missing-original/unrecoverable counts and candidate-set completeness. It contains no raw result, source quote or identifier. These diagnostics explain a bounded attempt; they do not authorize a target, link or Calendar write.
-
-1. Validate the release with synthetic collectors, source/action replay, migration/retention, decision-preservation and UI tests. Review safe aggregate metadata and source capabilities. Offline success does not establish live school compatibility.
-2. Stage the reviewed immutable release with new sources in `preview`. Collection must verify the selected authenticated learner, all pages and full bodies. Unsupported, partial or ambiguous source discovery stays visible as incomplete. Preview analyses remain separate from live proposals, operations and decisions; attachments are metadata only, with no image, OCR, PDF or attachment-content requests.
-3. Observe a real scheduled hourly run in preview. Check each required source's successful fetch, backlog, errors, learner verification and complete pagination. Inspect source results and uncertain duplicates privately. Verify zero preview Calendar writes and no changed human decisions or owned-event identities. A manual run or a future timer timestamp does not satisfy this gate.
-4. After the preview criteria and actual scheduled gate pass, switch only the approved mode to `active`. Activation must always re-fetch, reanalyze and revalidate current source content, learner scope, canonical matches and human decisions; a saved preview is not authorization to replay stale actions.
-5. Observe a real full hourly active run. Require complete active-source collection, no automatic backlog or unknown writes, unchanged human decisions and no duplicate event on full replay. Confirm UI and aggregate monitoring separately. Report deployment, preview, activation and full-hourly acceptance as separate pending or complete states.
-
-The source panel exposes outcomes added, linked, enriched, review, ignored and analysis incomplete, with reasons and provenance. Existing `/api/messages`, `/api/proposals` and `/api/proposal-groups` shapes stay compatible. `/api/sources?limit=50&offset=0&kind=announcement` returns `{items,limit,offset,next_offset}` (limit 1–100); kinds are `message`, `announcement`, `school_event`, `substitution` (`school_calendar` is an alias). `/api/actions/{id}` includes supporting sources, links and preserved decision metadata. `/api/source-previews` is paginated and read-only; there is no web activation endpoint.
-
-Netdata receives only whitelisted aggregates per source kind: mode, last successful fetch, pending/error counts and action-link counts, plus the separate ready-preview count. Older databases/exports keep missing source evidence unknown. Preview freshness never advances full active-sync success; every required active source must be complete. Existing alarm thresholds and routes remain unchanged, including the intentional disabled-backup policy.
-
-### Exact activation and refusal recovery
-
-After the real hourly preview gate, stop only the sync timer and wait for any active writer to finish. Do not stop or kill a running `librus-sync.service`. Protect the short plan/apply window from panel decisions. Keep the recorded write-pause policy unchanged. Both administrative commands acquire `sync.lock`; `already_running` means wait and retry after the existing owner finishes.
-
-```sh
-systemctl --user stop librus-sync.timer
-systemctl --user show librus-sync.service -p ActiveState -p SubState -p Result -p ExecMainStatus
-release_python="$HOME/.local/lib/librus-calendar/releases/FULL_SHA/.venv/bin/python"
-source_config="$HOME/.config/librus-calendar/config.json"
-source_state="$HOME/.local/share/librus-calendar/current.sqlite3"
-source_admin_dir="$HOME/.local/share/librus-calendar/admin"
-install -d -m 0700 "$source_admin_dir"
-activation_plan="$source_admin_dir/activation-$(date -u +%Y%m%dT%H%M%SZ).json"
-"$release_python" -I -m app.cli --config "$source_config" --state "$source_state" source-activate --plan-file "$activation_plan"
-```
-
-Run the final command only after the service is inactive. Planning requires protected mode `preview`, complete verified collection for all three new channels and a ready preview for every current pending source version. It creates a new non-overwriting private 0600 plan bound to source versions, learner/calendar binding, decisions, events and journal state; output reports aggregates and `calendar_writes=0`. The plan contains private identifiers; never print, commit or share it.
-
-Review the protected plan privately. Atomically change only `multi_source_mode` in the protected configuration to `active`, preserving file ownership/mode and every other setting. Check effective environment overrides too. The timer stays stopped. **Configuration alone does not supply a missing activation receipt.** Starting an activation apply durably suspends any older receipt until the new attempt completes; shared analysis, queue and claim stay blocked after failure or restart. A valid prior receipt persists across configuration mode changes when no new apply has started. Writes require a bound activation receipt and complete required source collection.
-
-```sh
-"$release_python" -I -m app.cli --config "$source_config" --state "$source_state" source-activate --plan-file "$activation_plan" --apply
-```
-
-Apply freshly collects and checks learner scope/content against the snapshot, reads the exact allowed Calendar and verifies owned-event fingerprints, then performs fresh analysis and matching. It never executes saved preview proposals. Before collection it durably marks activation incomplete. All receipt fields and removal of the marker commit atomically only when every step completes; the command itself reports zero Calendar writes. A partial or interrupted attempt keeps shared analysis, queue and claim blocked. A fresh retry plan must cover the failed attempt's exact selected sources and freshly analyze them; earlier preview payloads provide selection evidence only. On success, verify preservation and per-source queues before restoring the recorded timer state:
-
-```sh
-systemctl --user restart librus-web.service
-systemctl --user start librus-monitor.service
-"$release_python" -I -m app.cli --config "$source_config" --state "$source_state" status
-systemctl --user start librus-sync.timer
-systemctl --user list-timers librus-sync.timer
-```
-
-Restarting only web reloads its once-loaded mode; refreshing monitoring is separate. Start the timer only if it was active in the baseline, then require the actual scheduled full active run. No manual invocation substitutes for that gate. Preserve the existing timer rule, alarms and backup-disabled policy.
-
-On changed source/version, learner, decision, journal, Calendar fingerprint, incomplete collection or analysis failure, leave the timer stopped and preserve the database/journals. Return only the protected mode to `preview`, restart web and refresh the monitor; do not alter decisions or restore a database. Resolve the specific cause, obtain fresh complete previews and create a new plan at a new path. The old snapshot is refused; do not edit its fingerprint or overwrite it. A lock refusal requires waiting, not another concurrent worker. Do not resume scheduled active writes after a refused/partial apply.
-
-### Explicit local cleanup
-
-Cleanup is separate from activation and never edits Calendar. Use it only for an explicitly reviewed bounded list of stale local proposals. Before the final activation plan, place a private 0600 request in the 0700 administration directory, using the shape below with actual reviewed identifiers supplied privately:
-
-```json
-{"changes":[{"proposal_id":"REVIEWED_PROPOSAL_ID","reason":"Reviewed local proposal is obsolete; retain existing Calendar and decisions."}]}
-```
-
-```sh
-cleanup_request="$source_admin_dir/cleanup-request.json"
-cleanup_plan="$source_admin_dir/cleanup-$(date -u +%Y%m%dT%H%M%SZ).json"
-"$release_python" -I -m app.cli --config "$source_config" --state "$source_state" cleanup-existing --request-file "$cleanup_request" --plan-file "$cleanup_plan"
-"$release_python" -I -m app.cli --config "$source_config" --state "$source_state" cleanup-existing --plan-file "$cleanup_plan" --apply
-```
-
-Review preview counts before apply; apply accepts only that saved plan, without `--request-file`. Snapshot changes, approved/edited/applied actions and attempted/inflight/unknown write evidence refuse cleanup. Explicit rejections remain rejected; only eligible obsolete local work is retired, with IDs, decisions and journals retained. Changed snapshots require a newly reviewed request/plan. Run cleanup before generating the final activation plan, then refresh preview evidence as needed; never bypass a refusal with SQL, state replacement or Calendar deletion.
+For local development use `scripts/ui_fixture.py --port 8796` with temporary fictional data. Real school data, configuration, snapshots and plan output stay outside Git and public screenshots.

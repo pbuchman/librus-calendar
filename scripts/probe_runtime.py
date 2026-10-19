@@ -114,7 +114,7 @@ def calendar_test(runtime, resume=False):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--analysis", action="store_true")
+    parser.add_argument("--agenda", "--analysis", dest="analysis", action="store_true", help="Run one tool-free fictional whole-agenda plan")
     calendar_options = parser.add_mutually_exclusive_group()
     calendar_options.add_argument("--calendar-test", action="store_true", help="Explicitly create/update/delete one marked synthetic test event")
     calendar_options.add_argument("--resume-calendar-test", action="store_true", help="Read-only reconcile the saved uncertain create, then continue the exact existing test")
@@ -128,10 +128,16 @@ def main():
                 print(json.dumps(result, ensure_ascii=False))
                 raise SystemExit(1)
         if options.analysis:
-            proposals = runtime.analyze({"id": "synthetic-probe", "sent_at": "2030-03-06T10:00:00+01:00", "sender": "Test", "subject": "Próba",
-                "text": "Fikcyjny warsztat szkolny 18 marca 2030 o 09:30. Formularz do 12 marca 2030. Opiekun grupy przygotuje listę."}, [])
-            result["analysis"] = {"proposals": len(proposals), "kinds": [x["kind"] for x in proposals],
-                                  "review_count": sum(x["needs_review"] for x in proposals)}
+            from app.core import digest
+            from app.agenda import agenda_summary
+            snapshot = {'learner': {'id':'fictional-probe', 'class_id':'1x', 'verified':True},
+                'as_of_date':'2030-03-06', 'timezone':'Europe/Warsaw', 'agenda':[], 'offer_groups':[],
+                'sources':[{'id':'fictional-probe-message', 'kind':'message', 'learner_id':'fictional-probe',
+                    'content_hash':digest('fictional-probe-text'), 'published_at':'2030-03-06T10:00:00+01:00',
+                    'title':'Fikcyjna informacja', 'text':'Klasa 1x przynosi papier do 12 marca 2030.', 'metadata':{}}]}
+            snapshot['snapshot_hash'] = digest(snapshot)
+            planned = runtime.plan_agenda(snapshot)
+            result['agenda'] = agenda_summary({'status':'preview', 'model_calls':1, 'items':planned['items']})
         print(json.dumps(result, ensure_ascii=False))
     except RuntimeFailure as error:
         print(json.dumps({"error": error.code}))

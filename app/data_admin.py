@@ -25,7 +25,7 @@ def intent_signature(item):
 
 def minimal_proposal(item):
     """Keep a chosen action, never the original teacher quote or AI reasoning."""
-    keep = ('id', 'message_id', 'kind', 'title', 'start', 'end', 'all_day', 'temporal_kind',
+    keep = ('agenda_plan_id', 'agenda_sources', 'agenda_learner', 'id', 'message_id', 'kind', 'title', 'start', 'end', 'all_day', 'temporal_kind',
             'due_at', 'activity_scope', 'canonical_action_id', 'source_id', 'source_hash', 'source_kind', 'source_version_at', 'optional', 'recipient_basis', 'deferred_unknown_operation', 'action_identity', 'recipient', 'event_id', 'default_duration', 'alternative_group_id', 'blocked_by_group_decision', 'blocked_by_offer_group', *FLAGS)
     result = {key: item[key] for key in keep if key in item}
     if isinstance(result.get('action_identity'),dict):result['action_identity']={k:v for k,v in result['action_identity'].items() if k!='evidence'}
@@ -470,7 +470,7 @@ def _prune_state_locked(store, *, days=30, apply=False, current=None):
                             (json.dumps(kept), json.dumps({key: outcome.get(key) for key in ('status','event_id','fingerprint')}), journal['id']))
             result.update(store.prune_source_content(current,apply=True))
             store.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', ('retention_last_applied_at', utcnow()))
-        if dirty_ids or result['analysis_records_pruned'] or result.get('sources_pruned') or result.get('source_previews_pruned') or result.get('source_audits_pruned'):
+        if dirty_ids or result['analysis_records_pruned'] or result.get('sources_pruned') or result.get('source_previews_pruned') or result.get('source_audits_pruned') or result.get('agenda_plans_pruned'):
             # Erase freed SQLite pages too; this is an in-place rewrite, no backup.
             store.db.execute('VACUUM')
     return result
@@ -685,20 +685,5 @@ class RebuildController:
             except Exception as error:
                 self.store.fail_message(mid, 'fetch', safe_error(error))
                 result['fetch_failures'] += 1
-        ambiguity = bool(result['calendar_blocking_ambiguities'])
-        for message in self.store.analysis_messages(100000):
-            try:
-                if message.get('sent_at') and as_datetime(message['sent_at']) < cutoff:
-                    continue
-                self.runtime.last_analysis_metadata = None
-                proposals = self.runtime.analyze(message, self.store.list_events(100000))
-                if not isinstance(proposals, list) or len(proposals) > 30:
-                    raise ValueError('Unexpected analysis result shape.')
-                if ambiguity:
-                    proposals = [{**item, 'needs_review': True,
-                                  'review_reason': 'Calendar discovery has ambiguous ownership; confirm before creating events.'} for item in proposals]
-                self.store.save_proposals(message['id'], proposals, current, getattr(self.runtime, 'last_analysis_metadata', None))
-                result['analyzed'] += 1
-            except Exception as error:
-                self.store.fail_message(message['id'], 'analysis', safe_error(error))
-                result['analysis_failures'] += 1
+        # Rebuild collects read-only ownership and current messages only. The
+        # next normal complete-snapshot sync owns all agenda interpretation.

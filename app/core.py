@@ -142,7 +142,7 @@ def normalize_proposal(data, current=None):
                     temporal_kind=temporal_kind, due_at=data.get('due_at'), activity_scope=activity_scope,
                     deletion_approved=data.get('deletion_approved') is True, user_approved=data.get('user_approved') is True,
                     user_edited=data.get('user_edited') is True)
-    for key in ('canonical_action_id','source_id','source_hash','source_kind','provenance','recipient','recipient_basis','optional','date_certainty','action_identity','match_evidence','source_version_at','offer_identity','informational','alternative_group','alternative_group_evidence','user_rejected','deferred_unknown_operation','blocked_by_offer_group'):
+    for key in ('agenda_plan_id','agenda_sources','agenda_learner','canonical_action_id','source_id','source_hash','source_kind','provenance','recipient','recipient_basis','optional','date_certainty','action_identity','match_evidence','source_version_at','offer_identity','informational','alternative_group','alternative_group_id','alternative_group_evidence','user_rejected','deferred_unknown_operation','blocked_by_offer_group','blocked_by_group_decision'):
         if key in data:
             proposal[key] = data[key]
     if proposal.get('optional') is True:
@@ -321,7 +321,10 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                     self.db.execute('UPDATE operations SET payload=? WHERE id=?', (json.dumps(payload, ensure_ascii=False), row['id']))
 
             self._initialize_sources()
-            self.db.execute("INSERT OR REPLACE INTO settings VALUES ('multi_source_mode',?)", (self.config.multi_source_mode,))
+            self.db.execute("INSERT OR REPLACE INTO settings VALUES ('agenda_engine','simple-agenda')")
+            # Retained transport enum means always-active; it cannot select an
+            # engine. Deprecated config.multi_source_mode is intentionally inert.
+            self.db.execute("INSERT OR REPLACE INTO settings VALUES ('multi_source_mode','active')")
 
     def close(self):
         self.db.close()
@@ -346,7 +349,7 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                         'events': count('events', " WHERE state='active'"), 'events_cancelled': count('events', " WHERE state='cancelled'"),
                         'writes_paused': self._setting('writes_paused', 'true') == 'true',
                         'last_sync': self._setting('last_sync'), 'last_error': self._setting('last_error'), 'sync_requested_at': self._setting('sync_requested_at'),
-                        'calendar_id': self.calendar_id, 'timezone': 'Europe/Warsaw', 'sources': self.source_status()}
+                        'calendar_id': self.calendar_id, 'timezone': 'Europe/Warsaw', 'sources': self.source_status(), 'agenda': self.agenda_status()}
             finally:
                 if own_snapshot:
                     self.db.rollback()
@@ -588,68 +591,13 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             return [{**dict(row), **{key: json.loads(row[key]) for key in ('metadata', 'proposal_ids', 'superseded_ids')}} for row in rows]
 
     def cached_reanalysis_scope(self, message_id):
-        """Reject any source carrying an external write or a human decision."""
-        with self.lock:
-            if self.config.multi_source_mode=='active':
-                raise ValueError('Active multi-source mode requires the canonical source workflow.')
-            message = self.get_message(message_id)
-            if not message or not message.get('payload_hash'):
-                raise ValueError('Cached reanalysis requires a fully fetched message.')
-            linked=self.db.execute("""SELECT 1 FROM action_sources s JOIN canonical_actions a ON a.id=s.action_id
-                WHERE s.source_id=? AND (s.relation<>'origin' OR EXISTS
-                    (SELECT 1 FROM action_sources other WHERE other.action_id=s.action_id AND other.source_id<>s.source_id)) LIMIT 1""",('message:'+str(message_id),)).fetchone()
-            if linked:
-                raise ValueError('Cached reanalysis refuses a message linked to a canonical source action.')
-            if self.db.execute("SELECT 1 FROM sources WHERE id=? AND kind<>'message'",(str(message_id),)).fetchone():
-                raise ValueError('Use the source preview workflow for non-message sources.')
-            if any(self._proposal(r).get('canonical_action_id') for r in self.db.execute('SELECT * FROM proposals WHERE message_id=?',(str(message_id),))):
-                raise ValueError('Use the source preview workflow for canonical actions.')
-            if self.db.execute('SELECT 1 FROM events WHERE message_id=? OR proposal_id IN (SELECT id FROM proposals WHERE message_id=?)',
-                               (message['id'], message['id'])).fetchone():
-                raise ValueError('Cached reanalysis refuses a source with historical calendar events.')
-            if self.db.execute("SELECT 1 FROM proposal_groups WHERE message_id=? AND status<>'open' LIMIT 1", (message['id'],)).fetchone():
-                raise ValueError('Cached reanalysis refuses a source with a prior group decision.')
-            eligible = []
-            for row in self.db.execute("SELECT * FROM proposals WHERE message_id=? AND status!='superseded'", (message['id'],)):
-                item = self._proposal(row)
-                if (row['source_hash'] != message['payload_hash'] or item['status'] not in ('pending', 'review')
-                        or any(item.get(flag) for flag in ('user_approved', 'user_edited', 'deletion_approved', 'user_rejected'))):
-                    raise ValueError('Cached reanalysis refuses protected proposal history or human decisions.')
-                eligible.append(item['id'])
-            operations = self.db.execute("SELECT o.* FROM operations o JOIN proposals p ON p.id=o.proposal_id WHERE p.message_id=? AND o.status!='superseded'", (message['id'],)).fetchall()
-            if any(row['status'] != 'pending' or row['attempts'] != 0 or row['result'] is not None or row['proposal_id'] not in eligible for row in operations):
-                raise ValueError('Cached reanalysis refuses attempted, inflight, unknown or reviewed operations.')
-            return {'message_id': message['id'], 'source_hash': message['payload_hash'], 'proposal_ids': eligible}
+        raise ValueError('Cached subset reanalysis is retired; use complete agenda preview.')
 
-    def prepare_cached_reanalysis(self, message_id, proposals, current=None):
-        with self.lock:
-            scope = self.cached_reanalysis_scope(message_id)
-            return self._prepare_proposals(message_id, proposals, current, scope['proposal_ids'], reanalysis=True)
+    def prepare_cached_reanalysis(self, *args, **kwargs):
+        raise ValueError('Cached subset reanalysis is retired; use complete agenda preview.')
 
-    def replace_cached_proposals(self, message_id, proposals, current=None, metadata=None, expected_source_hash=None):
-        """Called only with sync.lock held; supersede local evidence atomically."""
-        with self.lock:
-            if self.db.in_transaction:
-                raise ValueError('Cached replacement requires its own immediate transaction.')
-            with self.db:
-                # Web decisions use a separate connection and do not hold sync.lock.
-                # Reserve the SQLite write lock before any eligibility read so a
-                # concurrent approval cannot be lost between SELECT and UPDATE.
-                self.db.execute('BEGIN IMMEDIATE')
-                scope = self.cached_reanalysis_scope(message_id)
-                if not expected_source_hash or scope['source_hash'] != expected_source_hash:
-                    raise ValueError('Cached source changed during reanalysis.')
-                normalized = self._prepare_proposals(message_id, proposals, current, scope['proposal_ids'], reanalysis=True)
-                replacement_ids = {item['id'] for item in normalized}
-                superseded = [item for item in scope['proposal_ids'] if item not in replacement_ids]
-                for proposal_id in superseded:
-                    self.db.execute("UPDATE proposals SET status='superseded',updated_at=?,pending_since=NULL WHERE id=?", (utcnow(), proposal_id))
-                    self.db.execute("UPDATE operations SET status='superseded',last_error='Superseded by explicitly requested cached reanalysis.',updated_at=? WHERE proposal_id=? AND status='pending' AND attempts=0", (utcnow(), proposal_id))
-                # Open groups are replaceable only under this same reservation.
-                self.db.execute("DELETE FROM proposal_group_members WHERE group_id IN (SELECT id FROM proposal_groups WHERE message_id=? AND status='open')", (str(message_id),))
-                self.db.execute("DELETE FROM proposal_groups WHERE message_id=? AND status='open'", (str(message_id),))
-                self._save_analysis(self.get_message(message_id), normalized, metadata, 'cached_reanalysis', superseded)
-                return {'proposals': normalized, 'superseded_ids': superseded}
+    def replace_cached_proposals(self, *args, **kwargs):
+        raise ValueError('Cached subset reanalysis is retired; use complete agenda preview.')
 
     def _proposal(self, row):
         data = json.loads(row['payload'])
@@ -706,6 +654,9 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                 raise ValueError('Unknown proposal.')
             if json.loads(row['payload']).get('blocked_by_offer_group') and decision != 'ignore':
                 raise ValueError('This option belongs to an existing offer; reconcile the complete membership before approval.')
+            deferred = json.loads(row['payload']).get('deferred_unknown_operation')
+            if deferred and decision != 'ignore' and self.db.execute("SELECT 1 FROM operations WHERE id=? AND status IN ('unknown','inflight')", (deferred,)).fetchone():
+                raise ValueError('Reconcile the prior write before approving this change.')
             if json.loads(row['payload']).get('blocked_by_group_decision') and decision != 'ignore':
                 raise ValueError('A prior group decision blocks this ambiguous replacement.')
             group = self.get_proposal_group_for_proposal(proposal_id)
@@ -958,11 +909,13 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                             (json.dumps(operation, ensure_ascii=False), utcnow(), operation_id))
             return operation
 
-    def record_result(self, operation_id, result):
+    def record_result(self, operation_id, result, *, agenda_calendar=None, current=None):
         if not isinstance(result, dict) or result.get('status') not in ('applied','review','unknown','failed'):
             result = {'status': 'unknown', 'error': 'Invalid execution result; possible external write.'}
         status = result['status']
         with self.lock, self.db:
+            from .agenda import checkpoint_before_result, checkpoint_after_result
+            advance_agenda = checkpoint_before_result(self, agenda_calendar, current)
             row = self.db.execute('SELECT * FROM operations WHERE id=?', (operation_id,)).fetchone()
             if not row:
                 raise ValueError('Unknown operation.')
@@ -1015,6 +968,7 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             if current_proposal:
                 current_item=self._proposal(current_proposal)
                 self.db.execute('UPDATE canonical_actions SET payload=?,status=?,updated_at=? WHERE proposal_id=?',(json.dumps(current_item,ensure_ascii=False),current_item['status'],utcnow(),operation['proposal_id']))
+            checkpoint_after_result(self, agenda_calendar, current, advance_agenda, result)
 
     def backup(self, destination=None):
         self.set_setting('last_backup_attempt_at', utcnow())

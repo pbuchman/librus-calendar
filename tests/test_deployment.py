@@ -39,6 +39,8 @@ class DeploymentTests(unittest.TestCase):
         app.mkdir()
         for name in ('__init__.py', 'web.py', 'codex_runtime.py', 'monitoring.py'):
             (app / name).write_text('import sys; assert sys.flags.isolated == 1\n')
+        if 'schemas/agenda_plan.json' in resources:
+            (app / 'agenda.py').write_text('import sys; assert sys.flags.isolated == 1\n')
         for name in resources:
             path = app / name
             path.parent.mkdir(exist_ok=True)

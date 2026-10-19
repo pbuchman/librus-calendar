@@ -26,12 +26,8 @@ UNITS = ('librus-web.service', 'librus-sync.service', 'librus-sync.timer',
          'librus-monitor.service', 'librus-monitor.timer')
 BACKUP_UNITS = ('librus-backup.service', 'librus-backup.timer')
 MARKER = '# Managed by librus-calendar deployment v1\n'
-RESOURCES = ('templates/inbox.html', 'static/style.css', 'schemas/analysis.json',
-             'schemas/tool.json', 'schemas/analysis.md', 'schemas/executor.md',
-             'schemas/source_analysis.json', 'schemas/source_match.json',
-             'schemas/source_facts.md', 'schemas/source_match.md',
-             'schemas/source_verify.json', 'schemas/source_verify.md',
-             'schemas/source_recovery.json', 'schemas/source_recovery.md',
+RESOURCES = ('templates/inbox.html', 'static/style.css', 'schemas/tool.json',
+             'schemas/executor.md', 'schemas/agenda_plan.json', 'schemas/agenda_plan.md',
              'templates/sources.html', 'templates/source_preview.html')
 
 
@@ -111,12 +107,13 @@ def offline_env(home):
 def package_probe(release, *, resources=RESOURCES, app_directory=None):
     python = release / '.venv/bin/python'
     app_check = f'assert p == Path({str(app_directory)!r}); ' if app_directory else ''
+    planner_check = 'import app.agenda; ' if 'schemas/agenda_plan.json' in resources else ''
     script = ('from pathlib import Path; import app; '
               'p=Path(app.__file__).resolve().parent; '
               f'assert p.is_relative_to(Path({str(release)!r})); '
               + app_check +
               f'assert all((p/n).is_file() for n in {resources!r}); '
-              'import app.web, app.codex_runtime, app.monitoring; print("package-ok")')
+              'import app.web, app.codex_runtime, app.monitoring; ' + planner_check + 'print("package-ok")')
     with tempfile.TemporaryDirectory(prefix='librus-package-probe-') as folder:
         command([python, '-I', '-c', script], cwd=folder)
 

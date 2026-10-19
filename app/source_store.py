@@ -9,7 +9,6 @@ from datetime import datetime, timedelta, timezone
 import json
 import re
 import uuid
-from .source_matching import candidate_is_distinct
 from .source_preview import (SOURCE_PREVIEW_PLANNER_VERSION, PREVIEW_RETRY_SETTINGS,
                              current_preview_sql, preview_is_current, preview_queue_sql)
 
@@ -24,6 +23,7 @@ def authority_links(links):
     """Corroboration records visibility only, never a new identity authority."""
     return [link for link in links if link.get('relation')not in NON_AUTHORITY_RELATIONS]
 SOURCE_SCHEMA = '''
+CREATE TABLE IF NOT EXISTS agenda_plans(id TEXT PRIMARY KEY,input_hash TEXT NOT NULL,payload TEXT NOT NULL,metadata TEXT NOT NULL,status TEXT NOT NULL,created_at TEXT NOT NULL,error_code TEXT);
 CREATE TABLE IF NOT EXISTS sources(id TEXT PRIMARY KEY,kind TEXT NOT NULL,upstream_id TEXT NOT NULL,learner_id TEXT NOT NULL,payload TEXT NOT NULL,content_hash TEXT NOT NULL,status TEXT NOT NULL,deleted INTEGER NOT NULL DEFAULT 0,published_at TEXT,updated_at TEXT,fetched_at TEXT NOT NULL,analyzed_at TEXT,last_error TEXT,outcome TEXT,reason TEXT);
 CREATE INDEX IF NOT EXISTS sources_pending ON sources(status,kind,fetched_at);
 CREATE TABLE IF NOT EXISTS source_health(kind TEXT PRIMARY KEY,last_attempt_at TEXT,last_successful_fetch TEXT,last_result TEXT,last_error TEXT,learner_verified INTEGER NOT NULL DEFAULT 0);
@@ -61,6 +61,18 @@ def source_message(source):
 
 
 class SourceStoreMixin:
+    def latest_agenda_plan(self, preview=False):
+        with self.lock:
+            row = self.db.execute("SELECT * FROM agenda_plans WHERE status " + ("IN ('preview','preview_failed')" if preview else "NOT IN ('preview','preview_failed')") + " ORDER BY created_at DESC,rowid DESC LIMIT 1").fetchone()
+            return {**dict(row), 'payload': json.loads(row['payload']), 'metadata': json.loads(row['metadata'])} if row else None
+
+    def agenda_status(self):
+        result = {'engine': 'simple-agenda'}
+        for name, preview in (('latest_plan', False), ('latest_preview', True)):
+            row = self.latest_agenda_plan(preview)
+            result[name] = {key: row[key] for key in ('id','input_hash','status','created_at','error_code','metadata')} if row else None
+        return result
+
     def _initialize_sources(self):
         from .core import utcnow
         self.db.executescript(SOURCE_SCHEMA)
@@ -73,8 +85,19 @@ class SourceStoreMixin:
             self._mirror_message_source(row)
         for row in self.db.execute('SELECT * FROM proposals').fetchall():
             self._register_legacy_action(row)
+            payload = json.loads(row['payload'])
+            aid = payload.get('canonical_action_id') or row['id']
+            if not self.db.execute('SELECT 1 FROM canonical_actions WHERE id=? OR proposal_id=?', (aid, row['id'])).fetchone():
+                # Unmapped legacy state stays visible inventory, preserving its
+                # ID and flags even after source text expired. No Calendar write.
+                payload.update(canonical_action_id=aid, inventory_only=True)
+                self.db.execute('INSERT INTO canonical_actions VALUES (?,?,?,?,?)',
+                                (aid,row['id'],json.dumps(payload,ensure_ascii=False),row['status'],row['updated_at']))
         for event in self.db.execute('SELECT * FROM events').fetchall():
             if self.db.execute('SELECT 1 FROM canonical_actions WHERE proposal_id=?',(event['proposal_id'],)).fetchone():continue
+            if self.db.execute("SELECT 1 FROM canonical_actions WHERE id=? OR json_extract(payload,'$.event_id')=?", (event['proposal_id'], event['id'])).fetchone():continue
+            proposal = self.db.execute('SELECT payload FROM proposals WHERE id=?', (event['proposal_id'],)).fetchone()
+            if proposal and self.db.execute('SELECT 1 FROM canonical_actions WHERE id=?', (json.loads(proposal[0]).get('canonical_action_id'),)).fetchone():continue
             from .codex_runtime import normalize_event
             snapshot=normalize_event(json.loads(event['snapshot']),self.config.calendar_owner)
             start=snapshot.get('start',{});end=snapshot.get('end',{})
@@ -139,25 +162,17 @@ class SourceStoreMixin:
 
     def source_status(self):
         counts = {}
-        preview_queue,queue_args=preview_queue_sql({key:self._setting(key)for key in PREVIEW_RETRY_SETTINGS})
-        for row in self.db.execute('SELECT kind,COUNT(*) AS total,SUM(status=\'pending\') AS pending,SUM(status=\'failed\') AS failed,SUM(deleted) AS deleted FROM sources GROUP BY kind'):
-            counts[row['kind']] = {key:row[key] for key in ('total','pending','failed','deleted')}
-            ready=self.db.execute(f"SELECT COUNT(*) FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE s.kind=? AND p.status='ready' AND s.deleted=0 AND ({current_preview_sql()})",(row['kind'],)).fetchone()[0]
-            failed=self.db.execute(f"SELECT COUNT(*) FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE s.kind=? AND p.status='failed' AND s.deleted=0 AND ({current_preview_sql()})",(row['kind'],)).fetchone()[0]
-            counts[row['kind']]['preview_ready']=ready
-            counts[row['kind']]['preview_failed']=failed
-            counts[row['kind']]['preview_pending']=self.db.execute(f"SELECT COUNT(*) FROM sources s WHERE s.kind=? AND s.deleted=0 AND ({preview_queue}) AND NOT EXISTS (SELECT 1 FROM source_previews p WHERE p.source_id=s.id AND p.source_hash=s.content_hash AND p.status IN ('ready','failed') AND ({current_preview_sql()}))",(row['kind'],*queue_args)).fetchone()[0] if self.config.multi_source_mode=='preview' and row['kind']!='message' else 0
-            counts[row['kind']]['active_pending']=row['pending']+row['failed'] if self.config.multi_source_mode=='active' else 0
-        health = {r['kind']:{**dict(r),'learner_verified':bool(r['learner_verified'])} for r in self.db.execute('SELECT * FROM source_health')}
-        return {'mode':self.config.multi_source_mode,'counts':counts,'health':health,
-                'active_pending':sum(x['pending']+x['failed'] for x in counts.values()) if self.config.multi_source_mode=='active' else 0,
-                'preview_pending':sum(x['preview_pending'] for x in counts.values()) if self.config.multi_source_mode=='preview' else 0,
-                'preview_failed':sum(x['preview_failed'] for x in counts.values()),
-                'preview_count':self.db.execute(f"SELECT COUNT(*) FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE p.status='ready' AND s.deleted=0 AND ({current_preview_sql()})").fetchone()[0],
-                'last_collection_at':self._setting('source_last_collection_at'),
-                'last_collection_result':self._setting('source_last_collection_result'),
-                'last_error':self._setting('source_last_error'),
-                'learner_verified':self._setting('source_learner_verified')=='true'}
+        for row in self.db.execute("SELECT kind,COUNT(*) AS total,SUM(status='pending') AS pending,SUM(status='failed') AS failed,SUM(deleted) AS deleted FROM sources GROUP BY kind"):
+            counts[row['kind']] = {key: row[key] for key in ('total','pending','failed','deleted')}
+            counts[row['kind']].update(active_pending=row['pending'] + row['failed'], preview_ready=0, preview_failed=0, preview_pending=0)
+        health = {row['kind']: {**dict(row), 'learner_verified': bool(row['learner_verified'])} for row in self.db.execute('SELECT * FROM source_health')}
+        return {'mode': 'active', 'engine': 'simple-agenda', 'counts': counts, 'health': health,
+                'active_pending': sum(row['active_pending'] for row in counts.values()),
+                'preview_pending': 0, 'preview_failed': 0, 'preview_count': 0,
+                'last_collection_at': self._setting('source_last_collection_at'),
+                'last_collection_result': self._setting('source_last_collection_result'),
+                'last_error': self._setting('source_last_error'),
+                'learner_verified': self._setting('source_learner_verified') == 'true'}
 
     def ingest_sources(self, batch, current=None):
         """Accept only the selected learner; incomplete collection never deletes rows."""
@@ -229,11 +244,10 @@ class SourceStoreMixin:
                     # to delete a Calendar event.
                     if payload['deleted']:
                         self.db.execute("UPDATE sources SET outcome='review',reason='Source removed; linked Calendar facts require review.' WHERE id=?",(payload['id'],))
-                        if self.config.multi_source_mode=='active':
-                            for action in self.db.execute('SELECT a.proposal_id FROM canonical_actions a JOIN action_sources s ON s.action_id=a.id WHERE s.source_id=? AND s.relation NOT IN (?,?,?)',(payload['id'],CORROBORATION_RELATION,EXPIRED_FACT_RELATION,CLOSED_OFFER_RELATION)).fetchall():
-                                prow=self.db.execute('SELECT * FROM proposals WHERE id=?',(action[0],)).fetchone()
-                                if prow and prow['status']=='pending':
-                                    self._review_unwritten_locked(self._proposal(prow),'Supporting source removed; explicit review required.')
+                        for action in self.db.execute('SELECT a.proposal_id FROM canonical_actions a JOIN action_sources s ON s.action_id=a.id WHERE s.source_id=? AND s.relation NOT IN (?,?,?)',(payload['id'],CORROBORATION_RELATION,EXPIRED_FACT_RELATION,CLOSED_OFFER_RELATION)).fetchall():
+                            prow=self.db.execute('SELECT * FROM proposals WHERE id=?',(action[0],)).fetchone()
+                            if prow and prow['status']=='pending':
+                                self._review_unwritten_locked(self._proposal(prow),'Supporting source removed; explicit review required.')
             complete=set(batch.get('complete_kinds') or ())
             # Absence is meaningful only in an explicitly complete observed
             # scope. Announcements are all-current; Calendar scans only their
@@ -251,19 +265,18 @@ class SourceStoreMixin:
                 previous_payload['deleted']=True
                 self.db.execute("UPDATE sources SET deleted=1,status='deleted',payload=?,outcome='review',reason='Source unavailable in a complete current snapshot; no Calendar cancellation inferred.' WHERE id=?",(json.dumps(previous_payload,ensure_ascii=False),previous['id']))
                 self.db.execute("UPDATE source_previews SET status='stale' WHERE source_id=? AND status='ready'",(previous['id'],))
-                if self.config.multi_source_mode=='active':
-                    for action in self.db.execute('SELECT c.* FROM canonical_actions c JOIN action_sources a ON a.action_id=c.id WHERE a.source_id=? AND a.relation NOT IN (?,?,?)',(previous['id'],CORROBORATION_RELATION,EXPIRED_FACT_RELATION,CLOSED_OFFER_RELATION)).fetchall():
-                        # Another current literal source can still support the
-                        # obligation; disappearing one copy does not erase it.
-                        alternative=self.db.execute("SELECT s.* FROM sources s JOIN action_sources a ON a.source_id=s.id AND a.source_hash=s.content_hash WHERE a.action_id=? AND a.relation NOT IN (?,?,?) AND s.deleted=0 AND s.id<>? AND s.status IN ('analyzed','retained') ORDER BY s.published_at DESC LIMIT 1",(action['id'],CORROBORATION_RELATION,EXPIRED_FACT_RELATION,CLOSED_OFFER_RELATION,previous['id'])).fetchone()
-                        proposal=self.db.execute('SELECT * FROM proposals WHERE id=?',(action['proposal_id'],)).fetchone()
-                        if not proposal or proposal['status']!='pending':continue
-                        item=self._proposal(proposal)
-                        if alternative:
-                            item.update(source_id=alternative['id'],source_hash=alternative['content_hash'],source_kind=alternative['kind'])
-                            self.db.execute('UPDATE proposals SET payload=? WHERE id=?',(json.dumps(item,ensure_ascii=False),proposal['id']))
-                            self.db.execute('UPDATE canonical_actions SET payload=? WHERE id=?',(json.dumps(item,ensure_ascii=False),action['id']))
-                        else:self._review_unwritten_locked(item,'Supporting source unavailable in a complete snapshot; explicit review required.')
+                for action in self.db.execute('SELECT c.* FROM canonical_actions c JOIN action_sources a ON a.action_id=c.id WHERE a.source_id=? AND a.relation NOT IN (?,?,?)',(previous['id'],CORROBORATION_RELATION,EXPIRED_FACT_RELATION,CLOSED_OFFER_RELATION)).fetchall():
+                    # Another current literal source can still support the
+                    # obligation; disappearing one copy does not erase it.
+                    alternative=self.db.execute("SELECT s.* FROM sources s JOIN action_sources a ON a.source_id=s.id AND a.source_hash=s.content_hash WHERE a.action_id=? AND a.relation NOT IN (?,?,?) AND s.deleted=0 AND s.id<>? AND s.status IN ('analyzed','retained') ORDER BY s.published_at DESC LIMIT 1",(action['id'],CORROBORATION_RELATION,EXPIRED_FACT_RELATION,CLOSED_OFFER_RELATION,previous['id'])).fetchone()
+                    proposal=self.db.execute('SELECT * FROM proposals WHERE id=?',(action['proposal_id'],)).fetchone()
+                    if not proposal or proposal['status']!='pending':continue
+                    item=self._proposal(proposal)
+                    if alternative:
+                        item.update(source_id=alternative['id'],source_hash=alternative['content_hash'],source_kind=alternative['kind'])
+                        self.db.execute('UPDATE proposals SET payload=? WHERE id=?',(json.dumps(item,ensure_ascii=False),proposal['id']))
+                        self.db.execute('UPDATE canonical_actions SET payload=? WHERE id=?',(json.dumps(item,ensure_ascii=False),action['id']))
+                    else:self._review_unwritten_locked(item,'Supporting source unavailable in a complete snapshot; explicit review required.')
             for kind in KINDS-{'message'}:
                 success=kind in complete
                 self.db.execute('INSERT INTO source_health VALUES (?,?,?,?,?,?) ON CONFLICT(kind) DO UPDATE SET last_attempt_at=excluded.last_attempt_at,last_successful_fetch=COALESCE(excluded.last_successful_fetch,source_health.last_successful_fetch),last_result=excluded.last_result,last_error=excluded.last_error,learner_verified=excluded.learner_verified',
@@ -335,93 +348,10 @@ class SourceStoreMixin:
             item={**json.loads(row['payload']),**self._proposal(proposal)} if proposal else json.loads(row['payload'])
             decision=self.db.execute('SELECT payload FROM decision_intents WHERE id=?',(row['proposal_id'],)).fetchone()
             links=[dict(r) for r in self.db.execute('SELECT * FROM action_sources WHERE action_id=? ORDER BY source_id',(row['id'],))]
-            item=self._legacy_origin_provenance(item,links)
             event_ids={r[0] for r in self.db.execute('SELECT id FROM events WHERE proposal_id=?',(row['proposal_id'],))}
             if item.get('event_id'):event_ids.add(item['event_id'])
             return {'id':row['id'],'proposal_id':row['proposal_id'],'status':item.get('status',row['status']),'payload':item,'source_links':links,
-                    'evidence':self._linked_action_evidence(links,row['id']),
-                    'original_evidence':self._original_action_evidence(row['id'],links),
-                    'recovery_origin':self._current_origin_for_recovery(proposal,item,links),
                     'decision':json.loads((self.db.execute('SELECT payload FROM canonical_decisions WHERE action_id=?',(row['id'],)).fetchone() or decision)[0]) if (self.db.execute('SELECT 1 FROM canonical_decisions WHERE action_id=?',(row['id'],)).fetchone() or decision) else None,'event_ids':sorted(event_ids),'updated_at':row['updated_at']}
-
-    def _legacy_origin_provenance(self,item,links):
-        """Read projection for legacy decisions that predate typed provenance."""
-        from .core import as_datetime
-        if item.get('source_version_at')is not None:return item
-        origins=[link for link in links if link.get('relation')=='origin']
-        if len(origins)!=1:return item
-        link=origins[0]
-        row=self.db.execute('SELECT id,kind,content_hash,deleted,status,published_at,updated_at FROM sources WHERE id=?',(link['source_id'],)).fetchone()
-        if not row or row['deleted']or row['status']=='retained'or row['content_hash']!=link['source_hash']:return item
-        expected={'source_id':row['id'],'source_hash':row['content_hash'],'source_kind':row['kind']}
-        if any(item.get(key)is not None and item[key]!=value for key,value in expected.items()):return item
-        observed=row['updated_at']or row['published_at']
-        try:as_datetime(observed)
-        except (TypeError,ValueError,OverflowError):return item
-        return {**item,**expected,'source_version_at':observed}
-
-    def _original_action_evidence(self,action_id,links):
-        from .core import digest
-        return [{'id':digest(['original-action-quote',action_id,link['source_id'],link['source_hash'],link['source_quote']])[:32],
-                 'source_id':link['source_id'],'source_hash':link['source_hash'],'text':link['source_quote']}
-                for link in authority_links(links)[:8]if isinstance(link.get('source_quote'),str)and 4<=len(link['source_quote'].strip())<=4000]
-
-    def _current_origin_for_recovery(self,proposal,item,links):
-        """Expose current legacy origin separately from absent historical quotes.
-
-        This is input to a separate fact extractor, not matching evidence. The
-        actual proposal-row hash must corroborate the unique origin association.
-        No stored quotation, decision or source version is repaired here.
-        """
-        from .core import as_datetime,digest
-        if proposal is None or item.get('action_identity'):return None
-        origins=[link for link in authority_links(links)if link.get('relation')=='origin']
-        if len(origins)!=1:return None
-        link=origins[0]
-        if isinstance(link.get('source_quote'),str)and link['source_quote'].strip():return None
-        row=self.db.execute('SELECT * FROM sources WHERE id=?',(link['source_id'],)).fetchone()
-        if (not row or row['kind']!='message'or row['deleted']or row['status']=='retained'
-                or row['upstream_id']!=proposal['message_id']
-                or proposal['source_hash']!=link['source_hash']or row['content_hash']!=link['source_hash']):return None
-        data=json.loads(row['payload']);body=data.get('text');observed=row['updated_at']or row['published_at']
-        if not isinstance(body,str)or not 4<=len(body)<=4000 or(data.get('metadata')or{}).get('retained'):return None
-        try:as_datetime(observed)
-        except (ValueError,TypeError,OverflowError):return None
-        return {'source_id':row['id'],'source_hash':row['content_hash'],'proposal_source_hash':proposal['source_hash'],
-                'canonical_payload_hash':digest(item),'body':body,'published_at':observed}
-
-    def _linked_action_evidence(self,links,action_id):
-        """Bound context to the exact current source behind a saved quotation.
-
-        A legacy quote may omit a nearby sentence identifying the occasion. Only
-        its linked, still-current body can supply that context; retained bodies,
-        title similarity and unrelated inbox content provide no matching proof.
-        """
-        from .core import digest
-        evidence=[]
-        for link in authority_links(links)[:8]:
-            quote=link.get('source_quote')
-            if not isinstance(quote,str)or len(quote.strip())<4 or len(quote)>4000:continue
-            # A saved quote remains bounded historical proof at its recorded
-            # version even after a revision. It must never gain stale body text.
-            persisted=self.db.execute('SELECT 1 FROM action_sources WHERE action_id=? AND source_id=? AND source_hash=? AND source_quote=?',
-                (action_id,link['source_id'],link['source_hash'],quote)).fetchone()
-            snippet=quote if persisted else None
-            expanded=False
-            row=self.db.execute('SELECT id,content_hash,deleted,status,payload FROM sources WHERE id=?',(link['source_id'],)).fetchone()
-            if row and not row['deleted'] and row['status']!='retained' and row['content_hash']==link['source_hash']:
-                data=json.loads(row['payload']);body=data.get('text');metadata=data.get('metadata')or{}
-                if isinstance(body,str)and len(body)<=100000 and quote in body and not metadata.get('retained'):
-                    position=body.index(quote)
-                    start=max(0,position-max(0,(2000-len(quote))//2))
-                    end=min(len(body),start+2000)
-                    start=max(0,min(start,end-2000))
-                    snippet=body[start:end];expanded=True
-            if snippet is not None:
-                evidence.append({'id':digest([link['source_id'],link['source_hash'],snippet,expanded])[:32],
-                    'source_id':link['source_id'],'source_hash':link['source_hash'],'source_quote':quote,
-                    'text':snippet,'kind':'current_context'if expanded else'historical_quote'})
-        return evidence
 
     def list_actions(self,limit=100,offset=0,status=None):
         if not 1<=int(limit)<=500 or int(offset)<0:raise ValueError('Invalid action page.')
@@ -447,64 +377,50 @@ class SourceStoreMixin:
         return {'id':context.get('id'),'class_id':context.get('class_id'),
                 'pinned_id':self._setting('source_learner_id'),'verified':self._setting('source_learner_verified')}
 
-    def candidate_actions(self,proposal,limit=12,additional=()):
-        """Bounded relevant facts only; never all inboxes or all Calendar events."""
-        def content_words(item):
-            identity=item.get('action_identity') or {}
-            text=' '.join(str(identity.get(k) or '') for k in ('object','occasion'))+' '+str(item.get('title') or '')+' '+str(item.get('source_quote') or '')
-            generic={'librus','szkoła','school','klasa','class','dzieci','rodzice','proszę','termin','zajęcia','odbędzie','będzie','przygotować','przynieść'}
-            return {w for w in re.findall(r'[^\W\d_]{4,}',normalized_text(text)) if w not in generic}
-        words=content_words(proposal)
-        ranked=[]
-        available={r[0]:self.get_action(r[0]) for r in self.db.execute('SELECT id FROM canonical_actions ORDER BY id').fetchall()}
-        # A speculative preview must never replace a persisted target's original
-        # proof, decisions or hash-bound recovery context. New virtual targets
-        # still help compare independent pending previews with each other.
-        for action in additional:available.setdefault(action['id'],action)
-        for action in available.values():
-            item=action['payload']
-            # This is the same proof boundary used by both matching validators.
-            # Unknown human inventory remains a candidate even with default fields.
-            if candidate_is_distinct(proposal,item):continue
-            # A retained diagnostic with no human/event authority is not an
-            # existing obligation candidate. Human-owned unknown inventory still
-            # remains in the complete candidate set and cannot be filtered out.
-            if item.get('expired_without_authority')and not action.get('event_ids')and not action.get('decision'):continue
-            if 'evidence' not in action:
-                action={**action,'evidence':self._linked_action_evidence(action.get('source_links',[]),action['id'])}
-            tokens=content_words(item)
-            for proof in action['evidence']:
-                tokens.update(content_words({'source_quote':proof['text']}))
-            score=len(words & tokens)
-            same_source=bool(proposal.get('source_id') and any(x['source_id']==proposal['source_id'] for x in authority_links(action['source_links'])))
-            if score or same_source or item.get('inventory_only'):
-                ranked.append((int(same_source)*100+score,action))
-        ranked.sort(key=lambda pair:(-pair[0],pair[1]['id']))
-        self._source_candidates_complete = len(ranked)<=min(int(limit),12)
-        return [action for _,action in ranked[:min(int(limit),12)]]
-
-    def _source_write_reason(self,item):
+    def _source_write_reason(self, item):
+        # The shared plan may deliberately omit legacy pending intents. Its
+        # omission never adopts old automatic writes, including untagged rows.
+        if (self._setting('agenda_baseline_hash') and not item.get('agenda_plan_id')
+                and not item.get('user_approved')):
+            return 'Legacy automatic intent requires current agenda review.'
         if not item.get('canonical_action_id'):
             return None
-        from .core import digest
-        if (not self._setting('source_activation_at')
-                or self._setting('source_activation_learner')!=self._setting('source_learner_id')
-                or self._setting('source_activation_binding')!=digest([self.config.calendar_id,self.config.calendar_owner])):
-            return 'A verified activation receipt is required before source actions can write.'
-        if self._setting('source_learner_verified')!='true':
-            return 'Selected learner context is unverified; no source action may write.'
-        source=self.get_source(item.get('source_id'))
-        if not source or source['deleted'] or source['content_hash']!=item.get('source_hash') or source['status'] not in ('analyzed','retained'):
-            return 'Source version changed or is unavailable; reanalysis required.'
-        if item.get('recipient_basis',{}).get('kind')=='served_class_calendar':
-            from .source_audience import calendar_recipient_basis
-            context=json.loads(self._setting('source_learner_context','{}'))
-            context['verified']=self._setting('source_learner_verified')=='true'
-            if item['recipient_basis']!=calendar_recipient_basis(source,context):
-                return 'Observed calendar audience context changed; fresh analysis required.'
-        canonical=self.db.execute('SELECT proposal_id FROM canonical_actions WHERE id=?',(item['canonical_action_id'],)).fetchone()
-        if not canonical or canonical[0]!=item['id']:
-            return 'A newer canonical action supersedes this proposal.'
+        uncertain = item.get('deferred_unknown_operation')
+        if uncertain and self.db.execute("SELECT 1 FROM operations WHERE id=? AND status IN ('unknown','inflight')", (uncertain,)).fetchone():
+            return 'Prior write must be reconciled before this change can execute.'
+        if self._setting('source_learner_verified') != 'true':
+            return 'Selected learner context is unverified.'
+        action = self.db.execute('SELECT proposal_id FROM canonical_actions WHERE id=?', (item['canonical_action_id'],)).fetchone()
+        if not action or action[0] != item['id']:
+            return 'A newer agenda revision supersedes this proposal.'
+        group_id = item.get('alternative_group_id')
+        if group_id and not self.db.execute('SELECT 1 FROM proposal_group_members WHERE group_id=? AND proposal_id=?', (group_id, item['id'])).fetchone():
+            selected = self.db.execute("SELECT p.id,p.payload FROM proposal_groups g JOIN proposal_group_members m ON m.group_id=g.id AND m.proposal_id=g.selected_proposal_id JOIN proposals p ON p.id=m.proposal_id WHERE g.id=? AND g.status='selected'", (group_id,)).fetchone()
+            selected_aid = (json.loads(selected['payload']).get('canonical_action_id') or selected['id']) if selected else None
+            owned = self.db.execute('SELECT e.proposal_id,p.payload FROM events e LEFT JOIN proposals p ON p.id=e.proposal_id WHERE e.id=? AND e.calendar_id=? AND e.state=?', (item.get('event_id'), self.calendar_id, 'active')).fetchone()
+            owned_aid = (json.loads(owned['payload']).get('canonical_action_id') or owned['proposal_id']) if owned and owned['payload'] else None
+            if (item.get('kind') not in ('update', 'cancel') or selected_aid != item['canonical_action_id']
+                    or owned_aid != selected_aid):
+                return 'Only the selected offer action and its owned event may change after explicit review.'
+        refs = item.get('agenda_sources')
+        if refs:
+            context = json.loads(self._setting('source_learner_context','{}'))
+            if item.get('agenda_learner') != {'id': context.get('id'), 'class_id': context.get('class_id')}:
+                return 'Selected learner/class context changed; fresh agenda review required.'
+            plan = self.db.execute("SELECT status FROM agenda_plans WHERE id=?", (item.get('agenda_plan_id'),)).fetchone()
+            if not plan or plan[0] != 'applied':
+                return 'A persisted active agenda plan is required.'
+        else:
+            # Existing explicit human decisions remain executable. Old model-only
+            # pending proposals require review under the new shared planner.
+            if not item.get('user_approved'):
+                return 'Legacy automatic intent requires agenda review.'
+            refs = [{'source_id': item.get('source_id'), 'source_hash': item.get('source_hash')}]
+        for ref in refs:
+            source = self.get_source(ref['source_id'])
+            if (not source or source['learner_id'] != self._setting('source_learner_id')
+                    or source['deleted'] or source['content_hash'] != ref['source_hash']):
+                return 'Supporting source version changed or is unavailable; review required.'
         return None
 
     def remember_canonical_decision(self,proposal_id,record=None):
@@ -526,7 +442,7 @@ class SourceStoreMixin:
             try:old=as_datetime(row['content_since'] or row['fetched_at'])<cutoff
             except (ValueError,TypeError):old=False
             if old and row['status']!='retained':selected.append(row)
-        counts={'sources_pruned':len(selected),'source_previews_pruned':0,'source_audits_pruned':0}
+        counts={'sources_pruned':len(selected),'source_previews_pruned':0,'source_audits_pruned':0,'agenda_plans_pruned':0}
         if not apply:return counts
         for row in selected:
             sid=row['id']
@@ -581,27 +497,31 @@ class SourceStoreMixin:
                 try:old=as_datetime(row[column])<cutoff
                 except (ValueError,TypeError):old=False
                 if old:counts[key]+=self.db.execute('DELETE FROM '+table+' WHERE id=?',(row['id'],)).rowcount
+        for row in self.db.execute('SELECT id,payload,status,created_at FROM agenda_plans').fetchall():
+            try: old = as_datetime(row['created_at']) < cutoff
+            except (ValueError,TypeError): old = False
+            payload = json.loads(row['payload'])
+            if not old or payload.get('content_expired') or row['status'] == 'failed':continue
+            if row['status'] in ('preview', 'preview_failed'):
+                self.db.execute('DELETE FROM agenda_plans WHERE id=?', (row['id'],))
+            else:
+                # Keep operational IDs/version references; private model prose
+                # follows the same 30-day content retention as existing analysis.
+                fields = ('operation','action_id','proposal_id','sources','status','review_change','offer_group_id','new_offer_key','candidate_action_ids')
+                kept = {'snapshot_hash':payload.get('snapshot_hash'), 'content_expired':True,
+                        'items':[{key:item[key] for key in fields if key in item} for item in payload.get('items',[])]}
+                self.db.execute('UPDATE agenda_plans SET payload=? WHERE id=?', (json.dumps(kept),row['id']))
+            counts['agenda_plans_pruned'] += 1
         return counts
 
-    def source_mode_blocked(self,item):
-        return (self.config.multi_source_mode!='active' and item.get('canonical_action_id')
-                and item.get('source_kind') not in (None,'message'))
+    def source_mode_blocked(self, item):
+        # Compatibility for the existing executor; engine selection is retired.
+        return False
 
-    def source_write_deferred(self,item):
-        """A partial enabled channel cannot prove absence of cross-source facts."""
+    def source_write_deferred(self, item):
         if not item.get('canonical_action_id'):
             return False
-        if self._setting('source_activation_incomplete',''):return True
-        if self.config.multi_source_mode!='active':return False
-        if item.get('recipient_basis',{}).get('kind')=='served_class_calendar':
-            from .source_audience import calendar_recipient_basis
-            context=json.loads(self._setting('source_learner_context','{}'))
-            context['verified']=self._setting('source_learner_verified')=='true'
-            source=self.get_source(item.get('source_id'))
-            if (not source or self._setting('source_activation_class')!=context.get('class_id')
-                    or item['recipient_basis']!=calendar_recipient_basis(source,context)):
-                return True
-        if self._setting('source_last_collection_result')!='ok':
+        if self._setting('source_last_collection_result') != 'ok':
             return True
-        health={r['kind']:r['last_result'] for r in self.db.execute('SELECT kind,last_result FROM source_health')}
-        return any(health.get(kind)!='ok' for kind in KINDS)
+        health = {r['kind']: r['last_result'] for r in self.db.execute('SELECT kind,last_result FROM source_health')}
+        return any(health.get(kind) != 'ok' for kind in KINDS)

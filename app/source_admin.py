@@ -1,13 +1,9 @@
 """Explicit fingerprint-bound local administration, always under the sync lock."""
-from datetime import datetime
 import json
 import os
 from pathlib import Path
-import stat
-import uuid
-from .source_preview import SOURCE_PREVIEW_PLANNER_VERSION, current_preview_sql, incomplete_activation_attempt
 
-from .core import WARSAW,digest,utcnow
+from .core import digest,utcnow
 
 
 def read_private_json(path):
@@ -28,124 +24,9 @@ def write_private_json(path,data):
     return path
 
 
-def activation_snapshot(store):
-    return {'source_versions':[{ 'id':r['id'],'content_hash':r['content_hash'],'deleted':r['deleted'],'status':r['status']}
-                               for r in store.db.execute('SELECT id,content_hash,deleted,status FROM sources ORDER BY id')],
-            'decisions':store.source_decision_snapshot(),
-            'learner_id':store._setting('source_learner_id'),
-            'calendar_binding':digest([store.config.calendar_id,store.config.calendar_owner]),
-            'operations':digest([tuple(r) for r in store.db.execute('SELECT id,status,attempts,updated_at FROM operations ORDER BY id')])}
-
-
-def activate_sources(store,runtime,*,plan_path,apply=False,current=None,client_factory=None):
-    """Saved preview payload is deliberately never read as an execution plan.
-
-    The protected configuration is the sole mode authority. The operator changes
-    preview to active while scheduled sync is stopped, then applies this receipt.
-    Both modes and this command keep original Calendar write pause policy intact.
-    """
-    current=current or datetime.now(WARSAW)
-    def incomplete_attempt():
-        return incomplete_activation_attempt(store._setting('source_activation_incomplete',''))
-    def ready_sources():
-        from .source_store import KINDS
-        required=KINDS-{'message'}
-        health={r['kind']:dict(r) for r in store.db.execute('SELECT * FROM source_health')}
-        if (store._setting('source_last_collection_result')!='ok'
-                or any(k not in health or health[k]['last_result']!='ok' or not health[k]['learner_verified'] for k in required)):
-            raise ValueError('Every required source channel must have a complete verified collection.')
-        ready=[dict(r) for r in store.db.execute(f"SELECT p.* FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE p.status='ready' AND s.deleted=0 AND s.kind<>'message' AND ({current_preview_sql()}) ORDER BY p.source_id")]
-        attempt=incomplete_attempt()
-        if attempt:
-            selected={item['source_id']:item for item in ready}
-            for previous in attempt['sources']:
-                source=store.get_source(previous['id'])
-                if not source or source['deleted']:continue
-                if source['content_hash']!=previous['hash']:
-                    raise ValueError('An incomplete activation source needs a fresh current preview.')
-                if source['id']in selected:continue
-                # Only this failed attempt's exact current versions may reuse
-                # their activated preview as a selection receipt. Its payload
-                # is never executed: every selected source is freshly analyzed.
-                preview=store.db.execute(f"SELECT p.* FROM source_previews p WHERE source_id=? AND source_hash=? AND status IN ('ready','activated') AND ({current_preview_sql()})",
-                    (source['id'],source['content_hash'])).fetchone()
-                if not preview:
-                    raise ValueError('An incomplete activation source needs a fresh current preview.')
-                selected[source['id']]=dict(preview)
-            ready=[selected[key]for key in sorted(selected)]
-        missing=store.db.execute(f"SELECT COUNT(*) FROM sources s WHERE s.kind<>'message' AND s.deleted=0 AND s.status IN ('pending','failed') AND NOT EXISTS (SELECT 1 FROM source_previews p WHERE p.source_id=s.id AND p.source_hash=s.content_hash AND p.status='ready' AND ({current_preview_sql()}))").fetchone()[0]
-        if missing or not ready or len(ready)>5000:
-            raise ValueError('Every current source version needs a ready preview before activation.')
-        return ready
-    if not apply:
-        if store.config.multi_source_mode!='preview':raise ValueError('Activation planning requires preview mode.')
-        ready=ready_sources()
-        if not ready or store._setting('source_learner_verified')!='true':raise ValueError('Verified source previews are required.')
-        plan={'version':1,'kind':'source_activation','planner_version':SOURCE_PREVIEW_PLANNER_VERSION,'created_at':utcnow(),'snapshot':activation_snapshot(store),
-              'activation_guard':digest(store._setting('source_activation_incomplete','')),
-              'sources':[{ 'id':p['source_id'],'hash':p['source_hash']} for p in ready]}
-        plan['fingerprint']=digest(plan)
-        write_private_json(plan_path,plan)
-        return {'status':'preview','sources':len(ready),'calendar_writes':0,'plan_fingerprint':plan['fingerprint']}
-    plan=read_private_json(plan_path)
-    signed={k:v for k,v in plan.items() if k!='fingerprint'}
-    if plan.get('kind')!='source_activation' or plan.get('version')!=1 or plan.get('fingerprint')!=digest(signed):raise ValueError('Invalid activation plan.')
-    if plan.get('planner_version')!=SOURCE_PREVIEW_PLANNER_VERSION:raise ValueError('Activation planner changed; create fresh previews and a new plan.')
-    if store.config.multi_source_mode!='active':raise ValueError('Protected configuration must explicitly enable active mode.')
-    if plan.get('activation_guard',digest(''))!=digest(store._setting('source_activation_incomplete','')):
-        raise ValueError('Activation attempt changed; create a fresh retry plan.')
-    if activation_snapshot(store)!=plan['snapshot']:raise ValueError('Activation snapshot changed; create a fresh plan.')
-    ready_sources()
-    if not callable(client_factory):raise ValueError('Fresh verified source collection is required for activation.')
-    if not getattr(runtime,'read_only',False):raise ValueError('Activation validation requires a read-only Calendar runtime.')
-    selected=ready_sources()
-    if {item['source_id']for item in selected}!={item['id']for item in plan['sources']}:
-        raise ValueError('Activation retry does not cover its incomplete selection.')
-    attempt=json.dumps({'token':uuid.uuid4().hex,'plan':plan['fingerprint'],'sources':plan['sources']},sort_keys=True)
-    with store.lock,store.db:
-        store.db.execute('BEGIN IMMEDIATE')
-        if (activation_snapshot(store)!=plan['snapshot']or
-                plan.get('activation_guard',digest(''))!=digest(store._setting('source_activation_incomplete',''))):
-            raise ValueError('Activation state changed before collection.')
-        attempt_context=store.source_context_snapshot()
-        store.db.execute("INSERT OR REPLACE INTO settings VALUES ('source_activation_incomplete',?)",(attempt,))
-    client=client_factory()
-    batch=client.collect_sources(current=current,past_days=30,future_days=60)
-    store.ingest_sources(batch,current)
-    ready_sources()
-    if activation_snapshot(store)!=plan['snapshot']:raise ValueError('Fresh source collection changed the activation snapshot.')
-    probe=runtime.probe()
-    if probe.get('calendar_id')!=store.calendar_id or probe.get('access_role') not in ('owner','writer'):
-        raise ValueError('Exact Calendar access was not verified.')
-    from .codex_runtime import event_fingerprint,marker_present,external_attendees
-    for event in store.list_events(100000,include_cancelled=True):
-        observed=runtime.read_event(event['id'],event['snapshot'])
-        if (observed.get('id')!=event['id'] or not marker_present(observed.get('description'),event['marker'])
-                or external_attendees(observed,store.config.calendar_owner)
-                or event_fingerprint(observed,store.config.calendar_owner)!=event['fingerprint']):
-            raise ValueError('Owned Calendar evidence changed; review before activation.')
-    # Recheck after external reads. UI decisions made during Calendar validation
-    # cannot be silently accepted under the previous plan's fingerprint.
-    if activation_snapshot(store)!=plan['snapshot']:raise ValueError('Activation state changed during Calendar validation.')
-    from .source_planner import SourcePlanner
-    planner=SourcePlanner(store,runtime,expected_context=attempt_context)
-    outcomes=[]
-    for selected in plan['sources']:
-        source=store.get_source(selected['id'])
-        if not source or source['content_hash']!=selected['hash'] or source['deleted']:raise ValueError('Activation source changed.')
-        outcomes.append(planner.analyze(source,current))
-    with store.lock,store.db:
-        store.db.execute('BEGIN IMMEDIATE')
-        if (store._setting('source_activation_incomplete','')!=attempt
-                or store.source_context_snapshot()!=attempt_context):
-            raise ValueError('Activation attempt changed before completion.')
-        for key,value in (('source_activation_at',utcnow()),('source_activation_learner',attempt_context['pinned_id']),
-                ('source_activation_class',attempt_context['class_id']or''),
-                ('source_activation_binding',digest([store.config.calendar_id,store.config.calendar_owner])),('source_activation_plan',plan['fingerprint'])):
-            store.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)',(key,value))
-        store.db.execute("DELETE FROM settings WHERE key='source_activation_incomplete'")
-    return {'status':'applied','sources':len(outcomes),'calendar_writes':0,
-            'actions':sum(len(x['outcomes']) for x in outcomes),'plan_fingerprint':plan['fingerprint']}
+def activate_sources(store, runtime, *, plan_path, apply=False, current=None, client_factory=None):
+    """Retired rollout switch; no legacy activation may bypass the agenda."""
+    raise ValueError('Source engine activation is retired; use the complete agenda preview and normal sync.')
 
 
 def cleanup_existing(store,*,plan_path,request=None,apply=False):
