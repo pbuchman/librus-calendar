@@ -155,22 +155,26 @@ def prepare_source_proposals(source,raws,context,current=None):
     return prepared
 
 
-def verified_match(source,item,candidates,result):
+def verified_match(source,item,candidates,result,diagnostic=None):
     """Only one evidence-grounded match can transfer any durable human intent.
 
     A model's match ID, title or date is insufficient. Both literal quotations and
     a shared substantive anchor must be in the respective source evidence.
     """
-    if not isinstance(result,dict) or result.get('decision') not in {'match','distinct','uncertain'}:
-        return None,'uncertain'
-    if result['decision']!='match':return None,result['decision']
+    response=result.get('decision')if isinstance(result,dict)else None
+    response=response if isinstance(response,str)and response in {'match','distinct','uncertain'}else'invalid'
+    def finish(action,decision,code):
+        if diagnostic is not None:diagnostic.update(primary_response=response,primary_validation=code)
+        return action,decision
+    if response=='invalid':return finish(None,'uncertain','response_invalid')
+    if response!='match':return finish(None,response,'model_'+response)
     matches=[x for x in candidates if x['id']==result.get('action_id')]
-    if len(matches)!=1:return None,'uncertain'
+    if len(matches)!=1:return finish(None,'uncertain','target_not_unique')
     action=matches[0]
     old=action['payload']
     candidate_quote=result.get('candidate_quote')
-    if not _literal(result.get('source_quote'),source['text']) or not isinstance(candidate_quote,str)or len(candidate_quote.strip())<4:
-        return None,'uncertain'
+    if not _literal(result.get('source_quote'),source['text']):return finish(None,'uncertain','source_quote_unbound')
+    if not isinstance(candidate_quote,str)or len(candidate_quote.strip())<4:return finish(None,'uncertain','candidate_quote_invalid')
     proofs=[]
     for proof in action.get('evidence',[]):
         if result.get('evidence_id') and result['evidence_id']!=proof['id']:continue
@@ -180,20 +184,20 @@ def verified_match(source,item,candidates,result):
         # saved quote may itself be the bounded context.
         if candidate_quote in proof['text'] and (saved in candidate_quote or candidate_quote in saved):
             proofs.append(proof)
-    if len(proofs)!=1:return None,'uncertain'
+    if len(proofs)!=1:return finish(None,'uncertain','candidate_evidence_not_unique')
     anchors=result.get('anchors')
-    if not isinstance(anchors,list) or not 1<=len(anchors)<=4:return None,'uncertain'
+    if not isinstance(anchors,list) or not 1<=len(anchors)<=4:return finish(None,'uncertain','anchors_invalid')
     anchor_text=' '.join(str(a) for a in anchors)
     # Dates, generic school/parent language and titles cannot establish identity.
     significant=_substantive_words(anchor_text)
-    if len(significant)<2:return None,'uncertain'
-    if any(not _literal(a,result['source_quote']) or not _literal(a,candidate_quote) for a in anchors):return None,'uncertain'
+    if len(significant)<2:return finish(None,'uncertain','anchors_generic')
+    if any(not _literal(a,result['source_quote']) or not _literal(a,candidate_quote) for a in anchors):return finish(None,'uncertain','anchors_unbound')
     # A surrounding paragraph cannot reassign an untyped legacy action's
     # purpose. Some claimed substantive grounding must attach to its ORIGINAL
     # quote, not merely to a different obligation in expanded context.
-    if not significant&_substantive_words(proofs[0]['source_quote']):return None,'uncertain'
+    if not significant&_substantive_words(proofs[0]['source_quote']):return finish(None,'uncertain','original_anchor_missing')
     reason=_hard_match_decision(item,old)
-    return (None,reason)if reason else(action,'match')
+    return finish(None,reason,'typed_distinct')if reason else finish(action,'match','accepted')
 
 
 def verified_semantic_match(source,item,candidates,result):
@@ -298,6 +302,114 @@ class SourcePlanner:
     def __init__(self,store,runtime,*,expected_context=None):
         self.store,self.runtime,self.expected_context=store,runtime,expected_context
 
+    def _virtual_candidates(self,source,current=None,context=None):
+        """Conserve each prepared obligation; only exact bound authority supplies proof."""
+        records=[];origins={};current_clock=current
+        if context is None:
+            context=json.loads(self.store._setting('source_learner_context','{}'))
+            context['verified']=self.store._setting('source_learner_verified')=='true'
+        def projected(item):
+            value={key:entry for key,entry in item.items()if key not in
+                {'evidence','original_evidence','reconstructed_evidence','recovery_origin','canonical_action_id',
+                 'blocked_by_group_decision','blocked_by_offer_group','decision','event_ids','expired_without_authority'}}
+            value.update(user_approved=False,user_edited=False,user_rejected=False,deletion_approved=False,event_id=None)
+            if not isinstance(value.get('action_identity'),dict):value['action_identity']=None
+            if not isinstance(value.get('recipient'),dict):value['recipient']=None
+            return value
+        rows=self.store.db.execute(f"SELECT p.source_id,p.source_hash,p.payload FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE p.status='ready' AND s.deleted=0 AND ({current_preview_sql()}) AND p.source_id<>? ORDER BY p.created_at,p.id",(source['id'],)).fetchall()
+        for row in rows:
+            payload=json.loads(row['payload']);prepared=payload.get('proposals',[]);outcomes=payload.get('outcomes',[])
+            if not isinstance(prepared,list):raise ValueError('Invalid prepared preview actions.')
+            if not isinstance(outcomes,list):outcomes=[]
+            current=self.store.get_source(row['source_id'])
+            own_ids=[entry['action'].get('id')for entry in outcomes if isinstance(entry,dict)
+                     and isinstance(entry.get('action'),dict)and isinstance(entry['action'].get('payload'),dict)
+                     and entry['action']['payload'].get('source_id')==row['source_id']]
+            for index in range(max(len(prepared),len(outcomes))):
+                raw=prepared[index]if index<len(prepared)else None
+                if isinstance(raw,dict)and raw.get('kind')=='ignore':continue
+                outcome=outcomes[index]if index<len(outcomes)and isinstance(outcomes[index],dict)else{}
+                action=outcome.get('action');action=action if isinstance(action,dict)else{}
+                item=action.get('payload');item=item if isinstance(item,dict)else{}
+                claimed=action.get('id');well_formed=isinstance(claimed,str)and bool(claimed.strip())and bool(item)
+                unbound=digest(['unbound-preview-candidate',row['source_id'],row['source_hash'],index])[:32]
+                unknown={'id':unbound,'proposal_id':unbound,'payload':dict(projected(raw if isinstance(raw,dict)else item),inventory_only=True),
+                         'status':'review','decision':None,'event_ids':[],'source_links':[],'evidence':[],'original_evidence':[],
+                         '_preview_unbound':True}
+                record={'unknown':unknown,'claimed':claimed if well_formed else None,'action':action,'outcome':outcome,
+                        'raw':raw,'current':current,'own_link':None,'origin':None,'policy':None,'expired':False}
+                records.append(record)
+                quote=raw.get('source_quote')if isinstance(raw,dict)else None
+                expected={'source_id':row['source_id'],'source_hash':row['source_hash'],'source_kind':current['kind']if current else None}
+                if (not well_formed or not current or current['deleted']or current['status']=='retained'or current['content_hash']!=row['source_hash']
+                        or not isinstance(raw,dict)or any(raw.get(key)!=value for key,value in expected.items())
+                        or not isinstance(quote,str)or not 4<=len(quote)<=4000 or quote not in current.get('text','')
+                        or outcome.get('action_id')!=claimed or action.get('proposal_id')!=outcome.get('proposal_id')):continue
+                try:valid_fact=_source_fact_reason(raw,current)is None
+                except (TypeError,ValueError,KeyError,AttributeError):valid_fact=False
+                links=action.get('source_links')
+                if not valid_fact or not isinstance(links,list)or not links or any(not isinstance(link,dict)for link in links):continue
+                own=[link for link in links if link.get('source_id')==row['source_id']]
+                if (len(own)!=1 or own[0].get('source_hash')!=row['source_hash']or own[0].get('source_quote')!=quote
+                        or not isinstance(own[0].get('relation'),str)):continue
+                relation=own[0]['relation'];special=relation in {CORROBORATION_RELATION,EXPIRED_FACT_RELATION,CLOSED_OFFER_RELATION}
+                if not special and (relation!=outcome.get('outcome')or relation not in {'added','linked','enriched','review','ignored'}):continue
+                record['own_link']=own[0]
+                if special:
+                    # Derive the existing low-authority policy again from current
+                    # literal facts/context/clock; cached flags confer no exemption.
+                    try:record['policy']=prepare_source_proposals(current,[raw],context,current_clock)[0]
+                    except (TypeError,ValueError,KeyError,AttributeError,OverflowError):pass
+                fields=('kind','title','description','start','end','all_day','temporal_kind','due_at','activity_scope',
+                        'action_identity','recipient','recipient_basis','source_quote','optional','alternative_group','offer_identity',
+                        'date_certainty','informational','alternative_group_evidence')
+                if (len(links)!=1 or own_ids.count(claimed)!=1 or action.get('proposal_id')!=claimed
+                        or claimed!=digest(['source-action',row['source_id'],row['source_hash'],index,item])[:32]
+                        or any(item.get(key)!=value for key,value in expected.items())
+                        or any(raw.get(key)!=item.get(key)for key in fields)):continue
+                if special:
+                    record['expired']=(relation==EXPIRED_FACT_RELATION and outcome.get('outcome')=='ignored'
+                                       and bool((record['policy']or{}).get('expired_without_authority')))
+                    continue
+                candidate={'id':claimed,'proposal_id':claimed,'payload':projected(item),'status':action.get('status'),
+                           'decision':None,'event_ids':[],'source_links':[{key:own[0][key]for key in ('source_id','source_hash','source_quote','relation')}]}
+                candidate['evidence']=self.store._linked_action_evidence(candidate['source_links'],claimed)
+                candidate['original_evidence']=self.store._original_action_evidence(claimed,candidate['source_links'])
+                record['origin']=candidate;origins.setdefault(claimed,[]).append(candidate)
+        resolved=[]
+        for record in records:
+            claimed=record['claimed'];registered=origins.get(claimed,[]);authority=self.store.get_action(claimed)if claimed else None
+            origin=record['origin']if len(registered)==1 else None
+            if record['expired']and not(authority and (authority.get('decision')or authority.get('event_ids'))):continue
+            if origin:
+                if authority:
+                    # A formerly virtual origin may now be an actual canonical
+                    # action, but an unrelated ID collision is never authority.
+                    link=origin['source_links'][0]
+                    exact=any(all(saved.get(key)==link[key]for key in ('source_id','source_hash','source_quote'))
+                              for saved in authority_links(authority['source_links']))
+                    resolved.append(authority if exact else record['unknown'])
+                else:resolved.append(origin)
+                continue
+            target=authority or (registered[0]if len(registered)==1 else None)
+            action=record['action'];own=record['own_link'];links=action.get('source_links')
+            # Aliases need both their own current prepared quote and the exact
+            # claimed authority's payload/link prefix; ID/payload alone is not proof.
+            if (target and own and action.get('proposal_id')==target['proposal_id']
+                    and action.get('payload')==target['payload']and links==target['source_links']+[own]):
+                try:compatible=_hard_match_decision(record['raw'],target['payload'])is None
+                except (TypeError,ValueError,KeyError,AttributeError):compatible=False
+                relation=own['relation'];policy=record['policy']or{}
+                if relation==CORROBORATION_RELATION:
+                    compatible=compatible and bool(authority and policy.get('corroboration_only')and self._corroboration_allowed(record['current'],policy,authority))
+                elif relation==CLOSED_OFFER_RELATION:
+                    compatible=compatible and bool(authority and policy.get('closed_offer_research')and self._closed_offer_eligible(policy,authority))
+                elif relation==EXPIRED_FACT_RELATION:compatible=False
+                if compatible:
+                    resolved.append(target);continue
+            resolved.append(record['unknown'])
+        return resolved
+
     def analyze(self,source,current=None,preview=False):
         with self.store.lock:
             if self.expected_context is not None and self.store.source_context_snapshot()!=self.expected_context:
@@ -316,10 +428,7 @@ class SourcePlanner:
         prepared=prepare_source_proposals(source,raws,context,current)
         if preview and hasattr(self.runtime,'verify_source_action')and hasattr(self.runtime,'reserve_source_plan'):
             self.runtime.reserve_source_plan(sum(item['kind']!='ignore'for item in prepared))
-        virtual=[]
-        if preview:
-            for row in self.store.db.execute(f"SELECT p.payload FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE p.status='ready' AND s.deleted=0 AND ({current_preview_sql()}) AND p.source_id<>? ORDER BY p.created_at",(source['id'],)):
-                virtual.extend(x['action'] for x in json.loads(row[0]).get('outcomes',[]) if isinstance(x.get('action'),dict))
+        virtual=self._virtual_candidates(source,current,context)if preview else[]
         matches=[];recovery_cache={}
         for item_index,item in enumerate(prepared):
             if item['kind']=='ignore':matches.append((None,'distinct'));continue
@@ -327,13 +436,29 @@ class SourcePlanner:
                 matches.append((None,'distinct'if item.get('expired_without_authority')else'uncertain'));continue
             candidates=self.store.candidate_actions(item,additional=virtual)
             complete=getattr(self.store,'_source_candidates_complete',False)
+            missing=[action for action in candidates if not action.get('original_evidence')]
+            diagnostic={'candidate_count':len(candidates),'candidate_set_complete':bool(complete),
+                        'missing_original_count':len(missing),
+                        'unrecoverable_count':sum(not(action.get('recovery_origin')and _substantive_words(action['payload'].get('title','')))for action in missing),
+                        'primary_response':'not_requested','primary_validation':'not_requested',
+                        'recovery':'not_requested','verification':'not_requested'}
+            metadata.setdefault('matching_diagnostics',[]).append(diagnostic)
+            if any(action.get('_preview_unbound')for action in candidates):
+                # Invalid cache bindings cannot supply typed exclusions to any
+                # matching strategy, including the deterministic closed-offer path.
+                diagnostic.update(primary_validation='unbound_preview_candidate',
+                                  recovery='ineligible_unbound_preview',verification='ineligible_unbound_preview')
+                matches.append((None,'uncertain'));continue
             if item.get('closed_offer_research'):
                 matched=self._closed_offer_target(source,item,candidates)if complete else None
+                diagnostic['primary_validation']='closed_offer_retained'if matched else'closed_offer_unresolved'if complete else'candidate_overflow'
+                if not matched and complete and candidates:
+                    diagnostic['verification']='ineligible_missing_original'if missing else'unsupported'if not hasattr(self.runtime,'verify_source_action')else'not_requested'
                 if (not matched and complete and candidates and all(action.get('original_evidence')for action in candidates)
                         and hasattr(self.runtime,'verify_source_action')):
                     reserve=sum(other['kind']!='ignore'for other in prepared[item_index+1:])
                     if preview and hasattr(self.runtime,'can_verify_source_action')and not self.runtime.can_verify_source_action(reserve):
-                        self._verification_deferred(item,metadata)
+                        self._verification_deferred(item,metadata);diagnostic['verification']='budget_deferred'
                     else:
                         result=self.runtime.verify_source_action(source,item,candidates)
                         verified,decision=verified_semantic_match(source,item,candidates,result)
@@ -343,6 +468,7 @@ class SourcePlanner:
                         metadata.setdefault('identity_verifications',[]).append(dict(
                             getattr(self.runtime,'last_verification_metadata',None)or{},version=SOURCE_VERIFY_VERSION,
                             accepted=matched is not None,closed_offer_decision_only=True))
+                        diagnostic['verification']='accepted'if matched else'rejected'
                 if not matched:
                     from .core import start_key
                     if sum(start_key(item)==start_key(action['payload'])and not _hard_match_decision(item,action['payload'])for action in candidates)>1:
@@ -351,36 +477,42 @@ class SourcePlanner:
                 continue
             retained=self._retained_rejection(source,item,candidates) if complete and not item.get('corroboration_only')else None
             independently_verified=False
-            if retained:matched,decision=retained,'match'
+            if retained:
+                matched,decision=retained,'match';diagnostic['primary_validation']='retained_rejection'
             elif not complete:
-                matched,decision=None,'uncertain'
+                matched,decision=None,'uncertain';diagnostic['primary_validation']='candidate_overflow'
             elif candidates and hasattr(self.runtime,'match_source_action'):
                 result=self.runtime.match_source_action(source,item,candidates)
-                matched,decision=verified_match(source,item,candidates,result)
+                matched,decision=verified_match(source,item,candidates,result,diagnostic)
                 if item.get('corroboration_only')and decision=='match':matched,decision=None,'uncertain'
                 # Missing evidence is uncertainty, never permission to remove a
                 # plausible candidate and manufacture a unique semantic target.
                 reserve=sum(other['kind']!='ignore'for other in prepared[item_index+1:])
-                missing=[action for action in candidates if not action.get('original_evidence')]
-                if (decision=='uncertain'and isinstance(result,dict)and result.get('decision')in {'match','uncertain'}
-                        and missing and hasattr(self.runtime,'recover_source_action_evidence')
-                        and all(action.get('recovery_origin')and _substantive_words(action['payload'].get('title',''))for action in missing)):
+                fallback=decision=='uncertain'and diagnostic['primary_response']in {'match','uncertain'}
+                if fallback and missing:
+                    diagnostic['recovery']=('unsupported'if not hasattr(self.runtime,'recover_source_action_evidence')else
+                                             'ineligible_missing_origin'if diagnostic['unrecoverable_count']else'eligible')
+                if fallback and missing and diagnostic['recovery']=='eligible':
                     uncached=[action for action in missing if action['id']not in recovery_cache]
                     if uncached:
                         if preview and hasattr(self.runtime,'can_recover_source_action_evidence')and not self.runtime.can_recover_source_action_evidence(reserve):
-                            self._verification_deferred(item,metadata)
+                            self._verification_deferred(item,metadata);diagnostic['recovery']='budget_deferred'
                         else:
                             recovered=self.runtime.recover_source_action_evidence(uncached,context)
                             registered=recovered_action_evidence(uncached,recovered)
                             recovery_cache.update({action['id']:registered.get(action['id'],[])for action in uncached})
                             proof_metadata=dict(getattr(self.runtime,'last_recovery_metadata',None)or{},accepted_count=len(registered))
                             metadata.setdefault('origin_recoveries',[]).append(proof_metadata)
+                            diagnostic['recovery']='completed'
+                    else:diagnostic['recovery']='cached'
                     candidates=[dict(action,reconstructed_evidence=recovery_cache.get(action['id'],[]))for action in candidates]
                 original=candidates if all(action.get('original_evidence')or action.get('reconstructed_evidence')for action in candidates)else[]
-                if (decision=='uncertain'and isinstance(result,dict)and result.get('decision')in {'match','uncertain'}
-                        and original and hasattr(self.runtime,'verify_source_action')):
+                if fallback:
+                    diagnostic['verification']=('ineligible_missing_original'if not original else
+                                                 'unsupported'if not hasattr(self.runtime,'verify_source_action')else'eligible')
+                if fallback and diagnostic['verification']=='eligible':
                     if preview and hasattr(self.runtime,'can_verify_source_action')and not self.runtime.can_verify_source_action(reserve):
-                        self._verification_deferred(item,metadata)
+                        self._verification_deferred(item,metadata);diagnostic['verification']='budget_deferred'
                     else:
                         verification=self.runtime.verify_source_action(source,item,original)
                         matched,decision=verified_semantic_match(source,item,original,verification)
@@ -389,7 +521,10 @@ class SourcePlanner:
                             version=SOURCE_VERIFY_VERSION,accepted=decision=='match')
                         metadata.setdefault('identity_verifications',[]).append(proof_metadata)
                         independently_verified=decision=='match'
-            else:matched,decision=_synthetic_match(source,item,candidates)
+                        diagnostic['verification']='accepted'if independently_verified else'rejected'
+            else:
+                matched,decision=_synthetic_match(source,item,candidates)
+                diagnostic['primary_validation']='synthetic_'+decision
             if item.get('corroboration_only'):
                 if independently_verified and self._corroboration_allowed(source,item,matched):
                     decision='corroborate';metadata['corroboration_only']=metadata.get('corroboration_only',0)+1

@@ -2,7 +2,7 @@
 import json
 import re
 
-SOURCE_PREVIEW_PLANNER_VERSION = 'source-preview-planner-v2'
+SOURCE_PREVIEW_PLANNER_VERSION = 'source-preview-planner-v3'
 
 
 def preview_is_current(payload):
