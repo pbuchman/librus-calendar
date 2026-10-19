@@ -16,7 +16,7 @@ import jsonschema
 from .codex_runtime import SCHEMAS, CodexRuntime, RuntimeFailure, normalize_event, event_fingerprint
 from .core import WARSAW, digest, normalize_proposal, utcnow
 
-AGENDA_VERSION = 'simple-agenda-v2-compact'
+AGENDA_VERSION = 'simple-agenda-v3-operational-notices'
 AGENDA_MODEL = 'gpt-6.1-sol'
 AGENDA_EFFORT = 'high'
 # UTF-8 bytes are a conservative upper bound on text tokens. Reserve space for

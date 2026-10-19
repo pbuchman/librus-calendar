@@ -48,6 +48,12 @@ scope; no Calendar envelope is required when that text establishes applicability
 If neither text nor observed audience metadata establishes applicability, use
 review rather than automatic create. Do not transfer class/date authority from
 one source to a different activity merely because both sources appear together.
+Dated operational notices about services, availability, opening hours, closures
+or disruptions are information: use ignore unless the source also establishes
+an applicable pupil activity or duty. A service closure alone is not a personal
+agenda event. If an actual pupil activity is stated but its applicability is
+uncertain, use review. Preserve voluntary school actions with an explicit task,
+applicable pupil/class and date; mark optional=true rather than discarding them.
 Do not read attachments, images, OCR, PDFs or links. If essential evidence exists
 only there, use review. Failed source collection is not empty source content.
 
