@@ -15,6 +15,7 @@ def main(argv=None, *, config=None):
     parser.add_argument('--state', type=Path)
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('status')
+    sub.add_parser('agenda-preview', help='Plan the complete stored successful collection with fresh read-only Calendar state; does not refresh Librus sources or apply decisions.')
     backup = sub.add_parser('backup')
     backup.add_argument('--destination', type=Path)
     migrate = sub.add_parser('migrate-decisions', help='Transfer minimal decisions directly from a read-only old database; never copy message history.')
@@ -138,14 +139,14 @@ def main(argv=None, *, config=None):
                 return client
             def initialize_runtime():
                 from .codex_runtime import CodexRuntime
-                return CodexRuntime(config, read_only=args.command == 'rebuild')
+                return CodexRuntime(config, read_only=args.command in ('rebuild', 'agenda-preview') or (args.command == 'sync' and args.dry_run))
             if args.command == 'rebuild':
                 from .data_admin import RebuildController
                 result = RebuildController(store, client_factory=initialize_client, runtime_factory=initialize_runtime,
                                            days=args.days).run()
             else:
                 result = SyncController(store, client_factory=initialize_client, runtime_factory=initialize_runtime,
-                                        max_messages=args.limit).run(dry_run=args.dry_run)
+                                        max_messages=getattr(args, 'limit', 100)).run(dry_run=args.command == 'agenda-preview' or args.dry_run)
         print(json.dumps(result, ensure_ascii=True, indent=2))
         return 1 if result.get('status') in ('partial', 'failed', 'interrupted', 'review', 'already_running') else 0
     except ConfigurationError:

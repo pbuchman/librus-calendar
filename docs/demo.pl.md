@@ -46,10 +46,6 @@ Testy izolacji:
 
 Sprawdzają brak odszukiwania konfiguracji/domowego katalogu oraz tworzenia rzeczywistych klientów, powtarzalność wiadomości, propozycji i wydarzeń, stały czas rozpoczęcia synchronizacji i brak niezatwierdzonej robotyki na ilustracji. Potwierdza to fikcyjne dane oraz przepływ interfejsu; zgodność rzeczywistych kont, modeli i kalendarza wymaga osobnych testów.
 
-## Widoki źródeł i podglądu
+## Widoki źródeł i agendy
 
-Otwórz `/sources`, aby filtrować fikcyjne wiadomości, ogłoszenia i terminarz oraz przejść ze źródła do wspólnego działania. Szczegół działania pokazuje źródła, dowody i pewność. `/preview` przedstawia osobne fikcyjne analizy bez przycisku zatwierdzania ani aktywacji. Załączniki mają etykietę **załącznik nieanalizowany** i nie są pobierane. Przygotowane wyniki służą wyłącznie demonstracji; dotychczasowe cztery zrzuty powstały przed dodaniem widoków źródeł i nie potwierdzają ich wdrożenia.
-
-Podgląd pokazuje planowane dopasowania, zachowane decyzje rodzica i różnice wobec obecnych działań. Fikcyjna powtórzona wycieczka wskazuje istniejące działanie; powtórzone zaproszenie do klubu zachowuje rzeczywiste odrzucenie zapisane w fikcyjnej bazie. Wirtualne działania podglądu nie mają odnośnika do aktywnego działania. Gotowy podgląd bieżącej wersji źródła ma osobną etykietę; stary podgląd nie zastępuje stanu bieżącego źródła.
-
-Te fikcyjne widoki nie sprawdzają uwierzytelnionego pochodzenia dowodu adresatów terminarza klasy, odzyskiwania starszych dowodów, niezależnej jednoznacznej weryfikacji ani blokady przerwanej aktywacji. Takie mechanizmy wymagają osobnych testów; zapisany podgląd i dodatkowe źródło bez potwierdzonego adresata nie uprawniają do zapisów Calendar.
+`/sources` filtruje fikcyjne wiadomości, ogłoszenia i terminarz oraz pokazuje jedno działanie ze wszystkimi źródłami. `/preview` zawiera jeden przygotowany plan agendy: nowe opcjonalne przypomnienie, jedną wycieczkę potwierdzoną trzema źródłami i zachowane odrzucenie. Pokazuje czas zebrania zapisanych źródeł i informuje, że bieżąca aktualność wymaga sprawdzenia przy synchronizacji. Nie ma formularza zatwierdzania/aktywacji ani wywołania modelu. Załączniki są oznaczane i nie są pobierane. Fixture sprawdza prezentację i lokalne decyzje; nie potwierdza działania dostawcy, zbierania źródeł ani produkcji.

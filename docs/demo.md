@@ -46,10 +46,6 @@ Isolation tests:
 
 They verify no home/config discovery or real client initialization, repeatable message/proposal/event state, fixed synchronization timestamps, and exclusion of the unapproved extracurricular event from the illustration. This validates the offline fixture and UI flow; live account/model/calendar compatibility requires separate checks.
 
-## Source and preview views
+## Source and agenda views
 
-Open `/sources` to filter fictional messages, announcements and school-calendar entries and follow a source to its canonical action. The action detail lists supporting sources, evidence and certainty. `/preview` presents separate synthetic analyses with no approval or activation control. Attachments are labeled **załącznik nieanalizowany** and never fetched. These seeded source results are demonstrations only; existing four screenshots predate the source views and do not establish their deployed state.
-
-Preview shows planned matching outcomes, retained human decisions and differences from existing actions. A fictional repeated trip links to its existing action; a repeated club invitation retains an actual seeded rejection. Virtual preview actions have no active-action link. A ready preview of the current source version is labeled separately from active analysis; stale versions do not override current source state.
-
-These fictional views do not test authenticated served-class-calendar audience provenance, legacy-evidence recovery, independent unique matching or the interrupted-activation guard. Those mechanisms need separate checks; a saved preview and corroborating source without verified recipient applicability grant no Calendar write authority.
+`/sources` filters fictional messages, announcements and school-calendar entries and links to one action with all supporting sources. `/preview` shows one seeded whole-agenda plan: a new optional reminder, one trip supported by three sources and a preserved rejection. It labels the stored source-collection time and warns that current freshness needs a new sync check. No approval/activation form or model call runs on this page. Attachments are labeled unread and never fetched. The fixture tests UI presentation and local decisions; it does not establish live provider, source collection or production behavior.

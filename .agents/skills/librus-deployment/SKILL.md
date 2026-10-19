@@ -27,25 +27,13 @@ Run from the Librus repository:
 
 Preparation validates the source, runs full offline tests in an isolated temporary home, scans source and complete reachable history, builds a wheel, installs dependencies into a separate release, verifies imports/resources outside the checkout, and records artifact/application hashes and the wheel's resource inventory. Each installed release is validated against its own hash-verified wheel and recorded application files; older manifests derive their resource inventory from their wheel. Preparation, including reuse, and target activation also require the invoking source's full resource list. All preparation completes before services stop. An existing verified release is reused; no service commands or production database access occur during preparation.
 
-Never run real-message evaluation against production state or expose it on the production port. `scripts/evaluate_analysis.py --config PRIVATE_EVAL_CONFIG PRIVATE_CASES_JSON` uses an explicitly read-only runtime and does not discover the production configuration. The offline UI fixture uses temporary synthetic state; use a separate development port when production is running.
+The offline UI fixture uses temporary fictional state and no external clients. Use a separate development port. Keep real school data and plan output outside Git.
 
-## Initial state migration
+## Existing state upgrade
 
-Follow the reviewed migration policy and stop new old-worker runs, allowing any active writer to finish. Use the prepared release Python before activation, explicitly selecting the new private state:
+Keep the existing private database path and configured learner/calendar binding. Stop new old-worker runs, allow any active writer to finish and reconcile unknown outcomes. The new initialization idempotently links existing messages, proposals and owned events into the shared agenda; it preserves IDs, decisions, approved hours, groups and journals. Never reset, copy or restore SQLite, create a fresh replacement target, or run the retired source activation/message reanalysis workflow.
 
-```sh
-release_python="$HOME/.local/lib/librus-calendar/releases/FULL_SHA/.venv/bin/python"
-"$release_python" -I -m app.cli --config "$HOME/.config/librus-calendar/config.json" --state "$HOME/.local/share/librus-calendar/current.sqlite3" pause-writes
-"$release_python" -I -m app.cli --config "$HOME/.config/librus-calendar/config.json" --state "$HOME/.local/share/librus-calendar/current.sqlite3" migrate-decisions --from "$HOME/.local/share/librus-calendar/state.sqlite3"
-"$release_python" -I -m app.cli --config "$HOME/.config/librus-calendar/config.json" --state "$HOME/.local/share/librus-calendar/current.sqlite3" rebuild --days 30
-"$release_python" -I -m app.cli --config "$HOME/.config/librus-calendar/config.json" --state "$HOME/.local/share/librus-calendar/current.sqlite3" prune --days 30
-```
-
-The migration source and target must differ. `migrate-decisions` directly reads the old DB; it copies no message history or database file. It keeps minimal human decisions, exact owned event IDs/markers, cancellation tombstones and unresolved journal evidence. Bound calendar/owner and account identities must match. For an explicitly authorized unbound legacy source only, append `--allow-legacy-binding`; this requires a read-only Calendar owner probe and every exact saved event calendar to match.
-
-`rebuild` permits calendar reads only, scans all Librus pages in the 1–30 day window, retries failed cached work, and verifies discovered and transferred exact event IDs. It changes only target local state and invokes analysis, never queues/executes a calendar mutation. Investigate partial/review outcomes before acceptance. Keep writes paused, run `sync --dry-run` with the prepared release interpreter, and inspect pending proposals and review items before resuming writes. An automatic update or cancellation of an event governed by prior human approval, edit or rejection requires fresh approval of that change, including across source messages after reconstruction; cancellation also requires explicit confirmation.
-
-`prune` previews by default; use `--apply` only within the approved retention policy. It clears old message/analysis content and unnecessary snapshot payload but retains minimal ownership, event IDs, decisions, conflict/tombstone and every durable operation journal record. Unknown/inflight intent is preserved in full. In-place secure deletion/VACUUM makes no backup and no calendar write. Retain/delete the old source according to the explicit acceptance policy, never through an automatic installer copy/delete. The detailed contract is in `docs/setup.md` and `app/CONTRACT.md`.
+Use the prepared release interpreter with `-I` for status and `agenda-preview` (equivalently `sync --dry-run`). Preview uses the last complete stored collection plus fresh read-only Calendar state; it does not refresh Librus. It records source collection time and mutates only isolated preview rows. A failed or stale preview grants no write authority. Normal sync freshly collects and rechecks sources, decisions and Calendar before materializing a plan. Inspect preservation, review and unknown states before resuming writes. `prune` remains preview-only unless `--apply` is authorized by the retention policy; keep all journal and ownership evidence.
 
 ## Activate
 
@@ -55,7 +43,7 @@ For normal releases:
 .venv/bin/python scripts/deploy.py activate --sha FULL_SHA
 ```
 
-For the explicitly authorized initial migration, prepare the private target state/configuration first, then use:
+For the explicitly authorized initial migration, preserve and validate the existing private state/configuration first, then use:
 
 ```sh
 .venv/bin/python scripts/deploy.py activate --sha FULL_SHA --migrate-legacy --no-sync

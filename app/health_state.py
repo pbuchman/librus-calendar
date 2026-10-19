@@ -22,6 +22,11 @@ ERROR_CODES = frozenset(('configuration_required', 'calendar_configuration_requi
     'unexpected_tool_arguments', 'unexpected_tool_count', 'unsafe_event_boundaries', 'unsafe_event_fields'))
 ERROR_CODES |= frozenset(('codex_protocol_invalid', 'calendar_tool_incomplete', 'calendar_probe_audit_failed',
     'codex_permission_denied', 'codex_configuration_failed', 'discovery_timeout', 'discovery_http_failed', 'discovery_connection_failed', 'discovery_parsing_failed'))
+ERROR_CODES |= frozenset(('agenda_collection_incomplete', 'agenda_context_overflow', 'agenda_snapshot_overflow',
+    'agenda_snapshot_invalid', 'agenda_learner_unverified', 'agenda_learner_mismatch',
+    'agenda_calendar_snapshot_incomplete', 'agenda_calendar_snapshot_invalid', 'agenda_plan_invalid', 'agenda_plan_stale',
+    'agenda_action_reference_invalid', 'agenda_source_reference_invalid', 'agenda_group_reference_invalid',
+    'agenda_conflicting_operations', 'agenda_review_required', 'agenda_model_configuration_required', 'agenda_whole_snapshot_required'))
 PROBE_RESULTS = frozenset(('running', 'ok', 'failed', 'interrupted'))
 PROBE_FIELDS = ('attempt_number', 'model', 'effort', 'cli_version', 'started_at', 'completed_at', 'result',
     'safe_code', 'process_code', 'started_count', 'completed_count', 'parse_error_count', 'unknown_event_count',
@@ -108,8 +113,10 @@ def read_source_health(db, tables):
     current_preview=current_preview_sql() if 'payload' in {r[1] for r in db.execute('PRAGMA table_info(source_previews)')} else '0'
     settings=dict(db.execute('SELECT key,value FROM settings WHERE key IN (?,?,?,?)',PREVIEW_RETRY_SETTINGS))
     preview_queue,queue_args=preview_queue_sql(settings)
+    engine_row = db.execute("SELECT value FROM settings WHERE key='agenda_engine'").fetchone()
+    simple = bool(engine_row and engine_row[0] == 'simple-agenda')
     row = db.execute("SELECT value FROM settings WHERE key='multi_source_mode'").fetchone()
-    mode = row[0] if row else 'off'
+    mode = 'active' if simple else (row[0] if row else 'off')
     if mode not in SOURCE_MODES:
         raise ValueError('Invalid source mode.')
     kinds = {}
@@ -122,7 +129,7 @@ def read_source_health(db, tables):
             raise ValueError('Invalid source result.')
         if code is not None and code not in SOURCE_ERROR_CODES:
             code = 'source_operation_failed'
-        pending, failed, preview_ready = counts.get('pending', 0), counts.get('failed', 0), None
+        pending, failed, preview_ready = counts.get('pending', 0), counts.get('failed', 0), 0 if simple else None
         if mode == 'preview' and kind != 'message':
             preview_counts = dict(db.execute(f'SELECT p.status,COUNT(*) FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE s.kind=? AND s.deleted=0 AND ({current_preview}) GROUP BY p.status', (kind,)))
             preview_ready = preview_counts.get('ready', 0)
@@ -132,8 +139,28 @@ def read_source_health(db, tables):
             last_successful_fetch=timestamp(health[0]) if health else None,
             pending=pending, failed=failed, preview_ready=preview_ready, links=links,
             last_result=result, last_error=code)
-    return dict(mode=mode, kinds=kinds,
-        preview_count=int(db.execute(f"SELECT COUNT(*) FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE p.status='ready' AND s.deleted=0 AND ({current_preview})").fetchone()[0]))
+    return dict(mode=mode, kinds=kinds, **({'engine': 'simple-agenda'} if simple else {}),
+        preview_count=0 if simple else int(db.execute(f"SELECT COUNT(*) FROM source_previews p JOIN sources s ON s.id=p.source_id AND s.content_hash=p.source_hash WHERE p.status='ready' AND s.deleted=0 AND ({current_preview})").fetchone()[0]))
+
+
+def read_agenda_health(db, tables):
+    """Technical plan outcomes only: no payload, source ID, hash or model text."""
+    if 'agenda_plans' not in tables:
+        return None
+    result = {'engine': 'simple-agenda'}
+    for name, clause in (('latest_plan', "NOT IN ('preview','preview_failed')"),
+                         ('latest_preview', "IN ('preview','preview_failed')")):
+        row = db.execute('SELECT status,created_at,error_code FROM agenda_plans WHERE status ' + clause +
+                         ' ORDER BY created_at DESC,rowid DESC LIMIT 1').fetchone()
+        if row:
+            status, created_at, code = row
+            if status not in {'applied', 'failed', 'preview', 'preview_failed'}:
+                raise ValueError('Invalid agenda status.')
+            result[name] = {'status': status, 'created_at': timestamp(created_at),
+                            'error_code': code if code in ERROR_CODES else ('operation_failed' if code else None)}
+        else:
+            result[name] = None
+    return result
 
 
 def read_connection_state(db, now=None):
@@ -210,7 +237,7 @@ def read_connection_state(db, now=None):
                 item = max(latest, key=lambda value: value['attempt_number'])
                 probe.update(calendar_probe_result=item['result'], calendar_probe_attempts=len(latest),
                     calendar_probe_recovered=None if item['result'] == 'running' else item['result'] == 'ok' and item['attempt_number'] == 2)
-    return dict(schema_version=1, sources=read_source_health(db, tables), **probe, initialized_at=timestamp(settings.get('health_initialized_at')),
+    return dict(schema_version=1, sources=read_source_health(db, tables), agenda=read_agenda_health(db, tables), **probe, initialized_at=timestamp(settings.get('health_initialized_at')),
         last_attempt_at=timestamp(last['started_at'] if last else settings.get('last_sync')),
         last_successful_sync=timestamp(settings.get('last_successful_sync')),
         last_result=result, last_stage=stage, last_error_code=code, last_duration_seconds=duration,

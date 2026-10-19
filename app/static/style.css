@@ -23,3 +23,5 @@ button:disabled{cursor:default;opacity:.55}
 .preview-diff { display: grid; grid-template-columns: minmax(90px, auto) 1fr; gap: 8px 16px; font-size: 12px; }
 .preview-diff dt { font-weight: 600; }
 .preview-diff dd { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+
+.agenda-preview > p { margin: 16px 22px; }

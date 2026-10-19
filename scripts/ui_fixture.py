@@ -2,6 +2,7 @@
 """Deterministic, synthetic UI demo. No Librus, Codex or Calendar clients."""
 from __future__ import annotations
 import argparse
+import json
 from datetime import datetime
 from pathlib import Path
 import sys
@@ -16,7 +17,7 @@ from app.web import create_app
 DEMO_NOW = datetime(2030, 3, 6, 10, 15, tzinfo=ZoneInfo('Europe/Warsaw'))
 DEMO_STAMP = DEMO_NOW.isoformat()
 DEMO_LABEL = 'Demo — dane fikcyjne / fictional data'
-DEMO_CONFIG = AppConfig(multi_source_mode='preview', calendar_id='calendar@example.test', calendar_owner='owner@example.test',
+DEMO_CONFIG = AppConfig( calendar_id='calendar@example.test', calendar_owner='owner@example.test',
                         state_path=Path('demo-state-unused.sqlite3'), credentials_path=Path('demo-credentials-unused.json'))
 
 # Newly authored synthetic messages; no private source messages were reused.
@@ -180,22 +181,26 @@ def seed_sources(store):
         'start':'2030-03-11','end':None,'all_day':True,'optional':True,'confidence':'high',
         'activity_scope':'school','source_quote':'Na 11 marca 2030 chętni mogą przynieść kolorowy papier.',
         'review_reason':'Opcjonalne zwykłe przypomnienie szkolne; wyłącznie podgląd.'}
-    provenance={'model':'synthetic-fixture (no model called)','effort':'none','decision_reason':DEMO_LABEL}
-    store.save_source_preview(optional,[planned],metadata=provenance,outcomes=[{
-        'action_id':'demo-virtual-optional','proposal_id':'demo-virtual-optional','outcome':'added',
-        'reason':'Opcjonalne szkolne przypomnienie, bez zapisu w podglądzie.',
-        'action':{'id':'demo-virtual-optional','payload':planned,'decision':None,'event_ids':[],'source_links':[]}}])
     linked=source_identity('announcement','demo-trip-announcement','demo-learner')
-    trip_action=store.get_action(trip['id'])
-    store.save_source_preview(linked,[],metadata=provenance,outcomes=[{
-        'action_id':trip['id'],'proposal_id':trip['id'],'outcome':'linked',
-        'reason':'To samo wyjście: zachowano wspólne działanie bez drugiego wpisu.', 'action':trip_action}])
+    calendar_source=source_identity('school_event','demo-trip-calendar','demo-learner')
     rejected=next(item for item in store.list_proposals() if item['message_id']=='demo-rejected-club')
     rejected_source=source_identity('announcement','demo-rejected-announcement','demo-learner')
-    store.save_source_preview(rejected_source,[],metadata=provenance,outcomes=[{
-        'action_id':rejected['id'],'proposal_id':rejected['id'],'outcome':'ignored',
-        'reason':'Zachowano wcześniejsze odrzucenie udziału przez rodzica.',
-        'action':store.get_action(rejected['id'])}])
+    def item(operation, ids, action=None, target=None, reason=''):
+        return dict(operation=operation, action_id=target, proposal_id=target,
+                    sources=[{'source_id': sid, 'source_hash': store.get_source(sid)['content_hash']} for sid in ids],
+                    reason=reason, action=action, review_change=None, offer_group_id=None,
+                    new_offer_key=None, candidate_action_ids=[])
+    plan={'snapshot_hash':'synthetic-demo-snapshot','decision_reason':DEMO_LABEL,
+          'items':[item('create',[optional],planned,reason='Opcjonalne szkolne przypomnienie, bez zapisu w podglądzie.'),
+                   item('link',[source_identity('message',trip['message_id']),linked,calendar_source],target=trip['id'],
+                        reason='To samo wyjście w trzech źródłach: jedno działanie i jeden wpis.'),
+                   item('ignore',[rejected_source],target=rejected['id'],
+                        reason='Zachowano wcześniejsze odrzucenie udziału przez rodzica.')]}
+    metadata={'model':'synthetic-fixture','effort':'none','prompt_version':'demo-simple-agenda',
+              'source_collection_at':DEMO_STAMP,'sources_refreshed_by_preview':False}
+    with store.db:
+        store.db.execute('INSERT INTO agenda_plans VALUES (?,?,?,?,?,?,NULL)',
+                         ('demo-agenda-preview','synthetic-demo-snapshot',json.dumps(plan),json.dumps(metadata),'preview',DEMO_STAMP))
 
 
 def make_demo_app(store: AppStore, port=8795):

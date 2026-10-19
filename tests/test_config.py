@@ -79,14 +79,12 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(tools[tools.index('-m') + 1], 'gpt-test-luna')
         self.assertIn('apps.connector_synthetic.tools.read_event.enabled=true', tools)
 
-    def test_configured_analysis_provenance_tracks_actual_selection(self):
-        config = replace(TEST_CONFIG, analysis_model='gpt-test-sol', analysis_effort='xhigh')
-        record = {'type': 'item.completed', 'item': {'type': 'agent_message',
-                  'text': json.dumps({'proposals': [], 'decision_reason': 'Synthetic undated advice.'})}}
-        runtime = CodexRuntime(config, run_process=lambda *_: (0, json.dumps(record), ''))
-        self.assertEqual(runtime.analyze({'text': 'Synthetic advice.'}), [])
-        self.assertEqual(runtime.last_analysis_metadata['model'], config.analysis_model)
-        self.assertEqual(runtime.last_analysis_metadata['effort'], config.analysis_effort)
+    def test_agenda_rejects_nonexplicit_runtime_model_before_process(self):
+        from app.codex_runtime import RuntimeFailure
+        runtime = CodexRuntime(replace(TEST_CONFIG, analysis_model='gpt-test-sol', analysis_effort='xhigh'),
+                               run_process=lambda *_: self.fail('must fail before provider'))
+        with self.assertRaisesRegex(RuntimeFailure, 'agenda_model_configuration_required'):
+            runtime.plan_agenda({})
 
     def test_verified_owner_is_separate_from_calendar_id(self):
         owner = 'account-owner@example.test'

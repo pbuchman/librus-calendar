@@ -36,6 +36,10 @@ class FakeClient:
             raise RuntimeError('Simulated private failure')
         return {'message_id': mid, 'subject': 'School '+mid, 'sender': 'Teacher', 'sent_at': '2026-10-08T10:00:00+02:00', 'text': QUOTE, 'read_date_returned': 'already read'}
 
+    def collect_sources(self, **kwargs):
+        return {'learner': {'id': 'fictional-learner', 'class_id': '1x'}, 'sources': [],
+                'complete_kinds': ['announcement','school_event','substitution'], 'status':'ok'}
+
 
 class FakeRuntime:
     def __init__(self, propose=True, fail_analysis=False, outcome='applied'):
@@ -51,6 +55,28 @@ class FakeRuntime:
         if self.fail_analysis:
             raise RuntimeError('Simulated model failure')
         return [proposal(title='Trip '+message['id'], start='2030-11-10T%02d:00:00+01:00' % (9 + int(message['id']) % 10))] if self.propose else []
+
+    def plan_agenda(self, snapshot):
+        from test_agenda import item, plan
+        self.agenda_calls = getattr(self, 'agenda_calls', 0) + 1
+        result = []
+        for source in snapshot['sources']:
+            if source['kind'] != 'message' or source['status'] not in ('pending','failed'):
+                continue
+            message = {'id': source['id'].removeprefix('message:'), 'text': source['text']}
+            for raw in self.analyze(message, []):
+                projected = {key: raw.get(key) for key in ('title','description','start','end','all_day','temporal_kind','due_at','activity_scope')}
+                projected.update(optional=False, temporal_kind=raw.get('temporal_kind', 'event'), activity_scope=raw.get('activity_scope', 'school'))
+                result.append(item(snapshot, 'review' if raw.get('needs_review') or raw.get('confidence', 'high') == 'low' or raw.get('activity_scope', 'school') != 'school' else 'create', review_change='create' if raw.get('needs_review') or raw.get('confidence', 'high') == 'low' or raw.get('activity_scope', 'school') != 'school' else None, action=projected, sources=[{'source_id':source['id'],'source_hash':source['content_hash']}]))
+        self.last_agenda_metadata = {key: value for key, value in getattr(self, 'last_analysis_metadata', {}).items() if key in ('model','effort','prompt_version')}
+        return plan(snapshot, result)
+
+    def read_event(self, eid, expected=None):
+        found = next((operation for operation in reversed(self.executed)
+                      if eid == 'event-' + operation['message_id']), None)
+        if found:
+            return {**found['event'], 'id': eid}
+        return dict(expected or {}, id=eid)
 
     def execute(self, op):
         self.executed.append(op)
@@ -68,12 +94,12 @@ class SyncTests(unittest.TestCase):
 
     def test_pagination_bounded_and_resumes_without_losing_tail(self):
         client, runtime = FakeClient(count=125), FakeRuntime(propose=False)
-        result = SyncController(self.store, client, runtime).run(dry_run=True, current=NOW)
+        result = SyncController(self.store, client, runtime).run(current=NOW)
         self.assertEqual(result['fetched'], 100)
         self.assertEqual(self.store._setting('discovery_page'), '11')
         self.assertLessEqual(len(set(client.details)), 100)
         self.assertIsNone(self.store.get_message('124'))
-        result = SyncController(self.store, client, runtime).run(dry_run=True, current=NOW)
+        result = SyncController(self.store, client, runtime).run(current=NOW)
         self.assertIsNotNone(self.store.get_message('100'))
         self.assertIsNotNone(self.store.get_message('109'))
         self.assertIsNotNone(self.store.get_message('124'))
@@ -82,14 +108,14 @@ class SyncTests(unittest.TestCase):
 
     def test_limit_one_cursor_and_page_size_change_fill_history_in_same_run(self):
         client, runtime = FakeClient(count=25), FakeRuntime(propose=False)
-        first = SyncController(self.store, client, runtime, max_messages=1).run(dry_run=True, current=NOW)
+        first = SyncController(self.store, client, runtime, max_messages=1).run(current=NOW)
         self.assertEqual(first['fetched'], 1)
         self.assertEqual(self.store._setting('discovery_page'), '2')
         self.assertEqual(self.store._setting('discovery_page_size'), '1')
         # Even an older persisted cursor must not be interpreted under a new size.
         self.store.set_setting('discovery_page', '3')
         client.pages.clear()
-        full = SyncController(self.store, client, runtime).run(dry_run=True, current=NOW)
+        full = SyncController(self.store, client, runtime).run(current=NOW)
         self.assertEqual(full['fetched'], 25)
         self.assertEqual(client.pages, [1, 2, 3])
         self.assertEqual(self.store.status()['messages'], 25)
@@ -98,7 +124,7 @@ class SyncTests(unittest.TestCase):
 
     def test_30day_history_ends_at_old_page(self):
         client, runtime = FakeClient(count=60, old_after=12), FakeRuntime(propose=False)
-        result = SyncController(self.store, client, runtime).run(dry_run=True, current=NOW)
+        result = SyncController(self.store, client, runtime).run(current=NOW)
         self.assertEqual(result['fetched'], 12)
         self.assertEqual(client.pages, [1, 2, 3])
         self.assertIsNone(self.store.get_message('12'))
@@ -118,37 +144,37 @@ class SyncTests(unittest.TestCase):
 
     def test_analysis_failure_retries_from_durable_queue(self):
         client, runtime = FakeClient(), FakeRuntime(fail_analysis=True)
-        first = SyncController(self.store, client, runtime).run(dry_run=True, current=NOW)
+        first = SyncController(self.store, client, runtime).run(current=NOW)
         self.assertEqual(first['analysis_failures'], 1)
-        self.assertEqual(self.store.get_message('0')['status'], 'analysis_failed')
+        self.assertEqual(self.store.get_message('0')['status'], 'analysis_pending')
+        self.assertEqual(self.store.agenda_status()['latest_plan']['status'], 'failed')
         runtime.fail_analysis = False
-        second = SyncController(self.store, client, runtime).run(dry_run=True, current=NOW)
+        second = SyncController(self.store, client, runtime).run(current=NOW)
         self.assertEqual(second['analyzed'], 1)
         self.assertEqual(self.store.get_message('0')['status'], 'analyzed')
 
-    def test_successful_empty_analysis_persists_current_call_provenance(self):
+    def test_successful_empty_plan_persists_current_call_provenance(self):
         runtime = FakeRuntime(propose=False)
-        def analyze(source, events):
-            runtime.last_analysis_metadata = {'model': 'gpt-6.1-sol', 'effort': 'high',
-                'prompt_version': 'school-actions-v2', 'decision_reason': 'Information only; no school action or date.'}
-            return []
-        runtime.analyze = analyze
-        result = SyncController(self.store, FakeClient(), runtime).run(dry_run=True, current=NOW)
+        runtime.last_analysis_metadata = {'model':'gpt-6.1-sol','effort':'high','prompt_version':'fictional-shared-plan'}
+        result = SyncController(self.store, FakeClient(), runtime).run(current=NOW)
         self.assertEqual(result['analyzed'], 1)
-        source = self.store.get_message('0')
-        self.assertEqual(source['analysis_metadata']['model'], 'gpt-6.1-sol')
-        self.assertEqual(source['analysis_metadata']['effort'], 'high')
-        self.assertEqual(source['analysis_metadata']['prompt_version'], 'school-actions-v2')
-        self.assertIn('Information only', source['analysis_metadata']['decision_reason'])
-        self.assertEqual(self.store.get_analysis_history('0')[0]['proposal_ids'], [])
+        metadata = self.store.agenda_status()['latest_plan']['metadata']
+        self.assertEqual(metadata['model'], 'gpt-6.1-sol')
+        self.assertEqual(metadata['effort'], 'high')
+        self.assertEqual(metadata['prompt_version'], 'fictional-shared-plan')
+        self.assertEqual(self.store.get_message('0')['status'], 'analyzed')
+        self.assertEqual(self.store.get_analysis_history('0'), [])  # No second per-message analysis journal.
 
     def test_dry_run_and_default_pause_skip_all_execution(self):
         client, runtime = FakeClient(), FakeRuntime()
         SyncController(self.store, client, runtime).run(current=NOW)
         self.assertEqual(runtime.executed, [])
         self.store.set_writes_paused(False)
-        SyncController(self.store, client, runtime).run(dry_run=True, current=NOW)
+        before = list(self.store.db.execute('SELECT * FROM operations'))
+        result = SyncController(self.store, client, runtime).run(dry_run=True, current=NOW)
+        self.assertEqual(result['status'], 'dry_run')
         self.assertEqual(runtime.executed, [])
+        self.assertEqual(before, list(self.store.db.execute('SELECT * FROM operations')))
         self.assertEqual(len(self.store.pending_operations()), 1)
 
     def test_unknown_operation_only_reconciles_never_new_create(self):
@@ -265,14 +291,16 @@ class SyncTests(unittest.TestCase):
         third = SyncController(self.store, client, runtime).run(current=NOW)
         self.assertEqual(third['status'], 'ok')
 
-    def test_analysis_backlog_over_budget_prevents_success(self):
+    def test_full_snapshot_replaces_per_message_analysis_budget(self):
         self.store.set_writes_paused(False)
         for index in range(3):
-            self.store.save_message({'id': str(index), 'text': QUOTE})
-        result = SyncController(self.store, FakeClient(count=0), FakeRuntime(propose=False), max_messages=1).run(current=NOW)
-        self.assertEqual(result['status'], 'partial')
-        self.assertEqual(result['state']['messages_pending'], 2)
-        self.assertIsNone(result['state']['last_successful_sync'])
+            self.store.save_message({'id':str(index),'text':QUOTE})
+        runtime = FakeRuntime(propose=False)
+        result = SyncController(self.store, FakeClient(count=0), runtime, max_messages=1).run(current=NOW)
+        self.assertEqual(result['status'], 'ok')
+        self.assertEqual(result['state']['messages_pending'], 0)
+        self.assertEqual(runtime.agenda_calls, 1)
+        self.assertEqual(len(runtime.analyzed), 3)
 
     def test_failed_write_and_unknown_write_prevent_success(self):
         self.store.set_writes_paused(False)
