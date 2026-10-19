@@ -1,7 +1,8 @@
 """The single planner retains strict temporal and policy output contracts."""
+import json
 import unittest
-from app.agenda import validate_agenda_plan
-from app.codex_runtime import RuntimeFailure, CodexRuntime
+from app.agenda import AGENDA_VERSION, validate_agenda_plan
+from app.codex_runtime import SCHEMAS, RuntimeFailure, CodexRuntime
 from test_agenda import action, item, plan
 from test_support import TEST_CONFIG
 
@@ -62,3 +63,42 @@ class AgendaPolicyTests(unittest.TestCase):
         self.assertIn('web_search="disabled"', args)
         for method in ('analyze', 'analyze_source', 'match_source_action', 'verify_source_action', 'recover_source_action_evidence'):
             self.assertFalse(hasattr(runtime, method))
+
+    def test_operational_notice_unknown_activity_and_voluntary_task_share_one_contract(self):
+        # This checks the real instructions/input and accepted output contract.
+        # Real model interpretation remains the bounded read-only preview gate.
+        bodies = [
+            'Biblioteka szkolna będzie zamknięta 12 marca z powodu inwentaryzacji.',
+            'Warsztaty odbędą się 14 marca. Uczestnictwo wymaga potwierdzenia; odbiorców nie wskazano.',
+            'Uczniowie klasy 1x mogą dobrowolnie przynieść papier na zajęcia 15 marca.',
+        ]
+        snapshot = dict(self.snapshot, learner={'id': 'fictional-pupil', 'class_id': '1x'}, sources=[
+            {'id': 'fictional-source-%d' % index, 'content_hash': str(index + 1) * 64,
+             'kind': 'announcement', 'text': body, 'metadata': {'scope': 'all_current_announcements'}}
+            for index, body in enumerate(bodies)])
+        outputs = [item(snapshot, 'ignore', action=None, reason='Informacja o dostępności placówki.'),
+                   item(snapshot, 'review', review_change='create', action=None,
+                        reason='Nie ustalono uczestnictwa wybranej klasy.'),
+                   item(snapshot, action=dict(action(), start='2030-03-15', optional=True))]
+        for output, source in zip(outputs, snapshot['sources']):
+            output['sources'] = [{'source_id': source['id'], 'source_hash': source['content_hash']}]
+        calls = []
+        def process(args, prompt, timeout):
+            calls.append((args, prompt))
+            return 0, json.dumps({'type': 'item.completed', 'item': {
+                'type': 'agent_message', 'text': json.dumps(plan(snapshot, outputs))}}), ''
+        runtime = CodexRuntime(TEST_CONFIG, run_process=process, read_only=True)
+        result = runtime.plan_agenda(snapshot)
+        self.assertEqual([entry['operation'] for entry in result['items']], ['ignore', 'review', 'create'])
+        self.assertTrue(result['items'][2]['action']['optional'])
+        self.assertEqual(len(calls), 1)
+        for body in bodies:
+            self.assertIn(body, calls[0][1])
+        self.assertTrue(any('model_instructions_file=' in argument and 'agenda_plan.md' in argument
+                            for argument in calls[0][0]))
+        policy = (SCHEMAS / 'agenda_plan.md').read_text()
+        self.assertIn('A service closure alone is not a personal', policy)
+        self.assertIn('an applicable pupil activity or duty', policy)
+        self.assertIn('uncertain, use review', policy)
+        self.assertIn('Preserve voluntary school actions with an explicit task', policy)
+        self.assertEqual(runtime.last_agenda_metadata['prompt_version'], AGENDA_VERSION)
