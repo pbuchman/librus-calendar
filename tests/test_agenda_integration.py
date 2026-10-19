@@ -45,7 +45,8 @@ class Calendar:
             found = next((event for event in self.events.values() if operation['marker'] in event['description']), None)
             return {'status': 'applied', 'event_id': found['id'], 'snapshot': found,
                     'fingerprint': event_fingerprint(found), 'reconciled': True} if found else {'status': 'unknown'}
-        event = {**operation['event'], 'id': eid}
+        event = ({**self.events[eid], 'status': 'cancelled'} if operation['action'] == 'cancel'
+                 else {**operation['event'], 'id': eid})
         self.events[eid] = event
         self.writes.append(operation)
         if self.timeout_after_write:
@@ -77,6 +78,101 @@ class AgendaIntegrationTests(AgendaTests):
             self.store.record_result(operation['operation_id'], runtime.execute(operation),
                                      agenda_calendar=planner.calendar, current=NOW)
         return queued
+
+    def approved_cancel(self):
+        result, runtime, planner = self.apply(lambda snapshot: [item(snapshot)])
+        self.store.set_writes_paused(False)
+        self.execute_pending(runtime, planner)
+        target = self.store.list_events()[0]['id']
+        aid = result['items'][0]['action_id']
+        runtime.select = lambda snapshot: [item(snapshot, 'review', action_id=aid,
+                                               review_change='cancel', action=None)]
+        snapshot = self.snapshot(runtime.events)
+        cancellation = materialize_plan(self.store, snapshot, plan(snapshot, runtime.select(snapshot)),
+                                        runtime.events, current=NOW)['items'][0]
+        self.store.resolve_proposal(cancellation['proposal_id'], 'confirm_cancel')
+        return aid, cancellation['proposal_id'], target, runtime, planner
+
+    def test_approved_pending_cancel_survives_duplicate_model_review_and_queues_once(self):
+        aid, pid, target, runtime, planner = self.approved_cancel()
+        before = tuple(self.store.db.execute('SELECT * FROM decision_intents WHERE id=?', (pid,)).fetchone())
+        runtime.select = lambda snapshot: [item(snapshot, 'review', action_id=aid,
+            review_change='cancel', action=dict(action(), title='Opis modelu zmieniony',
+                                              description='Inne uzasadnienie odwołania.', optional=True))]
+        repeated = planner.run(NOW)['items'][0]
+        self.assertEqual((repeated['operation'], repeated['proposal_id']), ('link', pid))
+        retained = next(p for p in self.store.list_proposals() if p['id'] == pid)
+        self.assertEqual(retained['status'], 'pending')
+        self.assertTrue(retained['user_approved'] and retained['deletion_approved'])
+        self.assertEqual(tuple(self.store.db.execute('SELECT * FROM decision_intents WHERE id=?', (pid,)).fetchone()), before)
+        self.assertEqual(self.store.get_action(aid)['proposal_id'], pid)
+        queued = self.store.queue_operations(NOW)
+        self.assertEqual([(op['action'], op['proposal_id'], op['event_id']) for op in queued], [('cancel', pid, target)])
+        self.assertEqual(self.store.queue_operations(NOW), [])
+        self.assertEqual(planner.run(NOW)['status'], 'unchanged')
+        self.assertEqual(len(self.store.pending_operations()), 1)
+        operation = self.store.pending_operations()[0]
+        self.assertTrue(self.store.claim_operation(operation['operation_id'], expected_operation=operation))
+        self.store.record_result(operation['operation_id'], runtime.execute(operation), agenda_calendar=planner.calendar, current=NOW)
+        self.assertEqual(self.store.queue_operations(NOW), [])
+        self.assertEqual(len([op for op in runtime.writes if op['action'] == 'cancel']), 1)
+        self.assertEqual(self.store.list_events(), [])
+        self.assertEqual(self.store.list_events(include_cancelled=True)[0]['id'], target)
+        calls = runtime.calls
+        self.assertEqual(planner.run(NOW)['status'], 'unchanged')
+        self.assertEqual(runtime.calls, calls)
+
+    def test_changed_source_does_not_reuse_pending_cancel_approval(self):
+        aid, pid, target, runtime, planner = self.approved_cancel()
+        with self.store.db:
+            self.store.db.execute("UPDATE sources SET content_hash='new-material-information' WHERE kind='announcement'")
+        revised = planner.run(NOW)['items'][0]
+        self.assertEqual(revised['operation'], 'review')
+        self.assertNotEqual(revised['proposal_id'], pid)
+        self.assertFalse(self.store.get_action(aid)['payload']['deletion_approved'])
+        self.assertEqual(self.store.queue_operations(NOW), [])
+        self.assertIsNotNone(self.store.db.execute('SELECT 1 FROM decision_intents WHERE id=?', (pid,)).fetchone())
+
+    def test_external_edit_does_not_reuse_pending_cancel_approval(self):
+        aid, pid, target, runtime, planner = self.approved_cancel()
+        runtime.events[target]['summary'] = 'Ręczna zmiana Calendar'
+        revised = planner.run(NOW)['items'][0]
+        self.assertEqual(revised['operation'], 'review')
+        self.assertNotEqual(revised['proposal_id'], pid)
+        self.assertEqual(self.store.queue_operations(NOW), [])
+
+    def test_changed_owned_target_does_not_reuse_pending_cancel_approval(self):
+        aid, pid, target, runtime, planner = self.approved_cancel()
+        replacement = 'fictional-replacement-target'
+        runtime.events[replacement] = dict(runtime.events.pop(target), id=replacement)
+        with self.store.db:
+            self.store.db.execute('UPDATE events SET id=?,snapshot=? WHERE id=?',
+                                  (replacement, json.dumps(runtime.events[replacement]), target))
+        revised = planner.run(NOW)['items'][0]
+        self.assertEqual(revised['operation'], 'review')
+        self.assertNotEqual(revised['proposal_id'], pid)
+        self.assertEqual(self.store.get_action(aid)['payload']['event_id'], replacement)
+        self.assertEqual(self.store.queue_operations(NOW), [])
+
+    def test_different_change_kind_does_not_inherit_cancel_approval(self):
+        aid, pid, target, runtime, planner = self.approved_cancel()
+        runtime.select = lambda snapshot: [item(snapshot, 'review', action_id=aid,
+            review_change='update', action=dict(action(), title='Nowa czynność'))]
+        revised = planner.run(NOW)['items'][0]
+        self.assertEqual(revised['operation'], 'review')
+        self.assertNotEqual(revised['proposal_id'], pid)
+        self.assertEqual(self.store.queue_operations(NOW), [])
+
+    def test_unknown_cancel_write_cannot_reuse_or_bypass_pending_approval(self):
+        aid, pid, target, runtime, planner = self.approved_cancel()
+        operation = self.store.queue_operations(NOW)[0]
+        self.assertTrue(self.store.claim_operation(operation['operation_id'], expected_operation=operation))
+        self.store.record_result(operation['operation_id'], {'status': 'unknown'}, agenda_calendar=planner.calendar, current=NOW)
+        revised = planner.run(NOW)['items'][0]
+        self.assertEqual(revised['operation'], 'review')
+        with self.assertRaisesRegex(ValueError, 'prior write'):
+            self.store.resolve_proposal(revised['proposal_id'], 'confirm_cancel')
+        self.assertEqual(self.store.queue_operations(NOW), [])
 
     def test_three_sources_one_action_review_is_local_and_replay_skips_inference(self):
         result, runtime, planner = self.apply(lambda snapshot: [item(snapshot),
