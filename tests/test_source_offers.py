@@ -170,6 +170,10 @@ class ClosedParticipationTests(unittest.TestCase):
                     'same_purpose':True,'same_occasion':True,'recipient_compatible':True,'unique_target':True}
         runtime=Independent();result=SourcePlanner(self.store,runtime).analyze(src,fixtures.NOW)
         self.assertEqual(runtime.verifications,5);self.assertTrue(all(x['outcome']=='ignored'for x in result['outcomes']))
+        metadata=json.loads(self.store.db.execute('SELECT metadata FROM source_analysis_audit WHERE source_id=? ORDER BY analyzed_at DESC LIMIT 1',(src['id'],)).fetchone()[0])
+        diagnostics=metadata['matching_diagnostics'];self.assertEqual(len(diagnostics),5)
+        self.assertTrue(all(item['primary_response']=='not_requested'and item['primary_validation']=='closed_offer_unresolved'
+                            and item['verification']=='accepted'for item in diagnostics))
         self.assertEqual(before,self.protected());self.assertEqual(self.store.queue_operations(fixtures.NOW),[])
 
     def test_legacy_closed_verification_rechecks_decision_cas_for_preview_and_active(self):
