@@ -479,6 +479,14 @@ class AgendaIntegrationTests(AgendaTests):
         self.assertEqual(len(runtime.writes), 2)
         self.assertEqual(self.store.agenda_status()['latest_plan']['status'], 'failed')
         self.assertEqual(self.store.agenda_status()['latest_plan']['error_code'], 'agenda_context_overflow')
+        failed = self.store.latest_agenda_plan()
+        self.assertEqual(failed['payload'], {})
+        with patch('app.agenda.MAX_INPUT_BYTES', 1000000):
+            full_input_bytes = len(agenda_prompt(assemble_agenda_snapshot(
+                self.store, runtime.events, current=NOW, enforce_budget=False)).encode())
+        self.assertEqual(failed['metadata'], {
+            'input_bytes': full_input_bytes,
+            'input_limit_bytes': 160000})
 
     def test_exact_duplicate_create_plan_fails_before_persistence_or_queue(self):
         self.ready()
@@ -486,6 +494,28 @@ class AgendaIntegrationTests(AgendaTests):
         with self.assertRaisesRegex(RuntimeFailure, 'agenda_conflicting_operations'):
             AgendaPlanner(self.store, runtime).run(NOW)
         self.assertEqual(self.store.list_actions(), [])
+        self.assertEqual(self.store.list_proposals(), [])
+        self.assertEqual(self.store.queue_operations(NOW), [])
+
+    def test_overflow_diagnostics_measure_failing_post_plan_snapshot(self):
+        self.ready()
+        runtime = Calendar(lambda snapshot: [item(snapshot)])
+        original_bytes = len(agenda_prompt(self.snapshot()).encode())
+        budget = original_bytes + 100
+        # A valid plan can grow the materialized agenda past the input budget.
+        # The transaction rolls back; diagnostics must describe that larger
+        # failing snapshot, rather than the smaller pre-planning input.
+        with patch('app.agenda.MAX_INPUT_BYTES', budget):
+            with self.assertRaisesRegex(RuntimeFailure, 'agenda_context_overflow') as failed:
+                AgendaPlanner(self.store, runtime).run(NOW)
+        metadata = self.store.latest_agenda_plan()['metadata']
+        self.assertEqual(metadata, {'input_bytes': failed.exception.input_bytes,
+                                    'input_limit_bytes': budget})
+        self.assertGreater(metadata['input_bytes'], budget)
+        self.assertEqual(runtime.calls, 1)
+        self.assertEqual(self.store.list_actions(), [])
+        self.assertEqual(self.store.pending_operations(), [])
+        self.assertEqual(runtime.writes, [])
         self.assertEqual(self.store.list_proposals(), [])
         self.assertEqual(self.store.queue_operations(NOW), [])
 

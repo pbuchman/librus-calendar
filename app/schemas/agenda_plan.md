@@ -40,6 +40,8 @@ before participation. Existing group selection allows exactly the selected optio
 
 Only act for the verified learner/class. Another named child/class or an
 unconfirmed parent volunteer role is not an obligation for this learner.
+All sources have been checked to belong to snapshot.learner; that shared learner
+ID is recorded once rather than repeated on every source.
 Served class-calendar metadata can establish class audience, but never exclusive
 role or participation. Substitutions do not create personal Calendar entries.
 Announcement visibility alone does not establish that this learner/class attends.

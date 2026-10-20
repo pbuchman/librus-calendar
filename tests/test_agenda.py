@@ -8,7 +8,7 @@ import sqlite3
 import tempfile
 import unittest
 
-from app.agenda import assemble_agenda_snapshot, MAX_INPUT_BYTES, validate_agenda_plan
+from app.agenda import agenda_prompt, assemble_agenda_snapshot, MAX_INPUT_BYTES, validate_agenda_plan
 from app.codex_runtime import CodexRuntime, RuntimeFailure, normalize_event
 from app.codex_runtime import SCHEMAS
 from app.core import AppStore, WARSAW
@@ -147,6 +147,40 @@ class AgendaTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeFailure, 'agenda_context_overflow'):
             self.runtime(plan(snapshot, []), calls).plan_agenda(snapshot)
         self.assertEqual(calls, [])
+
+    def test_shared_verified_learner_keeps_complete_input_under_budget(self):
+        sources = [{'kind': 'announcement', 'upstream_id': 'fictional-extra-%d' % index,
+                    'learner_id': LEARNER['id'], 'title': 'Materiały', 'sender': 'Szkoła',
+                    'published_at': '2030-03-01T09:00:00+01:00', 'updated_at': None,
+                    'text': 'Pełny fikcyjny tekst %d.' % index, 'metadata': {}, 'deleted': False}
+                   for index in range(79)]
+        self.store.ingest_sources({'learner': LEARNER, 'sources': sources, 'complete_kinds': []}, NOW)
+        snapshot = self.snapshot()
+        self.assertEqual(len(snapshot['sources']), 82)
+        self.assertEqual(snapshot['learner']['id'], LEARNER['id'])
+        self.assertTrue(snapshot['learner']['verified'])
+        self.assertTrue(all('learner_id' not in source for source in snapshot['sources']))
+        projected_texts = {source['text'] for source in snapshot['sources']}
+        self.assertTrue(all(source['text'] in projected_texts for source in sources))
+        # The old projection crosses the same unchanged cap solely by repeating
+        # the invariant already checked by the assembler. Full text is retained.
+        snapshot['sources'][0]['text'] += 'x' * (MAX_INPUT_BYTES - 1000 - len(agenda_prompt(snapshot).encode()))
+        complete_text = snapshot['sources'][0]['text']
+        prompt = agenda_prompt(snapshot)
+        self.assertEqual(len(prompt.encode()), MAX_INPUT_BYTES - 1000)
+        self.assertEqual(json.loads(prompt.split('\n', 1)[1])['sources'][0]['text'], complete_text)
+        for source in snapshot['sources']:
+            source['learner_id'] = LEARNER['id']
+        with self.assertRaisesRegex(RuntimeFailure, 'agenda_context_overflow'):
+            agenda_prompt(snapshot)
+
+    def test_shared_learner_projection_still_rejects_foreign_source(self):
+        for status, deleted in (('analyzed', 0), ('retained', 0), ('deleted', 1)):
+            with self.subTest(status=status), self.store.db:
+                self.store.db.execute("UPDATE sources SET learner_id='another-fictional-child',status=?,deleted=? WHERE kind='announcement'",
+                                      (status, deleted))
+                with self.assertRaisesRegex(RuntimeFailure, 'agenda_learner_mismatch'):
+                    self.snapshot()
 
     def test_foreign_references_duplicate_targets_and_bad_dates_fail(self):
         event = self.inventory()

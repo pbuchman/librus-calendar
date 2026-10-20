@@ -82,6 +82,69 @@ RESULTS = {'idle', 'running', 'ok', 'partial', 'failed', 'interrupted', 'paused'
 PROBE_RESULTS = {'running', 'ok', 'failed', 'interrupted'}
 
 
+# Labels are notification metadata only. Never publish arbitrary snapshot strings.
+SYNC_STAGES = frozenset(('analysis', 'calendar_probe', 'complete', 'credentials', 'discovery',
+    'fetch', 'login', 'queue', 'reconcile', 'runtime', 'starting', 'write'))
+SYNC_ERROR_CODES = frozenset(('account_mismatch', 'agenda_action_reference_invalid', 'agenda_calendar_snapshot_incomplete',
+    'agenda_calendar_snapshot_invalid', 'agenda_collection_incomplete',
+    'agenda_conflicting_operations', 'agenda_context_overflow', 'agenda_group_reference_invalid',
+    'agenda_learner_mismatch', 'agenda_learner_unverified', 'agenda_model_configuration_required',
+    'agenda_plan_invalid', 'agenda_plan_stale', 'agenda_review_required', 'agenda_snapshot_invalid',
+    'agenda_snapshot_overflow', 'agenda_source_reference_invalid', 'agenda_whole_snapshot_required',
+    'analysis_failed', 'analysis_tool_forbidden', 'calendar_configuration_required',
+    'calendar_event_id_mismatch', 'calendar_event_missing', 'calendar_event_not_found',
+    'calendar_not_allowed', 'calendar_probe_audit_failed', 'calendar_result_unreadable',
+    'calendar_search_incomplete', 'calendar_tool_failed', 'calendar_tool_incomplete',
+    'calendar_write_access_missing', 'codex_binary_required', 'codex_configuration_failed',
+    'codex_failed', 'codex_limit', 'codex_permission_denied', 'codex_protocol_invalid',
+    'codex_timeout', 'codex_unavailable', 'configuration_required', 'deletion_requires_approval',
+    'discovery_connection_failed', 'discovery_failed', 'discovery_http_failed', 'discovery_incomplete',
+    'discovery_parsing_failed', 'discovery_timeout', 'event_ownership_missing',
+    'existing_event_required', 'fetch_failed', 'invalid_analysis_json',
+    'invalid_analysis_temporal_fields', 'invalid_credentials', 'invalid_event_boundaries',
+    'invalid_event_duration', 'invalid_operation_marker', 'login_failed', 'message_too_long',
+    'messages_pending', 'missing_private_file', 'operation_failed', 'operation_not_allowed',
+    'operations_pending', 'operations_unknown', 'sync_interrupted', 'sync_timeout',
+    'timezone_required', 'unexpected_tool', 'unexpected_tool_arguments', 'unexpected_tool_count',
+    'unsafe_event_boundaries', 'unsafe_event_fields', 'worker_interrupted'))
+SYNC_FAILURE_RESULTS = frozenset(('failed', 'partial', 'interrupted'))
+SYNC_CAUSES = {
+    'agenda_context_overflow': 'agenda_context_overflow: complete planner input exceeds the local limit',
+    'agenda_snapshot_overflow': 'agenda_snapshot_overflow: collected agenda snapshot exceeds the local limit',
+    'codex_failed': 'codex_failed: Codex runtime process failed',
+    'codex_timeout': 'codex_timeout: Codex runtime process timed out',
+    'codex_limit': 'codex_limit: Codex runtime usage limit reached',
+    'codex_unavailable': 'codex_unavailable: Codex runtime unavailable',
+    'sync_timeout': 'sync_timeout: synchronization timed out or was interrupted',
+    'sync_interrupted': 'sync_interrupted: synchronization interrupted',
+}
+
+
+def sync_diagnostics(snapshot=None, now=None):
+    """Describe only the fresh current run; historical/cached errors are not current causes."""
+    unknown = {'sync_result': 'unknown', 'sync_stage': 'unknown',
+               'sync_cause': 'unknown: current run diagnostics unavailable'}
+    if snapshot is None or not snapshot['db_ok']:
+        return unknown
+    generated = parsed_time(snapshot['generated_at'], now)
+    if generated is None or now - generated >= 180:
+        return unknown
+    state = snapshot['state']
+    result = state['last_result']
+    stage = state['last_stage']
+    cause = 'none'
+    if snapshot['sync_timeout']:
+        cause = SYNC_CAUSES['sync_timeout']
+    elif result in SYNC_FAILURE_RESULTS:
+        code = state['last_error_code']
+        cause = (SYNC_CAUSES.get(code, code + ': ' + code.replace('_', ' '))
+                 if code in SYNC_ERROR_CODES else 'unknown: failure cause unavailable')
+    elif snapshot['sync_failed'] and result != 'running':
+        cause = 'sync_service_failed: synchronization service failed'
+    return {'sync_result': result, 'sync_stage': stage if stage in SYNC_STAGES else 'unknown',
+            'sync_cause': cause}
+
+
 def parsed_time(value, now):
     if value is None:
         return None
@@ -275,10 +338,33 @@ class Service(SimpleService):
         self.definitions = CHARTS
         self.path = self.configuration.get('path', '/var/lib/librus-monitor/status.json')
         self.metrics = HealthMetrics()
+        self.diagnostics = sync_diagnostics()
+        self._published_diagnostics = None
 
     def check(self):
         # Always start charts. Missing data must produce alarms instead of disabling this collector.
         return True
+
+    def publish_diagnostics(self):
+        """Use the stock plugins.d label protocol; python.d has no custom label API."""
+        charts = getattr(self, 'charts', None)
+        if charts is None:
+            return
+        from bases.charts import CHART_CREATE, CLABEL_COLLECT_JOB, CLABEL_COMMIT
+        from bases.collection import safe_print
+        for name in ('sync', 'queue'):
+            chart = charts[name]
+            # Native create() also publishes _collect_job. Its later refresh must not
+            # replace our labels; reapply after any pending native creation.
+            refresh = not chart.flags.created or chart.flags.push
+            if refresh:
+                chart.create()
+            if refresh or self._published_diagnostics != self.diagnostics:
+                labels = CLABEL_COLLECT_JOB.format(**chart.params)
+                labels += ''.join("CLABEL '{0}' '{1}' '1'\n".format(key, value)
+                                  for key, value in sorted(self.diagnostics.items()))
+                safe_print(CHART_CREATE.format(**chart.params) + labels + CLABEL_COMMIT)
+        self._published_diagnostics = dict(self.diagnostics)
 
     def get_data(self):
         now = time.time()
@@ -294,6 +380,10 @@ class Service(SimpleService):
                 snapshot = json.loads(content)
             data = self.metrics.calculate(snapshot, now)
             self.metrics.outage('invalid', False, now)
+            self.diagnostics = sync_diagnostics(snapshot, now)
+            self.publish_diagnostics()
             return encode_metrics(data)
         except (OSError, ValueError, KeyError, TypeError, OverflowError):
+            self.diagnostics = sync_diagnostics()
+            self.publish_diagnostics()
             return encode_metrics(self.metrics.invalid_data(now))

@@ -3,6 +3,7 @@ from test_support import TEST_CONFIG
 from datetime import datetime, timedelta, timezone
 from dataclasses import replace
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -229,6 +230,121 @@ class CollectorTests(unittest.TestCase):
     def setUp(self):
         self.metrics = COLLECTOR.HealthMetrics()
         self.now = NOW.timestamp()
+
+    def test_sync_diagnostics_use_current_allowlisted_cause_and_clear_on_success(self):
+        value = snapshot()
+        value['state'].update(last_result='failed', last_stage='analysis',
+                              last_error_code='agenda_context_overflow', consecutive_failures=2)
+        labels = COLLECTOR.sync_diagnostics(value, self.now)
+        self.assertIn('agenda_context_overflow: complete planner input exceeds the local limit', labels['sync_cause'])
+        self.assertEqual(labels['sync_stage'], 'analysis')
+        # A stale historical agenda/preview error is never used as current failure.
+        value['state']['agenda'] = {'latest_plan': {'error_code': 'codex_failed'}}
+        value['state']['last_result'] = 'ok'
+        self.assertEqual(COLLECTOR.sync_diagnostics(value, self.now)['sync_cause'], 'none')
+        value['state'].update(last_result='running', running_since=stamp())
+        self.assertEqual(COLLECTOR.sync_diagnostics(value, self.now)['sync_cause'], 'none')
+        value['state'].update(last_result='failed', last_error_code='private_school_identifier',
+                              last_stage='private_learner')
+        labels = COLLECTOR.sync_diagnostics(value, self.now)
+        self.assertNotIn('private', str(labels))
+        self.assertEqual(labels['sync_stage'], 'unknown')
+        self.assertIn('unknown', labels['sync_cause'])
+
+    def test_sync_diagnostics_are_unknown_for_stale_missing_and_broken_export(self):
+        value = snapshot()
+        value['state'].update(last_result='failed', last_error_code='codex_failed')
+        self.assertIn('codex_failed', COLLECTOR.sync_diagnostics(value, self.now)['sync_cause'])
+        self.assertEqual(COLLECTOR.sync_diagnostics(value, self.now + 180)['sync_result'], 'unknown')
+        self.assertEqual(COLLECTOR.sync_diagnostics()['sync_result'], 'unknown')
+        value.update(db_ok=False, state=None)
+        self.assertEqual(COLLECTOR.sync_diagnostics(value, self.now)['sync_result'], 'unknown')
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'status.json'
+            service = COLLECTOR.Service({'path': str(path)})
+            value = snapshot()
+            value['state'].update(last_result='failed', last_error_code='codex_failed')
+            path.write_text(json.dumps(value))
+            with patch.object(COLLECTOR.time, 'time', return_value=self.now):
+                service.get_data()
+                self.assertIn('codex_failed', service.diagnostics['sync_cause'])
+                path.write_text('broken')
+                service.get_data()
+                self.assertEqual(service.diagnostics['sync_result'], 'unknown')
+
+    def test_systemd_only_failure_has_fixed_cause(self):
+        value = snapshot()
+        value['sync_timeout'] = True
+        self.assertIn('sync_timeout', COLLECTOR.sync_diagnostics(value, self.now)['sync_cause'])
+        value.update(sync_timeout=False, sync_failed=True)
+        self.assertIn('sync_service_failed', COLLECTOR.sync_diagnostics(value, self.now)['sync_cause'])
+
+    def test_all_diagnostic_codes_and_stages_are_closed_application_values(self):
+        from app.health_state import ERROR_CODES, STAGES
+        self.assertEqual(COLLECTOR.SYNC_ERROR_CODES, ERROR_CODES)
+        self.assertEqual(COLLECTOR.SYNC_STAGES, STAGES)
+
+    def test_label_protocol_preserves_job_and_does_not_change_metrics_or_alert_state(self):
+        # Emulate the stock chart's create/refresh contract and downstream health
+        # evaluation. A cause-only change must update metadata without a transition.
+        emitted = []
+        charts_module = types.ModuleType('bases.charts')
+        charts_module.CHART_CREATE = "CHART {type}.{id} '' 'test' 'count'\n"
+        charts_module.CLABEL_COLLECT_JOB = "CLABEL '_collect_job' '{actual_job_name}' '0'\n"
+        charts_module.CLABEL_COMMIT = "CLABEL_COMMIT\n"
+        collection = types.ModuleType('bases.collection')
+        collection.safe_print = lambda value: emitted.append(value)
+        class Chart:
+            def __init__(self, name):
+                self.params = dict(type='librus_local', id=name, actual_job_name='local')
+                self.flags = types.SimpleNamespace(created=False, push=True)
+            def create(self):
+                emitted.append(charts_module.CHART_CREATE.format(**self.params)
+                               + charts_module.CLABEL_COLLECT_JOB.format(**self.params)
+                               + charts_module.CLABEL_COMMIT)
+                self.flags.created = True
+                self.flags.push = False
+        service = COLLECTOR.Service({})
+        service.charts = {name: Chart(name) for name in ('sync', 'queue')}
+        value = snapshot()
+        value['state'].update(last_result='failed', last_stage='analysis',
+                              last_error_code='agenda_context_overflow', consecutive_failures=2)
+        chart_labels, statuses, transitions = {}, {}, []
+        with patch.dict(sys.modules, {'bases.charts': charts_module, 'bases.collection': collection}):
+            for code, result in [('agenda_context_overflow', 'failed'), ('codex_failed', 'failed'),
+                                 (None, 'ok')]:
+                value['state'].update(last_error_code=code, last_result=result,
+                                      consecutive_failures=0 if result == 'ok' else 2)
+                before = COLLECTOR.HealthMetrics().calculate(value, self.now)
+                service.diagnostics = COLLECTOR.sync_diagnostics(value, self.now)
+                start = len(emitted)
+                service.publish_diagnostics()
+                self.assertEqual(COLLECTOR.HealthMetrics().calculate(value, self.now), before)
+                import shlex
+                for line in ''.join(emitted[start:]).splitlines():
+                    fields = shlex.split(line)
+                    if fields[0] == 'CHART':
+                        chart = fields[1]
+                        pending = {}
+                    elif fields[0] == 'CLABEL':
+                        pending[fields[1]] = fields[2]
+                    elif fields[0] == 'CLABEL_COMMIT':
+                        chart_labels[chart] = pending
+                for chart in ('librus_local.sync', 'librus_local.queue'):
+                    self.assertEqual(chart_labels[chart]['_collect_job'], 'local')
+                    self.assertEqual(chart_labels[chart]['sync_cause'], service.diagnostics['sync_cause'])
+                current = 'CRITICAL' if before['failures'] >= 2 else ('WARNING' if before['failures'] >= 1 else 'CLEAR')
+                if statuses.get('sync_failures', 'CLEAR') != current:
+                    transitions.append(current)
+                statuses['sync_failures'] = current
+            self.assertEqual(transitions, ['CRITICAL', 'CLEAR'])
+            self.assertEqual(chart_labels['librus_local.sync']['sync_cause'], 'none')
+            start = len(emitted)
+            service.publish_diagnostics()
+            self.assertEqual(len(emitted), start)
+            service.charts['sync'].flags.push = True
+            service.publish_diagnostics()
+            self.assertIn("'sync_cause' 'none'", ''.join(emitted[start:]))
 
     def test_probe_chart_is_optional_and_rolling_counts_are_absolute(self):
         value = snapshot()
@@ -457,6 +573,13 @@ class CollectorTests(unittest.TestCase):
         for value in (float('nan'), float('inf'), -1, True, 10**12 + 1):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 COLLECTOR.encode_metrics({'bad': value})
+
+    def test_diagnostics_preserve_every_original_health_setting_except_info(self):
+        rules = (ROOT/'deploy/netdata/librus_local-health.conf').read_text()
+        settings = '\n'.join(line for line in rules.splitlines() if not line.lstrip().startswith('info:'))
+        # Exact original owned rule settings before diagnostic info was added.
+        self.assertEqual(hashlib.sha256(settings.encode()).hexdigest(),
+                         '479b12107d91ef5e4502187890b919683b95cd2728308d5ca9b257449642cab1')
 
     def test_thresholds_and_collector_missing_rule_are_explicit(self):
         content=(ROOT/'deploy/netdata/librus_local-health.conf').read_text()
