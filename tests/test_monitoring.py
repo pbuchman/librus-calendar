@@ -272,6 +272,87 @@ class CollectorTests(unittest.TestCase):
                 service.get_data()
                 self.assertEqual(service.diagnostics['sync_result'], 'unknown')
 
+    def test_running_attempt_preserves_actual_completed_failure_in_alert_info(self):
+        value = snapshot()
+        value.update(sync_running=True)
+        value['state'].update(last_result='running', last_stage='analysis', last_error_code=None,
+                              running_since=stamp(), consecutive_failures=3,
+                              last_completed_result='failed', last_completed_stage='analysis',
+                              last_completed_error_code='agenda_context_overflow')
+        baseline = COLLECTOR.HealthMetrics().calculate(value, self.now)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)/'status.json'
+            service = COLLECTOR.Service({'path': str(path)})
+            path.write_text(json.dumps(value))
+            with patch.object(COLLECTOR.time, 'time', return_value=self.now):
+                wire = service.get_data()
+        self.assertEqual(wire['failures'], 3 * COLLECTOR.WIRE_SCALE)
+        self.assertEqual(service.diagnostics['sync_result'], 'running')
+        self.assertEqual(service.diagnostics['sync_stage'], 'analysis')
+        self.assertEqual(service.diagnostics['sync_completed_result'], 'failed')
+        self.assertEqual(service.diagnostics['sync_completed_stage'], 'analysis')
+        self.assertIn('agenda_context_overflow', service.diagnostics['sync_completed_cause'])
+        self.assertEqual(COLLECTOR.HealthMetrics().calculate(value, self.now), baseline)
+        rules = (ROOT/'deploy/netdata/librus_local-health.conf').read_text()
+        block = next(block for block in rules.split('template: ') if block.startswith('librus_sync_failures'))
+        info = next(line.strip()[6:] for line in block.splitlines() if line.strip().startswith('info: '))
+        for key, label in service.diagnostics.items():
+            info = info.replace('${label:' + key + '}', label)
+        self.assertIn('current sync: running; stage: analysis', info)
+        self.assertIn('last completed sync: failed; stage: analysis; cause: agenda_context_overflow', info)
+        self.assertNotIn('${label:', info)
+        self.assertNotIn('cause: none', info)
+
+    def test_completed_cause_survives_pause_dry_run_and_new_attempt_then_clears_on_actual_success(self):
+        value = snapshot()
+        value['state'].update(last_completed_result='failed', last_completed_stage='analysis',
+                              last_completed_error_code='agenda_context_overflow')
+        for result in ('failed', 'paused', 'dry_run', 'running'):
+            value['state'].update(last_result=result, last_error_code=None)
+            labels = COLLECTOR.sync_diagnostics(value, self.now)
+            self.assertEqual(labels['sync_result'], result)
+            self.assertEqual(labels['sync_completed_result'], 'failed')
+            self.assertIn('agenda_context_overflow', labels['sync_completed_cause'])
+        value['state'].update(last_result='ok', last_stage='complete', last_error_code=None,
+                              last_completed_result='ok', last_completed_stage='complete',
+                              last_completed_error_code=None)
+        labels = COLLECTOR.sync_diagnostics(value, self.now)
+        self.assertEqual(labels['sync_completed_result'], 'ok')
+        self.assertEqual(labels['sync_completed_stage'], 'complete')
+        self.assertEqual(labels['sync_completed_cause'], 'none')
+
+    def test_legacy_or_missing_completed_fields_are_unknown_without_inventing_a_cause(self):
+        value = snapshot()
+        for result in ('running', 'failed', 'ok'):
+            value['state'].update(last_result=result, last_error_code='agenda_context_overflow')
+            labels = COLLECTOR.sync_diagnostics(value, self.now)
+            self.assertEqual(labels['sync_completed_result'], 'unknown')
+            self.assertEqual(labels['sync_completed_stage'], 'unknown')
+            self.assertIn('unknown', labels['sync_completed_cause'])
+        value['state'].update(last_completed_result=None, last_completed_stage=None,
+                              last_completed_error_code=None)
+        self.assertEqual(COLLECTOR.sync_diagnostics(value, self.now)['sync_completed_result'], 'unknown')
+
+    def test_optional_completed_fields_accept_only_closed_actual_sync_values(self):
+        for field, bad in [('last_completed_result', 'running'), ('last_completed_result', 'paused'),
+                           ('last_completed_result', 'dry_run'), ('last_completed_result', True),
+                           ('last_completed_stage', 'private_learner'),
+                           ('last_completed_error_code', 'private_school_identifier')]:
+            value = snapshot()
+            value['state'].update(last_completed_result='failed', last_completed_stage='analysis',
+                                  last_completed_error_code='agenda_context_overflow')
+            value['state'][field] = bad
+            with self.subTest(field=field, bad=bad), self.assertRaises(ValueError):
+                COLLECTOR.validate_snapshot(value, self.now)
+        value = snapshot()
+        value['state'].update(last_completed_result='failed', last_completed_stage='analysis',
+                              last_completed_error_code='agenda_context_overflow')
+        COLLECTOR.validate_snapshot(value, self.now)
+        for age in (180, 600):
+            labels = COLLECTOR.sync_diagnostics(value, self.now + age)
+            self.assertEqual(labels['sync_completed_result'], 'unknown')
+            self.assertIn('unknown', labels['sync_completed_cause'])
+
     def test_systemd_only_failure_has_fixed_cause(self):
         value = snapshot()
         value['sync_timeout'] = True

@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from app.core import AppStore
 from app.health_state import read_monitoring_state
+from app.monitoring import sanitize_state
 from test_core import NOW, message, proposal
 
 
@@ -65,6 +66,8 @@ class HealthStateTests(unittest.TestCase):
         self.assertIsNone(state['last_successful_sync'])
         self.assertIsNone(state['initialized_at'])
         self.assertEqual(state['last_result'], 'idle')
+        for name in ('last_completed_result', 'last_completed_stage', 'last_completed_error_code'):
+            self.assertIsNone(state[name])
         self.assertEqual(before, self.path.read_bytes())
 
     def test_read_snapshot_includes_running_and_finished_attempt_metadata(self):
@@ -97,6 +100,68 @@ class HealthStateTests(unittest.TestCase):
         self.assertEqual(read_monitoring_state(self.path)['consecutive_failures'], 1)
         self.store.finish_sync_run(new, 'ok')
         self.assertEqual(read_monitoring_state(self.path)['consecutive_failures'], 0)
+
+    def test_running_preview_and_pause_keep_last_completed_failure_until_success(self):
+        failed = self.store.start_sync_run()
+        self.store.sync_stage(failed, 'analysis')
+        self.store.finish_sync_run(failed, 'partial', 'agenda_context_overflow')
+        for result in ('dry_run', 'paused'):
+            attempt = self.store.start_sync_run()
+            self.store.finish_sync_run(attempt, result)
+        running = self.store.start_sync_run()
+        self.store.sync_stage(running, 'reconcile')
+        before = self.path.read_bytes()
+        state = read_monitoring_state(self.path)
+        self.assertEqual(state['last_result'], 'running')
+        self.assertIsNone(state['last_error_code'])
+        self.assertEqual(state['last_completed_result'], 'partial')
+        self.assertEqual(state['last_completed_stage'], 'analysis')
+        self.assertEqual(state['last_completed_error_code'], 'agenda_context_overflow')
+        self.assertEqual(state['consecutive_failures'], 1)
+        self.assertEqual(self.path.read_bytes(), before)
+        exported = sanitize_state(state, datetime.now(timezone.utc))
+        self.assertEqual(exported['last_completed_error_code'], 'agenda_context_overflow')
+        self.store.sync_stage(running, 'complete')
+        self.store.finish_sync_run(running, 'ok')
+        state = read_monitoring_state(self.path)
+        self.assertEqual(state['last_completed_result'], 'ok')
+        self.assertEqual(state['last_completed_stage'], 'complete')
+        self.assertIsNone(state['last_completed_error_code'])
+        self.assertEqual(state['consecutive_failures'], 0)
+
+    def test_completed_sync_selection_uses_finish_instant_not_start_or_offset_text(self):
+        with self.store.db:
+            self.store.db.execute("INSERT INTO sync_runs(id,started_at,finished_at,stage,result,error_code) "
+                                  "VALUES ('latest-finish','2026-10-16T07:00:00Z','2026-10-16T08:30:00Z',"
+                                  "'analysis','failed','codex_failed')")
+            self.store.db.execute("INSERT INTO sync_runs(id,started_at,finished_at,stage,result) "
+                                  "VALUES ('later-start','2026-10-16T09:45:00+02:00','2026-10-16T10:00:00+02:00',"
+                                  "'complete','ok')")
+        self.store.start_sync_run()
+        state = read_monitoring_state(self.path)
+        self.assertEqual(state['last_completed_result'], 'failed')
+        self.assertEqual(state['last_completed_stage'], 'analysis')
+        self.assertEqual(state['last_completed_error_code'], 'codex_failed')
+
+    def test_completed_metadata_is_optional_and_closed_before_export(self):
+        state = read_monitoring_state(self.path)
+        now = datetime.now(timezone.utc)
+        fields = ('last_completed_result', 'last_completed_stage', 'last_completed_error_code')
+        legacy = {key: value for key, value in state.items() if key not in fields}
+        clean = sanitize_state(legacy, now)
+        self.assertTrue(all(clean[name] is None for name in fields))
+        for name, value in (('last_completed_result', 'running'), ('last_completed_result', 'dry_run'),
+                            ('last_completed_stage', 'PRIVATE-TEXT'),
+                            ('last_completed_error_code', 'private_school_identifier')):
+            with self.subTest(field=name, value=value), self.assertRaises(ValueError):
+                sanitize_state({**state, name: value}, now)
+        failed = self.store.start_sync_run()
+        self.store.finish_sync_run(failed, 'failed', 'codex_failed')
+        self.store.start_sync_run()
+        with self.store.db:
+            self.store.db.execute("UPDATE sync_runs SET error_code='PRIVATE-TOKEN' WHERE id=?", (failed,))
+        with self.assertRaisesRegex(ValueError, 'completed sync health metadata'):
+            read_monitoring_state(self.path)
 
     def test_pause_timestamp_changes_only_on_transitions(self):
         first = self.store.status()['writes_paused_since']
