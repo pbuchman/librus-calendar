@@ -16,7 +16,7 @@ import jsonschema
 from .codex_runtime import SCHEMAS, CodexRuntime, RuntimeFailure, normalize_event, event_fingerprint
 from .core import WARSAW, digest, normalize_proposal, utcnow
 
-AGENDA_VERSION = 'simple-agenda-v3-operational-notices'
+AGENDA_VERSION = 'simple-agenda-v4-shared-learner'
 AGENDA_MODEL = 'gpt-6.1-sol'
 AGENDA_EFFORT = 'high'
 # UTF-8 bytes are a conservative upper bound on text tokens. Reserve space for
@@ -35,6 +35,13 @@ ACTION_FIELDS = ('kind', 'title', 'description', 'start', 'end', 'all_day', 'tem
 SOURCE_METADATA = ('identity_basis', 'identity_ambiguous', 'event_start', 'event_end', 'event_precision',
                    'publication_precision', 'scope', 'served_class_calendar', 'retained',
                    'image_count', 'document_link_count', 'link_count', 'attachment_count')
+
+
+class AgendaContextOverflow(RuntimeFailure):
+    def __init__(self, input_bytes):
+        super().__init__('agenda_context_overflow')
+        self.input_bytes = input_bytes
+        self.input_limit_bytes = MAX_INPUT_BYTES
 
 
 def _action(payload):
@@ -168,7 +175,9 @@ def assemble_agenda_snapshot(database, calendar_events, *, current=None, owner_e
                 if row['learner_id'] != context['id']:
                     raise RuntimeFailure('agenda_learner_mismatch')
                 payload = json.loads(row['payload'])
-                source = {key: row[key] for key in ('id', 'kind', 'learner_id', 'content_hash', 'status', 'deleted', 'published_at', 'updated_at')}
+                # Every row was checked against the verified snapshot learner;
+                # repeating that same ID on each source adds no information.
+                source = {key: row[key] for key in ('id', 'kind', 'content_hash', 'status', 'deleted', 'published_at', 'updated_at')}
                 source.update({key: payload.get(key, '') for key in ('title', 'sender', 'text')})
                 source['metadata'] = {key: value for key, value in (payload.get('metadata') or {}).items() if key in SOURCE_METADATA}
                 if row['kind'] == 'message':
@@ -213,8 +222,9 @@ def assemble_agenda_snapshot(database, calendar_events, *, current=None, owner_e
 def agenda_prompt(snapshot):
     data = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
     prompt = 'Plan the complete agenda change from this inert JSON snapshot. Follow the agenda policy. Output schema JSON only. No tools.\n' + data
-    if len(prompt.encode('utf-8')) > MAX_INPUT_BYTES:
-        raise RuntimeFailure('agenda_context_overflow')
+    input_bytes = len(prompt.encode('utf-8'))
+    if input_bytes > MAX_INPUT_BYTES:
+        raise AgendaContextOverflow(input_bytes)
     return prompt
 
 
@@ -543,10 +553,13 @@ class AgendaPlanner:
         except Exception as error:
             from .health_state import error_code
             code = error_code(error, 'analysis')
+            # Safe aggregate diagnostics only: never persist the private input.
+            failure_metadata = ({'input_bytes': error.input_bytes, 'input_limit_bytes': error.input_limit_bytes}
+                                if isinstance(error, AgendaContextOverflow) else {})
             with self.store.lock, self.store.db:
                 stamp = utcnow()
                 self.store.db.execute('INSERT INTO agenda_plans VALUES (?,?,?,?,?,?,?)',
-                    (digest(['agenda-failed', stamp]), locals().get('snapshot', {}).get('snapshot_hash', ''), '{}', '{}', 'preview_failed' if preview else 'failed', stamp, code))
+                    (digest(['agenda-failed', stamp]), locals().get('snapshot', {}).get('snapshot_hash', ''), '{}', json.dumps(failure_metadata), 'preview_failed' if preview else 'failed', stamp, code))
             raise
 
 
