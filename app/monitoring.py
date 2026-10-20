@@ -9,7 +9,7 @@ import re
 import subprocess
 import tempfile
 from .config import ConfigurationError, load_config
-from .health_state import SOURCE_ERROR_CODES, ERROR_CODES
+from .health_state import SOURCE_ERROR_CODES, ERROR_CODES, STAGES, COMPLETED_SYNC_RESULTS
 from datetime import datetime, timezone
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -65,6 +65,12 @@ def sanitize_state(state, now):
         value = state[name]
         if value is not None and (not isinstance(value, str) or not re.fullmatch(r'[a-z][a-z0-9_]{0,63}', value)):
             raise ValueError('invalid technical code')
+        clean[name] = value
+    for name, allowed in (('last_completed_result', COMPLETED_SYNC_RESULTS),
+                          ('last_completed_stage', STAGES), ('last_completed_error_code', ERROR_CODES)):
+        value = state.get(name)
+        if value is not None and (not isinstance(value, str) or value not in allowed):
+            raise ValueError('invalid completed sync metadata')
         clean[name] = value
     duration = state['last_duration_seconds']
     if duration is not None and (type(duration) not in (int, float) or not 0 <= duration <= 31536000):

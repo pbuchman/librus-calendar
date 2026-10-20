@@ -108,6 +108,7 @@ SYNC_ERROR_CODES = frozenset(('account_mismatch', 'agenda_action_reference_inval
     'timezone_required', 'unexpected_tool', 'unexpected_tool_arguments', 'unexpected_tool_count',
     'unsafe_event_boundaries', 'unsafe_event_fields', 'worker_interrupted'))
 SYNC_FAILURE_RESULTS = frozenset(('failed', 'partial', 'interrupted'))
+SYNC_COMPLETED_RESULTS = frozenset(('ok', 'partial', 'failed', 'interrupted'))
 SYNC_CAUSES = {
     'agenda_context_overflow': 'agenda_context_overflow: complete planner input exceeds the local limit',
     'agenda_snapshot_overflow': 'agenda_snapshot_overflow: collected agenda snapshot exceeds the local limit',
@@ -120,10 +121,19 @@ SYNC_CAUSES = {
 }
 
 
+def sync_failure_cause(result, code):
+    if result not in SYNC_FAILURE_RESULTS:
+        return 'none'
+    return (SYNC_CAUSES.get(code, code + ': ' + code.replace('_', ' '))
+            if code in SYNC_ERROR_CODES else 'unknown: failure cause unavailable')
+
+
 def sync_diagnostics(snapshot=None, now=None):
-    """Describe only the fresh current run; historical/cached errors are not current causes."""
+    """Keep the current attempt separate from the latest completed run's cause."""
     unknown = {'sync_result': 'unknown', 'sync_stage': 'unknown',
-               'sync_cause': 'unknown: current run diagnostics unavailable'}
+               'sync_cause': 'unknown: current run diagnostics unavailable',
+               'sync_completed_result': 'unknown', 'sync_completed_stage': 'unknown',
+               'sync_completed_cause': 'unknown: completed run diagnostics unavailable'}
     if snapshot is None or not snapshot['db_ok']:
         return unknown
     generated = parsed_time(snapshot['generated_at'], now)
@@ -137,12 +147,22 @@ def sync_diagnostics(snapshot=None, now=None):
         cause = SYNC_CAUSES['sync_timeout']
     elif result in SYNC_FAILURE_RESULTS:
         code = state['last_error_code']
-        cause = (SYNC_CAUSES.get(code, code + ': ' + code.replace('_', ' '))
-                 if code in SYNC_ERROR_CODES else 'unknown: failure cause unavailable')
+        cause = sync_failure_cause(result, code)
     elif snapshot['sync_failed'] and result != 'running':
         cause = 'sync_service_failed: synchronization service failed'
-    return {'sync_result': result, 'sync_stage': stage if stage in SYNC_STAGES else 'unknown',
-            'sync_cause': cause}
+    completed = state.get('last_completed_result')
+    completed_stage = state.get('last_completed_stage')
+    completed_code = state.get('last_completed_error_code')
+    # Missing legacy fields establish no completed synchronization evidence.
+    labels = {'sync_result': result, 'sync_stage': stage if stage in SYNC_STAGES else 'unknown',
+              'sync_cause': cause, 'sync_completed_result': unknown['sync_completed_result'],
+              'sync_completed_stage': unknown['sync_completed_stage'],
+              'sync_completed_cause': unknown['sync_completed_cause']}
+    if completed in SYNC_COMPLETED_RESULTS:
+        labels.update(sync_completed_result=completed,
+                      sync_completed_stage=completed_stage if completed_stage in SYNC_STAGES else 'unknown',
+                      sync_completed_cause=sync_failure_cause(completed, completed_code))
+    return labels
 
 
 def parsed_time(value, now):
@@ -187,6 +207,12 @@ def validate_snapshot(snapshot, now):
             code = state[field]
             if code is not None and (not isinstance(code, str) or not re.fullmatch(r'[a-z][a-z0-9_]{0,63}', code)):
                 raise ValueError('invalid technical code')
+        for field, allowed in (('last_completed_result', SYNC_COMPLETED_RESULTS),
+                               ('last_completed_stage', SYNC_STAGES),
+                               ('last_completed_error_code', SYNC_ERROR_CODES)):
+            value = state.get(field)
+            if value is not None and (not isinstance(value, str) or value not in allowed):
+                raise ValueError('invalid completed run metadata')
         duration = state['last_duration_seconds']
         if duration is not None and (type(duration) not in (int, float) or not math.isfinite(duration) or duration < 0):
             raise ValueError('invalid duration')

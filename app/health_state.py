@@ -7,6 +7,7 @@ import sqlite3
 import re
 
 RESULTS = frozenset(('idle', 'running', 'ok', 'partial', 'failed', 'interrupted', 'paused', 'dry_run'))
+COMPLETED_SYNC_RESULTS = frozenset(('ok', 'partial', 'failed', 'interrupted'))
 STAGES = frozenset(('starting', 'credentials', 'login', 'runtime', 'calendar_probe', 'discovery',
                     'fetch', 'analysis', 'queue', 'reconcile', 'write', 'complete'))
 ERROR_CODES = frozenset(('configuration_required', 'calendar_configuration_required', 'codex_binary_required', 'operation_failed', 'missing_private_file', 'invalid_credentials', 'account_mismatch',
@@ -196,10 +197,24 @@ def read_connection_state(db, now=None):
         metadata_oldest = db.execute("SELECT MIN(created_at) FROM metadata_refresh WHERE status IN ('pending','inflight')").fetchone()[0]
         oldest = min((value for value in (oldest, metadata_oldest) if value), default=None)
     last = None
+    completed = dict(last_completed_result=None, last_completed_stage=None, last_completed_error_code=None)
     if 'sync_runs' in tables:
         cursor = db.execute('SELECT id,started_at,finished_at,stage,result,error_code,duration_seconds FROM sync_runs ORDER BY started_at DESC,rowid DESC LIMIT 1')
         row = cursor.fetchone()
         last = dict(zip((col[0] for col in cursor.description), row)) if row else None
+        # A running attempt, preview or pause does not resolve an earlier sync
+        # failure. Keep the latest finished actual sync, ordered by UTC instant.
+        row = db.execute("SELECT result,stage,error_code,finished_at FROM sync_runs "
+                         "WHERE finished_at IS NOT NULL AND result IN ('ok','partial','failed','interrupted') "
+                         "ORDER BY julianday(finished_at) DESC,rowid DESC LIMIT 1").fetchone()
+        if row:
+            completed_result, completed_stage, completed_code, finished_at = row
+            timestamp(finished_at)
+            if ((completed_stage is not None and completed_stage not in STAGES)
+                    or (completed_code is not None and completed_code not in ERROR_CODES)):
+                raise ValueError('Invalid completed sync health metadata.')
+            completed.update(last_completed_result=completed_result, last_completed_stage=completed_stage,
+                             last_completed_error_code=completed_code)
     result = last['result'] if last else 'idle'
     stage = last['stage'] if last else None
     code = last['error_code'] if last else None
@@ -237,7 +252,7 @@ def read_connection_state(db, now=None):
                 item = max(latest, key=lambda value: value['attempt_number'])
                 probe.update(calendar_probe_result=item['result'], calendar_probe_attempts=len(latest),
                     calendar_probe_recovered=None if item['result'] == 'running' else item['result'] == 'ok' and item['attempt_number'] == 2)
-    return dict(schema_version=1, sources=read_source_health(db, tables), agenda=read_agenda_health(db, tables), **probe, initialized_at=timestamp(settings.get('health_initialized_at')),
+    return dict(schema_version=1, sources=read_source_health(db, tables), agenda=read_agenda_health(db, tables), **probe, **completed, initialized_at=timestamp(settings.get('health_initialized_at')),
         last_attempt_at=timestamp(last['started_at'] if last else settings.get('last_sync')),
         last_successful_sync=timestamp(settings.get('last_successful_sync')),
         last_result=result, last_stage=stage, last_error_code=code, last_duration_seconds=duration,
