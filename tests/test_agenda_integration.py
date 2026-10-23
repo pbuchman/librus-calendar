@@ -197,7 +197,7 @@ class AgendaIntegrationTests(AgendaTests):
         self.store.resolve_proposal(approved['id'], 'approve')
         before_ids = {entry['id'] for entry in self.store.list_actions()}
         self.assertNotIn('canonical_action_id', legacy)
-        self.apply(lambda snapshot: [])
+        self.apply(lambda snapshot: [item(snapshot, 'ignore', action=None)])
         queued = self.store.queue_operations(NOW)
         self.assertEqual([operation['proposal_id'] for operation in queued], [approved['id']])
         proposals = {entry['id']: entry for entry in self.store.list_proposals()}
@@ -212,7 +212,7 @@ class AgendaIntegrationTests(AgendaTests):
                    source_quote='Klasa 1x przynosi papier do 12 marca.')
         legacy = self.store.save_proposals('fictional-message', [raw], NOW)[0]
         operation = self.store.queue_operations(NOW)[0]
-        self.apply(lambda snapshot: [])
+        self.apply(lambda snapshot: [item(snapshot, 'ignore', action=None)])
         self.store.set_writes_paused(False)
         self.assertFalse(self.store.claim_operation(operation['operation_id'], expected_operation=operation))
         self.assertEqual(self.store.list_proposals()[0]['id'], legacy['id'])
@@ -337,7 +337,7 @@ class AgendaIntegrationTests(AgendaTests):
         self.store.resolve_proposal_group(group['id'], 'select', chosen, expected_revision=group['revision'], current=NOW)
         self.store.set_writes_paused(False)
         self.assertEqual(len(self.execute_pending(runtime, planner)), 1)
-        runtime.select = lambda snapshot: [item(snapshot, 'create', offer_group_id=group['id'])]
+        runtime.select = lambda snapshot: [item(snapshot, 'review', review_change='create', offer_group_id=group['id'])]
         held = planner.run(NOW)
         self.assertEqual(held['items'][0]['operation'], 'ignore')
         self.assertEqual(len(self.store.list_proposal_groups()), 1)
@@ -482,8 +482,9 @@ class AgendaIntegrationTests(AgendaTests):
         failed = self.store.latest_agenda_plan()
         self.assertEqual(failed['payload'], {})
         with patch('app.agenda.MAX_INPUT_BYTES', 1000000):
-            full_input_bytes = len(agenda_prompt(assemble_agenda_snapshot(
-                self.store, runtime.events, current=NOW, enforce_budget=False)).encode())
+            from app.agenda_incremental import assemble_incremental_snapshot
+            full_input_bytes = len(agenda_prompt(assemble_incremental_snapshot(
+                self.store, runtime.events, current=NOW, enforce_budget=False)[0]).encode())
         self.assertEqual(failed['metadata'], {
             'input_bytes': full_input_bytes,
             'input_limit_bytes': 160000})
@@ -497,27 +498,22 @@ class AgendaIntegrationTests(AgendaTests):
         self.assertEqual(self.store.list_proposals(), [])
         self.assertEqual(self.store.queue_operations(NOW), [])
 
-    def test_overflow_diagnostics_measure_failing_post_plan_snapshot(self):
+    def test_complete_local_post_plan_state_has_no_prompt_byte_budget(self):
+        from app.agenda_incremental import assemble_incremental_snapshot
         self.ready()
         runtime = Calendar(lambda snapshot: [item(snapshot)])
-        original_bytes = len(agenda_prompt(self.snapshot()).encode())
+        original_bytes = len(agenda_prompt(assemble_incremental_snapshot(self.store, {}, current=NOW)[0]).encode())
         budget = original_bytes + 100
-        # A valid plan can grow the materialized agenda past the input budget.
-        # The transaction rolls back; diagnostics must describe that larger
-        # failing snapshot, rather than the smaller pre-planning input.
+        # Complete CAS/baseline state is local and never rejected just because
+        # the old all-body projection grows. Only actual requests are measured.
         with patch('app.agenda.MAX_INPUT_BYTES', budget):
-            with self.assertRaisesRegex(RuntimeFailure, 'agenda_context_overflow') as failed:
-                AgendaPlanner(self.store, runtime).run(NOW)
-        metadata = self.store.latest_agenda_plan()['metadata']
-        self.assertEqual(metadata, {'input_bytes': failed.exception.input_bytes,
-                                    'input_limit_bytes': budget})
-        self.assertGreater(metadata['input_bytes'], budget)
+            planner = AgendaPlanner(self.store, runtime)
+            result = planner.run(NOW)
+            self.assertEqual(result['status'], 'applied')
+            self.assertEqual(planner.run(NOW)['model_calls'], 0)
         self.assertEqual(runtime.calls, 1)
-        self.assertEqual(self.store.list_actions(), [])
-        self.assertEqual(self.store.pending_operations(), [])
-        self.assertEqual(runtime.writes, [])
-        self.assertEqual(self.store.list_proposals(), [])
-        self.assertEqual(self.store.queue_operations(NOW), [])
+        self.assertEqual(len(self.store.list_actions()), 1)
+        self.assertEqual(len(self.store.list_proposals()), 1)
 
     def test_cli_preview_and_sync_summary_never_print_private_planned_items(self):
         from app.cli import main
@@ -549,3 +545,215 @@ class AgendaIntegrationTests(AgendaTests):
         minimal = minimal_proposal(proposal)
         self.assertEqual(minimal['agenda_sources'], proposal['agenda_sources'])
         self.assertEqual(minimal['agenda_plan_id'], result['plan_id'])
+
+    def test_incremental_checkpoint_rollback_is_atomic_after_injected_failure(self):
+        from app.agenda_incremental import content_baseline_hash
+        tables = ('sources','messages','canonical_actions','proposals','action_sources','agenda_processed_sources','settings')
+        def state():
+            return {table: [tuple(row) for row in self.store.db.execute('SELECT * FROM ' + table + ' ORDER BY 1')]
+                    for table in tables}
+        self.ready()
+        before = state()
+        def fail_after_authority(snapshot):
+            if self.store._setting('agenda_authority_baseline') is not None:
+                raise RuntimeError('fictional injected crash')
+            return content_baseline_hash(snapshot)
+        runtime = Calendar(lambda snapshot: [item(snapshot)])
+        with patch('app.agenda_incremental.content_baseline_hash', side_effect=fail_after_authority):
+            with self.assertRaisesRegex(RuntimeError, 'injected crash'):
+                AgendaPlanner(self.store, runtime).run(NOW)
+        self.assertEqual(state(), before)
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM agenda_plans WHERE status='applied'").fetchone()[0], 0)
+        self.assertEqual(runtime.writes, [])
+
+    def test_incremental_checkpoint_scopes_message_id_hash_and_excludes_upstream_collision(self):
+        with self.store.db:
+            self.store.db.execute("INSERT INTO messages(id,payload,payload_hash,status) VALUES ('unrelated-pending','{}','unrelated-hash','analysis_pending')")
+            self.store.db.execute("INSERT INTO messages(id,status) VALUES ('unrelated-fetch','fetch_pending')")
+            self.store.db.execute("UPDATE sources SET upstream_id='unrelated-pending' WHERE kind='announcement'")
+        result, runtime, planner = self.apply(lambda snapshot: [item(snapshot)])
+        self.assertEqual(self.store.get_message('fictional-message')['status'], 'analyzed')
+        self.assertEqual(tuple(self.store.db.execute("SELECT status,analyzed_hash FROM messages WHERE id='unrelated-pending'").fetchone()), ('analysis_pending', None))
+        self.assertEqual(self.store.get_message('unrelated-fetch')['status'], 'fetch_pending')
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM agenda_processed_sources').fetchone()[0], 3)
+        metadata = self.store.latest_agenda_plan()['metadata']
+        self.assertEqual((metadata['source_count'], metadata['catalog_count']), (3, 3))
+        self.assertGreater(metadata['input_bytes'], 0)
+        self.assertEqual(len(metadata['request_hash']), 64)
+
+    def test_incremental_committed_plan_restart_before_queue_reuses_one_intent_next_day(self):
+        from app.core import AppStore
+        result, runtime, planner = self.apply(lambda snapshot: [item(snapshot)])
+        self.assertEqual(self.store.pending_operations(), [])
+        ids = {entry['id'] for entry in self.store.list_proposals()}
+        self.store.close()
+        self.store = AppStore(self.path, config=TEST_CONFIG)
+        planner = AgendaPlanner(self.store, runtime)
+        self.assertEqual(planner.run(NOW + timedelta(days=1))['model_calls'], 0)
+        self.assertEqual({entry['id'] for entry in self.store.list_proposals()}, ids)
+        self.store.set_writes_paused(False)
+        self.assertEqual(len(self.execute_pending(runtime, planner)), 1)
+        self.assertEqual(len(runtime.writes), 1)
+        self.assertEqual(planner.run(NOW + timedelta(days=1))['model_calls'], 0)
+
+    def test_incremental_own_create_update_cancel_advance_both_baselines(self):
+        from app.agenda_incremental import assemble_incremental_snapshot
+        result, runtime, planner = self.apply(lambda snapshot: [item(snapshot)])
+        self.store.set_writes_paused(False)
+        self.execute_pending(runtime, planner)
+        aid = result['items'][0]['action_id']
+        def baseline_matches():
+            from app.agenda import read_calendar
+            _, contract = assemble_incremental_snapshot(self.store, read_calendar(self.store, runtime), current=NOW)
+            self.assertEqual(json.loads(self.store._setting('agenda_authority_baseline')), contract['authority_versions'])
+            self.assertEqual(self.store._setting('agenda_baseline_hash'), contract['full_snapshot_hash'])
+            self.assertEqual(planner.run(NOW + timedelta(days=1))['model_calls'], 0)
+        baseline_matches()
+        with self.store.db:
+            self.store.db.execute("UPDATE sources SET content_hash='fictional-update-version' WHERE kind='announcement'")
+        runtime.select = lambda snapshot: [item(snapshot, 'update', action_id=aid, action=dict(action(), start='2030-03-13'))]
+        updated = planner.run(NOW)
+        self.assertEqual(updated['items'][0]['operation'], 'update')
+        self.execute_pending(runtime, planner)
+        baseline_matches()
+        with self.store.db:
+            self.store.db.execute("UPDATE sources SET content_hash='fictional-cancel-version' WHERE kind='announcement'")
+        runtime.select = lambda snapshot: [item(snapshot, 'review', review_change='cancel', action_id=aid, action=None)]
+        cancellation = planner.run(NOW)['items'][0]
+        self.store.resolve_proposal(cancellation['proposal_id'], 'confirm_cancel')
+        runtime.select = lambda snapshot: [item(snapshot, 'link', action_id=aid, action=None)]
+        planner.run(NOW)  # Observe the new explicit decision before executing it.
+        self.execute_pending(runtime, planner)
+        baseline_matches()
+        self.assertEqual(len(runtime.writes), 3)
+
+    def test_incremental_preview_stale_and_overflow_do_not_advance_checkpoint(self):
+        self.ready()
+        runtime = Calendar(lambda snapshot: [item(snapshot)])
+        planner = AgendaPlanner(self.store, runtime)
+        planner.run(NOW, preview=True)
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM agenda_processed_sources').fetchone()[0], 0)
+        self.assertIsNone(self.store._setting('agenda_authority_baseline'))
+        self.assertIsNone(self.store._setting('agenda_baseline_hash'))
+        with self.store.db:
+            self.store.db.execute('DELETE FROM agenda_plans')
+        def race():
+            with self.store.db:
+                self.store.db.execute("UPDATE sources SET content_hash='fictional-CAS-race' WHERE kind='announcement'")
+        runtime.on_plan = race
+        with self.assertRaisesRegex(RuntimeFailure, 'agenda_plan_stale'):
+            planner.run(NOW)
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM agenda_processed_sources').fetchone()[0], 0)
+        self.assertEqual(self.store.list_proposals(), [])
+        runtime.on_plan = None
+        before_calls = runtime.calls
+        with patch('app.agenda.MAX_INPUT_BYTES', 1):
+            with self.assertRaisesRegex(RuntimeFailure, 'agenda_context_overflow'):
+                planner.run(NOW)
+        self.assertEqual(runtime.calls, before_calls)
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM agenda_processed_sources').fetchone()[0], 0)
+        self.assertIsNone(self.store._setting('agenda_baseline_hash'))
+
+    def test_incremental_unknown_action_is_protected_independent_same_source_duty_executes(self):
+        result, runtime, planner = self.apply(lambda snapshot: [item(snapshot)])
+        aid = result['items'][0]['action_id']
+        self.store.set_writes_paused(False)
+        runtime.timeout_after_write = True
+        self.execute_pending(runtime, planner)
+        self.assertEqual(len(runtime.writes), 1)
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM operations WHERE status='unknown'").fetchone()[0], 1)
+        with self.store.db:
+            self.store.db.execute("UPDATE sources SET content_hash='changed-during-unknown' WHERE kind='announcement'")
+        runtime.select = lambda snapshot: [item(snapshot, 'update', action_id=aid),
+            item(snapshot, action=dict(action(), title='Independent new duty', start='2030-03-14'))]
+        guarded = planner.run(NOW)
+        self.assertTrue(next(proposal for proposal in self.store.list_proposals()
+            if proposal['id'] == guarded['items'][0]['proposal_id'])['deferred_unknown_operation'])
+        self.assertEqual(guarded['items'][1]['operation'], 'create')
+        self.assertEqual(len(self.execute_pending(runtime, planner)), 1)
+        self.assertEqual(len(runtime.writes), 2)
+        operation = self.store.reconcile_operations()[0]
+        self.store.record_result(operation['operation_id'], runtime.execute(operation), agenda_calendar=planner.calendar, current=NOW)
+        self.assertEqual(len(runtime.writes), 2)  # Marker read finds original, never another create.
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM operations WHERE status='unknown'").fetchone()[0], 0)
+
+    def test_incremental_missing_ledger_row_is_processed_despite_same_content_baseline(self):
+        result, runtime, planner = self.apply(lambda snapshot: [item(snapshot)])
+        with self.store.db:
+            self.store.db.execute("DELETE FROM agenda_processed_sources WHERE source_id IN (SELECT id FROM sources WHERE kind='announcement')")
+        runtime.select = lambda snapshot: [item(snapshot, 'ignore', action=None)]
+        result = planner.run(NOW)
+        self.assertEqual(result['status'], 'applied')
+        self.assertEqual(result['model_calls'], 1)
+        self.assertEqual(self.store.latest_agenda_plan()['metadata']['source_count'], 1)
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM agenda_processed_sources').fetchone()[0], 3)
+
+    def test_incremental_cached_preview_retains_actual_original_request_evidence(self):
+        runtime = Calendar(lambda snapshot: [item(snapshot)])
+        self.ready()
+        planner = AgendaPlanner(self.store, runtime)
+        planner.run(NOW, preview=True)
+        preview_metadata = self.store.latest_agenda_plan(preview=True)['metadata']
+        result = planner.run(NOW + timedelta(hours=1))
+        active_metadata = self.store.latest_agenda_plan()['metadata']
+        self.assertEqual(result['model_calls'], 0)
+        self.assertEqual(runtime.calls, 1)
+        self.assertEqual(active_metadata['request_hash'], preview_metadata['request_hash'])
+        self.assertEqual(active_metadata['input_bytes'], preview_metadata['input_bytes'])
+
+    def test_incremental_exact_unknown_creation_links_without_duplicate_and_independent_duty_executes(self):
+        result, runtime, planner = self.apply(lambda snapshot: [item(snapshot)])
+        original_aid = result['items'][0]['action_id']
+        original_pid = result['items'][0]['proposal_id']
+        self.store.set_writes_paused(False)
+        runtime.timeout_after_write = True
+        self.execute_pending(runtime, planner)
+        with self.store.db:
+            self.store.db.execute("UPDATE sources SET content_hash='changed-after-exact-unknown' WHERE kind='announcement'")
+        runtime.select = lambda snapshot: [item(snapshot),
+            item(snapshot, action=dict(action(), title='Independent duty', start='2030-03-15'))]
+        result = planner.run(NOW)
+        self.assertEqual([entry['operation'] for entry in result['items']], ['link', 'create'])
+        self.assertEqual(result['items'][0]['action_id'], original_aid)
+        self.assertEqual(result['items'][0]['proposal_id'], original_pid)
+        self.assertEqual(len(self.store.list_actions()), 2)  # Original obligation plus independent duty.
+        self.assertEqual(len(self.execute_pending(runtime, planner)), 1)
+        self.assertEqual(len(runtime.writes), 2)
+        operation = self.store.reconcile_operations()[0]
+        self.store.record_result(operation['operation_id'], runtime.execute(operation), agenda_calendar=planner.calendar, current=NOW)
+        self.assertEqual(len(runtime.writes), 2)
+
+    def test_incremental_unknown_candidate_cannot_be_approved_before_reconciliation(self):
+        result, runtime, planner = self.apply(lambda snapshot: [item(snapshot)])
+        aid = result['items'][0]['action_id']
+        self.store.set_writes_paused(False)
+        runtime.timeout_after_write = True
+        self.execute_pending(runtime, planner)
+        with self.store.db:
+            self.store.db.execute("UPDATE sources SET content_hash='candidate-related-change' WHERE kind='announcement'")
+        runtime.select = lambda snapshot: [item(snapshot, candidate_action_ids=[aid], action=dict(action(), title='Changed candidate title')),
+            item(snapshot, action=dict(action(), title='Independent duty', start='2030-03-16'))]
+        result = planner.run(NOW)
+        dependent = result['items'][0]['proposal_id']
+        with self.assertRaisesRegex(ValueError, 'Reconcile the prior write'):
+            self.store.resolve_proposal(dependent, 'approve')
+        queued = self.execute_pending(runtime, planner)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(len(runtime.writes), 2)
+        self.assertNotEqual(queued[0]['proposal_id'], dependent)
+
+    def test_incremental_exact_unknown_link_resolution_rechecks_target_conflicts(self):
+        result, runtime, planner = self.apply(lambda snapshot: [item(snapshot)])
+        aid = result['items'][0]['action_id']
+        self.store.set_writes_paused(False)
+        runtime.timeout_after_write = True
+        self.execute_pending(runtime, planner)
+        with self.store.db:
+            self.store.db.execute("UPDATE sources SET content_hash='unknown-target-conflict' WHERE kind='announcement'")
+        checkpoint = [tuple(row) for row in self.store.db.execute('SELECT * FROM agenda_processed_sources ORDER BY 1')]
+        runtime.select = lambda snapshot: [item(snapshot), item(snapshot, 'update', action_id=aid)]
+        with self.assertRaisesRegex(RuntimeFailure, 'agenda_conflicting_operations'):
+            planner.run(NOW)
+        self.assertEqual(len(self.store.list_actions()), 1)
+        self.assertEqual(len(runtime.writes), 1)
+        self.assertEqual([tuple(row) for row in self.store.db.execute('SELECT * FROM agenda_processed_sources ORDER BY 1')], checkpoint)

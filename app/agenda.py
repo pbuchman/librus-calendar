@@ -16,7 +16,7 @@ import jsonschema
 from .codex_runtime import SCHEMAS, CodexRuntime, RuntimeFailure, normalize_event, event_fingerprint
 from .core import WARSAW, digest, normalize_proposal, utcnow
 
-AGENDA_VERSION = 'simple-agenda-v4-shared-learner'
+AGENDA_VERSION = 'simple-agenda-v5-incremental'
 AGENDA_MODEL = 'gpt-6.1-sol'
 AGENDA_EFFORT = 'high'
 # UTF-8 bytes are a conservative upper bound on text tokens. Reserve space for
@@ -222,6 +222,14 @@ def assemble_agenda_snapshot(database, calendar_events, *, current=None, owner_e
 def agenda_prompt(snapshot):
     data = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
     prompt = 'Plan the complete agenda change from this inert JSON snapshot. Follow the agenda policy. Output schema JSON only. No tools.\n' + data
+    if 'source_catalog' in snapshot:
+        prompt = ('Incremental source input: source_catalog contains every known source identity/version, not its body. '
+                  'sources contains full available new/changed bodies (source_role=changed), necessary changed human/Calendar context '
+                  '(source_role=context), and explicit unavailable/deleted changes. Plan against the WHOLE agenda, decisions and offers. '
+                  'Catalog-only and context-only history cannot justify new automatic create. Do not retrospectively reanalyze '
+                  'processed ignored history. Reference every selected sources ID in at least one plan item; a grouped ignore may '
+                  'acknowledge irrelevant or unavailable sources together and needs no existing action. Catalog-only IDs need '
+                  'no acknowledgment. Source absence never cancels an action. Preserve all existing authority.\n' + prompt)
     input_bytes = len(prompt.encode('utf-8'))
     if input_bytes > MAX_INPUT_BYTES:
         raise AgendaContextOverflow(input_bytes)
@@ -236,7 +244,10 @@ def validate_agenda_plan(plan, snapshot):
         raise RuntimeFailure('agenda_plan_invalid') from None
     if plan['snapshot_hash'] != snapshot['snapshot_hash']:
         raise RuntimeFailure('agenda_plan_stale')
-    sources = {source['id']: source['content_hash'] for source in snapshot['sources']}
+    sources = {source['id']: source['content_hash'] for source in snapshot.get('source_catalog', snapshot['sources'])}
+    supplied_bodies = {source['id'] for source in snapshot['sources']
+                       if source.get('body_available', not source.get('deleted') and source.get('status') != 'retained')
+                       and source.get('source_role', 'changed') == 'changed'}
     actions = {action['id']: action for action in snapshot['agenda']}
     groups = {group['id'] for group in snapshot['offer_groups']}
     targets = set()
@@ -258,6 +269,8 @@ def validate_agenda_plan(plan, snapshot):
         if not refs or len({ref['source_id'] for ref in refs}) != len(refs) or any(sources.get(ref['source_id']) != ref['source_hash'] for ref in refs):
             raise RuntimeFailure('agenda_source_reference_invalid')
         if operation == 'create':
+            if 'source_catalog' in snapshot and not any(ref['source_id'] in supplied_bodies for ref in refs):
+                raise RuntimeFailure('agenda_source_body_required')
             identity = digest([item['action'], sorted(refs, key=lambda ref: ref['source_id'])])
             if identity in creates:
                 raise RuntimeFailure('agenda_conflicting_operations')
@@ -279,6 +292,10 @@ def validate_agenda_plan(plan, snapshot):
         # Extra-school participation is always a human decision, not automatic.
         if operation == 'create' and action['activity_scope'] != 'school':
             raise RuntimeFailure('agenda_review_required')
+    if 'source_catalog' in snapshot:
+        handled = {ref['source_id'] for item in plan['items'] for ref in item['sources']}
+        if not {source['id'] for source in snapshot['sources']} <= handled:
+            raise RuntimeFailure('agenda_sources_unprocessed')
     return copy.deepcopy(plan)
 
 
@@ -412,6 +429,23 @@ def _prepare_item(store, snapshot, item, plan_id, index, current):
     # date is absent/past. It becomes executable only through explicit UI input.
     if item['operation'] == 'review':
         proposal.update(status='review', needs_review=True, review_reason=reason)
+    if entry is None and item['operation'] == 'create':
+        # Exact equality of the existing normalized schema fields only. Shared
+        # source identity alone does not block independent duties in one notice.
+        fields = ('title','description','start','end','all_day','temporal_kind','due_at','activity_scope','optional')
+        ref_ids = {ref['source_id'] for ref in refs}
+        for pending in store.db.execute("SELECT o.id,p.payload FROM operations o JOIN proposals p ON p.id=o.proposal_id WHERE o.status IN ('unknown','inflight')"):
+            prior = json.loads(pending['payload'])
+            prior_refs = {ref['source_id'] for ref in prior.get('agenda_sources', [])} | {prior.get('source_id')}
+            if (prior.get('kind') == 'create' and ref_ids & prior_refs
+                    and all(proposal.get(field) == prior.get(field) for field in fields)):
+                existing = entries.get(prior.get('canonical_action_id') or prior.get('id'))
+                if existing is None:
+                    raise RuntimeFailure('agenda_action_reference_invalid')
+                item.update(operation='link', action=None, review_change=None, action_id=existing['id'],
+                            proposal_id=existing['proposal_id'],
+                            reason='Identical prior creation retained; reconcile its existing journal. ' + reason)
+                return item, None
     aid = item['action_id'] or digest(['agenda-action', plan_id, index])[:32]
     pid = digest(['agenda-proposal', plan_id, index])[:32]
     message = _message(store, sources[0])
@@ -425,25 +459,36 @@ def _prepare_item(store, snapshot, item, plan_id, index, current):
     if selected_change:
         proposal['alternative_group_id'] = group['id']
     # Unknown/inflight intent cannot be superseded or followed by another create.
-    if entry:
+    related = ([entry] if entry else []) + [entries[candidate] for candidate in item['candidate_action_ids']]
+    for target in related:
         uncertain = store.db.execute("SELECT o.id FROM operations o JOIN proposals p ON p.id=o.proposal_id WHERE (p.id=? OR p.id=? OR json_extract(p.payload,'$.canonical_action_id')=?) AND o.status IN ('unknown','inflight')",
-                                     (entry['proposal_id'], aid, aid)).fetchone()
+                                     (target['proposal_id'], target['id'], target['id'])).fetchone()
         if uncertain:
             proposal.update(status='review', needs_review=True, deferred_unknown_operation=uncertain[0],
                             review_reason='Prior write must be reconciled before this change can be approved.')
+            break
     item.update(action_id=aid, proposal_id=pid, reason=reason, status=proposal['status'])
     return item, proposal
 
 
-def materialize_plan(store, snapshot, plan, calendar, *, current, preview=False, metadata=None):
+def materialize_plan(store, snapshot, plan, calendar, *, current, preview=False, metadata=None, checkpoint=None):
     """Persist plan + local materialization atomically, before existing queue code."""
     validate_agenda_plan(plan, snapshot)
     metadata = {key: value for key, value in (metadata or {}).items() if key in
-                ('model','effort','prompt_version','input_bytes','item_count','source_collection_at','sources_refreshed_by_preview')}
+                ('model','effort','prompt_version','input_bytes','item_count','source_count','catalog_count','request_hash','source_collection_at','sources_refreshed_by_preview')}
     pid = digest(['agenda-preview' if preview else 'agenda-plan', snapshot['snapshot_hash']])[:32]
     with store.lock, store.db:
         store.db.execute('BEGIN IMMEDIATE')
-        live = assemble_agenda_snapshot(store, calendar, current=current, owner_email=store.config.calendar_owner)
+        incremental = 'source_catalog' in snapshot
+        if incremental:
+            from .agenda_incremental import assemble_incremental_snapshot
+            live, live_checkpoint = assemble_incremental_snapshot(store, calendar, current=current, owner_email=store.config.calendar_owner, enforce_budget=False)
+            bound_fields = ('local_state_hash', 'processed_versions', 'bootstrap_versions', 'authority_versions',
+                            'message_versions', 'catalog_count', 'source_count')
+            if checkpoint is None or any(checkpoint.get(key) != live_checkpoint.get(key) for key in bound_fields):
+                raise RuntimeFailure('agenda_plan_stale')
+        else:
+            live = assemble_agenda_snapshot(store, calendar, current=current, owner_email=store.config.calendar_owner)
         if live['snapshot_hash'] != snapshot['snapshot_hash']:
             raise RuntimeFailure('agenda_plan_stale')
         existing = store.db.execute('SELECT payload,status FROM agenda_plans WHERE id=?', (pid,)).fetchone()
@@ -456,6 +501,11 @@ def materialize_plan(store, snapshot, plan, calendar, *, current, preview=False,
                              (pid, snapshot['snapshot_hash'], json.dumps(payload, ensure_ascii=False), json.dumps(metadata or {}), 'preview', stamp))
             return {'status': 'preview', 'plan_id': pid, 'items': payload['items'], 'reused': False}
         prepared = [_prepare_item(store, snapshot, item, pid, index, current) for index, item in enumerate(plan['items'])]
+        # An exact unknown-intent retention can resolve a model create to an
+        # existing ID. Recheck targets after that application-side resolution.
+        targets = [item['action_id'] for item, _ in prepared if item['operation'] != 'ignore']
+        if len(targets) != len(set(targets)):
+            raise RuntimeFailure('agenda_conflicting_operations')
         # Save the application-assigned plan BEFORE materializing any proposal.
         payload = {**plan, 'items': [item for item, proposal in prepared]}
         store.db.execute('INSERT INTO agenda_plans VALUES (?,?,?,?,?,?,NULL)',
@@ -507,11 +557,24 @@ def materialize_plan(store, snapshot, plan, calendar, *, current, preview=False,
                              (gid, first['message_id'], first['agenda_message_hash'], key, members[0][0]['reason'], stamp, stamp))
             for position, (item, proposal) in enumerate(members):
                 store.db.execute('INSERT INTO proposal_group_members VALUES (?,?,?)', (gid, proposal['id'], position))
-        for source in snapshot['sources']:
-            store.db.execute("UPDATE sources SET status=CASE WHEN status='retained' THEN status WHEN deleted=1 THEN 'deleted' ELSE 'analyzed' END,analyzed_at=?,last_error=NULL WHERE id=?", (stamp, source['id']))
-        store.db.execute("UPDATE messages SET analyzed_hash=payload_hash,status='analyzed',last_error=NULL,pending_since=NULL,analyzed_at=? WHERE payload_hash IS NOT NULL AND status<>'retained'", (stamp,))
-        baseline = assemble_agenda_snapshot(store, calendar, current=current, owner_email=store.config.calendar_owner)
-        store.db.execute("INSERT OR REPLACE INTO settings VALUES ('agenda_baseline_hash',?)", (baseline['snapshot_hash'],))
+        from .agenda_incremental import (assemble_incremental_snapshot, commit_processed_sources,
+                                         content_baseline_hash)
+        if incremental:
+            commit_processed_sources(store, snapshot, checkpoint, pid, stamp)
+            _, baseline_contract = assemble_incremental_snapshot(store, calendar, current=current,
+                owner_email=store.config.calendar_owner, enforce_budget=False)
+            store.db.execute("INSERT OR REPLACE INTO settings VALUES ('agenda_authority_baseline',?)",
+                             (json.dumps(baseline_contract['authority_versions'], sort_keys=True),))
+        else:
+            # Compatibility for explicit full-snapshot local callers. Scope
+            # status updates to the supplied source versions here as well.
+            for source in snapshot['sources']:
+                store.db.execute("UPDATE sources SET status=CASE WHEN status='retained' THEN status WHEN deleted=1 THEN 'deleted' ELSE 'analyzed' END,analyzed_at=?,last_error=NULL WHERE id=? AND content_hash=?", (stamp, source['id'], source['content_hash']))
+                row = store.get_source(source['id'])
+                if row['kind'] == 'message':
+                    store.db.execute("UPDATE messages SET analyzed_hash=payload_hash,status='analyzed',last_error=NULL,pending_since=NULL,analyzed_at=? WHERE id=? AND payload_hash=? AND status<>'retained'", (stamp, row['upstream_id'], source['content_hash']))
+        baseline = assemble_agenda_snapshot(store, calendar, current=current, owner_email=store.config.calendar_owner, enforce_budget=False)
+        store.db.execute("INSERT OR REPLACE INTO settings VALUES ('agenda_baseline_hash',?)", (content_baseline_hash(baseline),))
         return {'status': 'applied', 'plan_id': pid, 'items': payload['items'], 'reused': False}
 
 
@@ -527,11 +590,16 @@ class AgendaPlanner:
             from .source_store import KINDS
             if self.store._setting('source_last_collection_result') != 'ok' or any(health.get(kind) != 'ok' for kind in KINDS):
                 raise RuntimeFailure('agenda_collection_incomplete')
+            if (self.store.config.analysis_model, self.store.config.analysis_effort) != (AGENDA_MODEL, AGENDA_EFFORT):
+                raise RuntimeFailure('agenda_model_configuration_required')
             self.calendar = read_calendar(self.store, self.runtime)
-            snapshot = assemble_agenda_snapshot(self.store, self.calendar, current=current, owner_email=self.store.config.calendar_owner, enforce_budget=False)
-            if not preview and snapshot['snapshot_hash'] == self.store._setting('agenda_baseline_hash'):
+            from .agenda_incremental import assemble_incremental_snapshot
+            snapshot, checkpoint = assemble_incremental_snapshot(self.store, self.calendar, current=current, owner_email=self.store.config.calendar_owner, enforce_budget=False)
+            if not preview and not snapshot['sources'] and checkpoint['full_snapshot_hash'] == self.store._setting('agenda_baseline_hash'):
                 return {'status': 'unchanged', 'items': [], 'reused': True, 'model_calls': 0}
-            agenda_prompt(snapshot)  # Always preflight before a provider adapter.
+            prompt = agenda_prompt(snapshot)  # Always preflight before a provider adapter.
+            import hashlib
+            checkpoint.update(request_hash=hashlib.sha256(prompt.encode('utf-8')).hexdigest(), input_bytes=len(prompt.encode('utf-8')))
             cached = self.store.db.execute("SELECT payload,metadata FROM agenda_plans WHERE input_hash=? AND status='preview' ORDER BY created_at DESC LIMIT 1", (snapshot['snapshot_hash'],)).fetchone()
             if cached:
                 plan, metadata = json.loads(cached['payload']), json.loads(cached['metadata'])
@@ -544,12 +612,17 @@ class AgendaPlanner:
                 metadata = getattr(self.runtime, 'last_agenda_metadata', None) or {}
                 # A Calendar edit during inference invalidates the same input.
                 fresh, calls = read_calendar(self.store, self.runtime), 1
-            result = materialize_plan(self.store, snapshot, plan, fresh, current=current, preview=preview,
+            metadata = {**metadata, 'source_count': checkpoint['source_count'],
+                        'catalog_count': checkpoint['catalog_count'],
+                        'input_bytes': metadata.get('input_bytes', checkpoint['input_bytes']) if cached else checkpoint['input_bytes'],
+                        'request_hash': metadata.get('request_hash', checkpoint['request_hash']) if cached else checkpoint['request_hash']}
+            result = materialize_plan(self.store, snapshot, plan, fresh, current=current, preview=preview, checkpoint=checkpoint,
                                       metadata={**metadata,
                                                 'source_collection_at': snapshot['observation']['last_collection_at'],
                                                 'sources_refreshed_by_preview': False} if preview else metadata)
             self.calendar = fresh
-            return {**result, 'reused': result['reused'] or bool(cached), 'model_calls': calls}
+            return {**result, 'reused': result['reused'] or bool(cached), 'model_calls': calls,
+                    'source_count': checkpoint['source_count'], 'input_bytes': metadata['input_bytes']}
         except Exception as error:
             from .health_state import error_code
             code = error_code(error, 'analysis')
@@ -565,7 +638,7 @@ class AgendaPlanner:
 
 def agenda_summary(result):
     """Safe service/CLI output; private items stay in the authenticated store API."""
-    summary = {key: result[key] for key in ('status', 'plan_id', 'reused', 'model_calls') if key in result}
+    summary = {key: result[key] for key in ('status', 'plan_id', 'reused', 'model_calls', 'source_count', 'input_bytes') if key in result}
     summary['counts'] = {operation: sum(item['operation'] == operation for item in result.get('items', []))
                          for operation in ('create', 'link', 'update', 'review', 'ignore')}
     return summary
@@ -575,7 +648,8 @@ def checkpoint_before_result(store, calendar, current):
     if calendar is None:
         return False
     snapshot = assemble_agenda_snapshot(store, calendar, current=current, owner_email=store.config.calendar_owner, enforce_budget=False)
-    return snapshot['snapshot_hash'] == store._setting('agenda_baseline_hash')
+    from .agenda_incremental import content_baseline_hash
+    return content_baseline_hash(snapshot) == store._setting('agenda_baseline_hash')
 
 
 def checkpoint_after_result(store, calendar, current, advance, result):
@@ -589,4 +663,7 @@ def checkpoint_after_result(store, calendar, current, advance, result):
         calendar[result['event_id']] = result['snapshot']
     if advance:
         snapshot = assemble_agenda_snapshot(store, calendar, current=current, owner_email=store.config.calendar_owner, enforce_budget=False)
-        store.db.execute("INSERT OR REPLACE INTO settings VALUES ('agenda_baseline_hash',?)", (snapshot['snapshot_hash'],))
+        from .agenda_incremental import assemble_incremental_snapshot, content_baseline_hash
+        _, checkpoint = assemble_incremental_snapshot(store, calendar, current=current, owner_email=store.config.calendar_owner, enforce_budget=False)
+        store.db.execute("INSERT OR REPLACE INTO settings VALUES ('agenda_authority_baseline',?)", (json.dumps(checkpoint['authority_versions'], sort_keys=True),))
+        store.db.execute("INSERT OR REPLACE INTO settings VALUES ('agenda_baseline_hash',?)", (content_baseline_hash(snapshot),))

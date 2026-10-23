@@ -1,6 +1,6 @@
 # Plan prostej agendy Librusa
 
-To plan zastąpienia obecnego silnika, bez implementacji i wdrożenia w tym zadaniu.
+Zatwierdzony plan jednego silnika agendy. Szczegóły przyrostowego wejścia i checkpointu opisuje [kontrakt przyrostowy](incremental-agenda-contract.md).
 Cel: jeden plan z tekstów trzech źródeł, jedna agenda i obecny bezpieczny wykonawca Calendar.
 Istniejące wpisy i decyzje rodzica są stanem wejściowym, który trzeba zachować.
 
@@ -20,11 +20,11 @@ Istniejące wpisy i decyzje rodzica są stanem wejściowym, który trzeba zachow
 1. Worker pod obecną blokadą odzyskuje przerwane operacje i rozlicza nieznane wyniki
    wyłącznie przez odczyt. Obsługuje zapisane decyzje użytkownika i zbiera źródła.
 2. Odczytuje aktualne zarządzane wpisy Calendar. Buduje spójny snapshot: pełna aktualna
-   agenda, istotne teksty z obecnego okna zbierania, zachowane fakty przyszłych wpisów,
+   agenda, pełne nowe lub zmienione teksty, teksty potrzebne po zmianie decyzji lub Calendar, zwarty katalog wszystkich źródeł, zachowane fakty przyszłych wpisów,
    powiązania źródeł, decyzje, wybory ofert oraz zweryfikowany kontekst ucznia.
    Źródło spoza okna, które nadal uzasadnia aktywny wpis, pozostaje istotne.
 3. Mierzy rozmiar wejścia względem budżetu kontekstu wybranego modelu, z miejscem na wynik.
-   Dla obecnej skali wysyła cały ograniczony snapshot. Przekroczenie budżetu daje widoczny
+   Wysyła pełną agendę, decyzje i oferty oraz wybrany przyrost tekstów; nie analizuje ponownie dawnej pominiętej historii. Przekroczenie budżetu daje widoczny
    błąd przed wywołaniem; bez cichego obcinania i własnego silnika stronicowania.
 4. Jeden tool-free task na jawnie skonfigurowanym `gpt-6.1-sol/high` zwraca plan całej zmiany:
    `create`, `link`, `update`, `review`, `ignore`, z uzasadnieniem i wskazaniem źródeł.
@@ -43,7 +43,7 @@ Istniejące wpisy i decyzje rodzica są stanem wejściowym, który trzeba zachow
 Hash do ponownego użycia planu obejmuje treści/wersje źródeł, agendę i aktualny stan
 zarządzanych wpisów Calendar, decyzje użytkownika, kontekst ucznia, politykę,
 wersję planera/promptu i konfigurację modelu. Ponowna kontrola przed kolejką odrzuca
-plan, jeśli stan zmienił się podczas inference. Sam nowy czas pobrania nie jest zmianą treści.
+plan, jeśli stan zmienił się podczas inference. Sam nowy czas pobrania lub zmiana dnia nie jest zmianą treści. Lokalny CAS obejmuje pełny stan bez limitu bajtów; hash rzeczywistego żądania jest osobny. Dodatkowy rejestr wersji źródeł uwzględnia treść, usunięcie, retencję i dostępność tekstu; checkpoint tylko jawnie obsłużonych wersji jest atomowy z materializacją planu. Sam katalog lub dawny tekst kontekstowy nie uprawnia do nowego automatycznego wpisu.
 Udane własne zapisy aktualizują baseline/checkpoint, więc ich zmiany agendy i Calendar
 oraz techniczne timestampy nie uruchamiają inference ponownie; zmiany zewnętrzne nadal je unieważniają.
 Brak zmiany wejścia pomija inference; worker nadal rozlicza operacje, wykonuje zatwierdzone

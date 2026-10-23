@@ -492,7 +492,8 @@ class DataAdminTests(unittest.TestCase):
         runtime.probe = lambda: {'calendar_id':TEST_CONFIG.calendar_id, 'access_role':'owner'}
         calls = []
         responses = iter([RuntimeFailure('codex_timeout')] + [{'event':original}] * 5 + [RuntimeFailure('codex_timeout', possible_write=True)])
-        runtime.plan_agenda = lambda snapshot: {'snapshot_hash':snapshot['snapshot_hash'],'decision_reason':'Fictional unchanged agenda.','items':[]}
+        from test_agenda import item as agenda_item, plan as agenda_plan
+        runtime.plan_agenda = lambda snapshot: agenda_plan(snapshot, [agenda_item(snapshot, 'ignore', action=None)] if snapshot['sources'] else [])
         def tool(name, args):
             calls.append(name)
             result = next(responses)

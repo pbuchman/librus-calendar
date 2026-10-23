@@ -26,7 +26,7 @@ ERROR_CODES |= frozenset(('codex_protocol_invalid', 'calendar_tool_incomplete', 
 ERROR_CODES |= frozenset(('agenda_collection_incomplete', 'agenda_context_overflow', 'agenda_snapshot_overflow',
     'agenda_snapshot_invalid', 'agenda_learner_unverified', 'agenda_learner_mismatch',
     'agenda_calendar_snapshot_incomplete', 'agenda_calendar_snapshot_invalid', 'agenda_plan_invalid', 'agenda_plan_stale',
-    'agenda_action_reference_invalid', 'agenda_source_reference_invalid', 'agenda_group_reference_invalid',
+    'agenda_action_reference_invalid', 'agenda_source_reference_invalid', 'agenda_source_body_required', 'agenda_sources_unprocessed', 'agenda_group_reference_invalid',
     'agenda_conflicting_operations', 'agenda_review_required', 'agenda_model_configuration_required', 'agenda_whole_snapshot_required'))
 PROBE_RESULTS = frozenset(('running', 'ok', 'failed', 'interrupted'))
 PROBE_FIELDS = ('attempt_number', 'model', 'effort', 'cli_version', 'started_at', 'completed_at', 'result',

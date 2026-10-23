@@ -492,11 +492,15 @@ class CodexRuntime:
         if (self.config.analysis_model, self.config.analysis_effort) != (AGENDA_MODEL, AGENDA_EFFORT):
             raise RuntimeFailure('agenda_model_configuration_required')
         prompt = agenda_prompt(snapshot)
+        import hashlib
         result = validate_agenda_plan(self._invoke(prompt, 'agenda_plan.json'), snapshot)
         self.last_agenda_metadata = {'model': AGENDA_MODEL, 'effort': AGENDA_EFFORT,
                                     'prompt_version': AGENDA_VERSION,
                                     'input_bytes': len(prompt.encode('utf-8')),
-                                    'item_count': len(result['items'])}
+                                    'request_hash': hashlib.sha256(prompt.encode('utf-8')).hexdigest(),
+                                    'item_count': len(result['items']),
+                                    'source_count': len(snapshot['sources']),
+                                    'catalog_count': len(snapshot.get('source_catalog', snapshot['sources']))}
         return result
 
     @staticmethod
