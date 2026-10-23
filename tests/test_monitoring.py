@@ -272,7 +272,7 @@ class CollectorTests(unittest.TestCase):
                 service.get_data()
                 self.assertEqual(service.diagnostics['sync_result'], 'unknown')
 
-    def test_running_attempt_preserves_actual_completed_failure_in_alert_info(self):
+    def test_running_attempt_preserves_actual_completed_failure_in_diagnostics(self):
         value = snapshot()
         value.update(sync_running=True)
         value['state'].update(last_result='running', last_stage='analysis', last_error_code=None,
@@ -296,12 +296,8 @@ class CollectorTests(unittest.TestCase):
         rules = (ROOT/'deploy/netdata/librus_local-health.conf').read_text()
         block = next(block for block in rules.split('template: ') if block.startswith('librus_sync_failures'))
         info = next(line.strip()[6:] for line in block.splitlines() if line.strip().startswith('info: '))
-        for key, label in service.diagnostics.items():
-            info = info.replace('${label:' + key + '}', label)
-        self.assertIn('current sync: running; stage: analysis', info)
-        self.assertIn('last completed sync: failed; stage: analysis; cause: agenda_context_overflow', info)
+        self.assertIn('Librus synchronization diagnostics chart', info)
         self.assertNotIn('${label:', info)
-        self.assertNotIn('cause: none', info)
 
     def test_completed_cause_survives_pause_dry_run_and_new_attempt_then_clears_on_actual_success(self):
         value = snapshot()
@@ -365,12 +361,13 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(COLLECTOR.SYNC_ERROR_CODES, ERROR_CODES)
         self.assertEqual(COLLECTOR.SYNC_STAGES, STAGES)
 
-    def test_label_protocol_preserves_job_and_does_not_change_metrics_or_alert_state(self):
-        # Emulate the stock chart's create/refresh contract and downstream health
-        # evaluation. A cause-only change must update metadata without a transition.
+    def test_diagnostic_wire_changes_only_the_chart_without_alerts(self):
+        # Exercise the actual collector output and stock chart create/refresh
+        # boundary. Native alarm lifecycle requires a separate real-Netdata test;
+        # a local approximation of health evaluation cannot establish it.
         emitted = []
         charts_module = types.ModuleType('bases.charts')
-        charts_module.CHART_CREATE = "CHART {type}.{id} '' 'test' 'count'\n"
+        charts_module.CHART_CREATE = "CHART {type}.{id} '' 'test' 'count' 'sync' '{type}.{id}' line 1 60\n"
         charts_module.CLABEL_COLLECT_JOB = "CLABEL '_collect_job' '{actual_job_name}' '0'\n"
         charts_module.CLABEL_COMMIT = "CLABEL_COMMIT\n"
         collection = types.ModuleType('bases.collection')
@@ -386,12 +383,17 @@ class CollectorTests(unittest.TestCase):
                 self.flags.created = True
                 self.flags.push = False
         service = COLLECTOR.Service({})
-        service.charts = {name: Chart(name) for name in ('sync', 'queue')}
+        service.charts = {name: Chart(name) for name in ('sync', 'queue', 'diagnostics')}
         value = snapshot()
         value['state'].update(last_result='failed', last_stage='analysis',
                               last_error_code='agenda_context_overflow', consecutive_failures=2)
-        chart_labels, statuses, transitions = {}, {}, []
+        chart_labels = {}
         with patch.dict(sys.modules, {'bases.charts': charts_module, 'bases.collection': collection}):
+            # Ordinary python.d initial creation supplies only its stable job
+            # label on alert-bearing charts.
+            for chart in service.charts.values():
+                chart.create()
+            initial = ''.join(emitted)
             for code, result in [('agenda_context_overflow', 'failed'), ('codex_failed', 'failed'),
                                  (None, 'ok')]:
                 value['state'].update(last_error_code=code, last_result=result,
@@ -402,7 +404,11 @@ class CollectorTests(unittest.TestCase):
                 service.publish_diagnostics()
                 self.assertEqual(COLLECTOR.HealthMetrics().calculate(value, self.now), before)
                 import shlex
-                for line in ''.join(emitted[start:]).splitlines():
+                update = ''.join(emitted[start:])
+                self.assertIn('CHART librus_local.diagnostics ', update)
+                self.assertNotIn('CHART librus_local.sync ', update)
+                self.assertNotIn('CHART librus_local.queue ', update)
+                for line in (initial + update).splitlines():
                     fields = shlex.split(line)
                     if fields[0] == 'CHART':
                         chart = fields[1]
@@ -412,20 +418,26 @@ class CollectorTests(unittest.TestCase):
                     elif fields[0] == 'CLABEL_COMMIT':
                         chart_labels[chart] = pending
                 for chart in ('librus_local.sync', 'librus_local.queue'):
-                    self.assertEqual(chart_labels[chart]['_collect_job'], 'local')
-                    self.assertEqual(chart_labels[chart]['sync_cause'], service.diagnostics['sync_cause'])
-                current = 'CRITICAL' if before['failures'] >= 2 else ('WARNING' if before['failures'] >= 1 else 'CLEAR')
-                if statuses.get('sync_failures', 'CLEAR') != current:
-                    transitions.append(current)
-                statuses['sync_failures'] = current
-            self.assertEqual(transitions, ['CRITICAL', 'CLEAR'])
-            self.assertEqual(chart_labels['librus_local.sync']['sync_cause'], 'none')
+                    self.assertEqual(chart_labels[chart], {'_collect_job': 'local'})
+                self.assertEqual(chart_labels['librus_local.diagnostics'],
+                                 {'_collect_job': 'local', **service.diagnostics})
+            self.assertEqual(chart_labels['librus_local.diagnostics']['sync_cause'], 'none')
             start = len(emitted)
             service.publish_diagnostics()
             self.assertEqual(len(emitted), start)
             service.charts['sync'].flags.push = True
             service.publish_diagnostics()
+            self.assertEqual(len(emitted), start)
+            service.charts['diagnostics'].flags.push = True
+            service.publish_diagnostics()
             self.assertIn("'sync_cause' 'none'", ''.join(emitted[start:]))
+
+        rules = (ROOT/'deploy/netdata/librus_local-health.conf').read_text()
+        self.assertNotIn('on: librus_local.diagnostics', rules)
+        self.assertNotIn('${label:', rules)
+        self.assertEqual(rules.count('Librus synchronization diagnostics chart'), 6)
+        self.assertEqual(COLLECTOR.CHARTS['diagnostics']['lines'],
+                         [['failures', 'consecutive failures', 'absolute', 1, COLLECTOR.WIRE_SCALE]])
 
     def test_probe_chart_is_optional_and_rolling_counts_are_absolute(self):
         value = snapshot()

@@ -14,7 +14,7 @@ priority = 90000
 WIRE_SCALE = 1000
 MAX_METRIC_VALUE = 10**12
 
-ORDER = ['sync', 'queue', 'services', 'monitoring', 'backup', 'pause', 'calendar_probe']
+ORDER = ['sync', 'diagnostics', 'queue', 'services', 'monitoring', 'backup', 'pause', 'calendar_probe']
 CHARTS = {
     'sync': {'options': [None, 'Librus synchronization', 'minutes / count', 'sync', 'librus_local.sync', 'line'],
         'lines': [['success_age', 'last full success age'], ['success_alert_age', 'unpaused full success age'], ['success_missing', 'no full success'],
@@ -23,6 +23,8 @@ CHARTS = {
     'queue': {'options': [None, 'Librus automatic queue', 'minutes / count', 'sync', 'librus_local.queue', 'line'],
         'lines': [['pending_age', 'oldest automatic work age'], ['pending_alert_age', 'unpaused automatic work age'], ['messages', 'pending messages'],
                   ['operations', 'pending operations'], ['review', 'awaiting owner decision']]},
+    'diagnostics': {'options': [None, 'Librus synchronization diagnostics', 'failures', 'sync', 'librus_local.diagnostics', 'line'],
+        'lines': [['failures', 'consecutive failures']]},
     'services': {'options': [None, 'Librus service outages', 'minutes', 'services', 'librus_local.services', 'line'],
         'lines': [['sync_timer_down', 'sync timer'], ['backup_timer_down', 'backup timer'],
                   ['web_down', 'web'], ['sync_unit_down', 'sync unit unavailable']]},
@@ -82,7 +84,9 @@ RESULTS = {'idle', 'running', 'ok', 'partial', 'failed', 'interrupted', 'paused'
 PROBE_RESULTS = {'running', 'ok', 'failed', 'interrupted'}
 
 
-# Labels are notification metadata only. Never publish arbitrary snapshot strings.
+# Labels belong only to the diagnostics chart, which has no alerts. Changing
+# labels on an alert-bearing chart resets its alert lifecycle in Netdata.
+# Never publish arbitrary snapshot strings.
 SYNC_STAGES = frozenset(('analysis', 'calendar_probe', 'complete', 'credentials', 'discovery',
     'fetch', 'login', 'queue', 'reconcile', 'runtime', 'starting', 'write'))
 SYNC_ERROR_CODES = frozenset(('account_mismatch', 'agenda_action_reference_invalid', 'agenda_calendar_snapshot_incomplete',
@@ -378,18 +382,17 @@ class Service(SimpleService):
             return
         from bases.charts import CHART_CREATE, CLABEL_COLLECT_JOB, CLABEL_COMMIT
         from bases.collection import safe_print
-        for name in ('sync', 'queue'):
-            chart = charts[name]
-            # Native create() also publishes _collect_job. Its later refresh must not
-            # replace our labels; reapply after any pending native creation.
-            refresh = not chart.flags.created or chart.flags.push
-            if refresh:
-                chart.create()
-            if refresh or self._published_diagnostics != self.diagnostics:
-                labels = CLABEL_COLLECT_JOB.format(**chart.params)
-                labels += ''.join("CLABEL '{0}' '{1}' '1'\n".format(key, value)
-                                  for key, value in sorted(self.diagnostics.items()))
-                safe_print(CHART_CREATE.format(**chart.params) + labels + CLABEL_COMMIT)
+        chart = charts['diagnostics']
+        # Native create() also publishes _collect_job. Its later refresh must not
+        # replace our labels; reapply after any pending native creation.
+        refresh = not chart.flags.created or chart.flags.push
+        if refresh:
+            chart.create()
+        if refresh or self._published_diagnostics != self.diagnostics:
+            labels = CLABEL_COLLECT_JOB.format(**chart.params)
+            labels += ''.join("CLABEL '{0}' '{1}' '1'\n".format(key, value)
+                              for key, value in sorted(self.diagnostics.items()))
+            safe_print(CHART_CREATE.format(**chart.params) + labels + CLABEL_COMMIT)
         self._published_diagnostics = dict(self.diagnostics)
 
     def get_data(self):
