@@ -90,7 +90,7 @@ SYNC_ERROR_CODES = frozenset(('account_mismatch', 'agenda_action_reference_inval
     'agenda_conflicting_operations', 'agenda_context_overflow', 'agenda_group_reference_invalid',
     'agenda_learner_mismatch', 'agenda_learner_unverified', 'agenda_model_configuration_required',
     'agenda_plan_invalid', 'agenda_plan_stale', 'agenda_review_required', 'agenda_snapshot_invalid',
-    'agenda_snapshot_overflow', 'agenda_source_reference_invalid', 'agenda_whole_snapshot_required',
+    'agenda_snapshot_overflow', 'agenda_source_reference_invalid', 'agenda_source_body_required', 'agenda_sources_unprocessed', 'agenda_whole_snapshot_required',
     'analysis_failed', 'analysis_tool_forbidden', 'calendar_configuration_required',
     'calendar_event_id_mismatch', 'calendar_event_missing', 'calendar_event_not_found',
     'calendar_not_allowed', 'calendar_probe_audit_failed', 'calendar_result_unreadable',

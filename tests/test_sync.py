@@ -68,6 +68,11 @@ class FakeRuntime:
                 projected = {key: raw.get(key) for key in ('title','description','start','end','all_day','temporal_kind','due_at','activity_scope')}
                 projected.update(optional=False, temporal_kind=raw.get('temporal_kind', 'event'), activity_scope=raw.get('activity_scope', 'school'))
                 result.append(item(snapshot, 'review' if raw.get('needs_review') or raw.get('confidence', 'high') == 'low' or raw.get('activity_scope', 'school') != 'school' else 'create', review_change='create' if raw.get('needs_review') or raw.get('confidence', 'high') == 'low' or raw.get('activity_scope', 'school') != 'school' else None, action=projected, sources=[{'source_id':source['id'],'source_hash':source['content_hash']}]))
+        covered = {ref['source_id'] for entry in result for ref in entry['sources']}
+        ignored = [{'source_id': source['id'], 'source_hash': source['content_hash']}
+                   for source in snapshot['sources'] if source['id'] not in covered]
+        if ignored:
+            result.append(item(snapshot, 'ignore', action=None, sources=ignored))
         self.last_agenda_metadata = {key: value for key, value in getattr(self, 'last_analysis_metadata', {}).items() if key in ('model','effort','prompt_version')}
         return plan(snapshot, result)
 

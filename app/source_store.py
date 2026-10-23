@@ -76,6 +76,8 @@ class SourceStoreMixin:
     def _initialize_sources(self):
         from .core import utcnow
         self.db.executescript(SOURCE_SCHEMA)
+        from .agenda_incremental import LEDGER_SCHEMA
+        self.db.execute(LEDGER_SCHEMA)
         if 'content_since' not in {r[1] for r in self.db.execute('PRAGMA table_info(sources)')}:
             self.db.execute('ALTER TABLE sources ADD COLUMN content_since TEXT')
         self.db.execute('UPDATE sources SET content_since=COALESCE(content_since,fetched_at)')

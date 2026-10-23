@@ -7,7 +7,9 @@ first run the read-only planning POC, then replace the old engine after its acce
 
 - Read only message, announcement and school-calendar text; no attachment, image, PDF, OCR or external-link content.
 - Keep one agenda in the existing SQLite database, runtime, Calendar, app timer and Netdata integration.
-- Use one tool-free structured task per changed coherent snapshot: relevant texts, current agenda and saved decisions.
+- Use one tool-free structured task per changed coherent snapshot: full new/changed texts, affected human/Calendar context, compact whole-source catalog, whole agenda, decisions and offers.
+- Do not retrospectively reanalyze processed ignored history. New automatic creates need an available changed body; catalog/context alone cannot authorize them.
+- Advance only explicitly handled exact source versions atomically with local materialization. Preview, failure and stale input never advance the source ledger. Retention/deletion are version changes even with the same content hash.
 - Measure the complete bounded input before calling; overflow fails visibly, without silent truncation or a bespoke paging engine.
 - Replace both old message inference and multi-source matching; retire the rollout switch, retain useful read-only preview.
 - Application code assigns stable IDs, validates and persists the plan, then uses the existing durable operation executor.
@@ -18,7 +20,7 @@ first run the read-only planning POC, then replace the old engine after its acce
 - Check current Calendar state before applying; material changes to user-controlled entries and cancellations require approval.
 - Review blocks affected actions only; keep dependent offer choices atomic. Missing sources or plan items never authorize deletion.
 - Reconcile uncertain writes read-only before retrying; preview cannot mutate active decisions, queue or Calendar.
-- External edits, decisions and policy/planner changes invalidate reuse; own successful writes advance the baseline. Unchanged runs still reconcile and check health.
+- External edits, decisions and policy/planner changes invalidate reuse; own successful writes advance content and authority baselines. Day/fetch clocks alone do not cause inference. Unchanged runs still reconcile and check health.
 
 ## Complexity, models and privacy
 
