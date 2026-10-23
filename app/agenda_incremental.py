@@ -16,7 +16,7 @@ from contextlib import nullcontext
 from .agenda import assemble_agenda_snapshot, agenda_prompt
 from .core import digest
 
-INCREMENTAL_VERSION = 'simple-agenda-v5-incremental'
+INCREMENTAL_VERSION = 'simple-agenda-v6-activity-eligibility'
 COMPATIBLE_FULL_VERSIONS = frozenset({'simple-agenda-v4-shared-learner'})
 LEDGER_TABLE = 'agenda_processed_sources'
 LEDGER_SCHEMA = '''CREATE TABLE IF NOT EXISTS agenda_processed_sources(

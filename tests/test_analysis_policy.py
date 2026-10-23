@@ -69,6 +69,8 @@ class AgendaPolicyTests(unittest.TestCase):
         # Real model interpretation remains the bounded read-only preview gate.
         bodies = [
             'Biblioteka szkolna będzie zamknięta 12 marca z powodu inwentaryzacji.',
+            'Napisane już prace konkursowe można obejrzeć w pokoju nauczycielskim '
+            '13 marca od 10:00 do 12:00. Godziny dostępu mogą się zmienić. Odbiorców nie wskazano.',
             'Warsztaty odbędą się 14 marca. Uczestnictwo wymaga potwierdzenia; odbiorców nie wskazano.',
             'Uczniowie klasy 1x mogą dobrowolnie przynieść papier na zajęcia 15 marca.',
         ]
@@ -77,6 +79,7 @@ class AgendaPolicyTests(unittest.TestCase):
              'kind': 'announcement', 'text': body, 'metadata': {'scope': 'all_current_announcements'}}
             for index, body in enumerate(bodies)])
         outputs = [item(snapshot, 'ignore', action=None, reason='Informacja o dostępności placówki.'),
+                   item(snapshot, 'ignore', action=None, reason='Wyłącznie godziny wglądu do już napisanych prac.'),
                    item(snapshot, 'review', review_change='create', action=None,
                         reason='Nie ustalono uczestnictwa wybranej klasy.'),
                    item(snapshot, action=dict(action(), start='2030-03-15', optional=True))]
@@ -89,8 +92,8 @@ class AgendaPolicyTests(unittest.TestCase):
                 'type': 'agent_message', 'text': json.dumps(plan(snapshot, outputs))}}), ''
         runtime = CodexRuntime(TEST_CONFIG, run_process=process, read_only=True)
         result = runtime.plan_agenda(snapshot)
-        self.assertEqual([entry['operation'] for entry in result['items']], ['ignore', 'review', 'create'])
-        self.assertTrue(result['items'][2]['action']['optional'])
+        self.assertEqual([entry['operation'] for entry in result['items']], ['ignore', 'ignore', 'review', 'create'])
+        self.assertTrue(result['items'][3]['action']['optional'])
         self.assertEqual(len(calls), 1)
         for body in bodies:
             self.assertIn(body, calls[0][1])
@@ -98,7 +101,10 @@ class AgendaPolicyTests(unittest.TestCase):
                             for argument in calls[0][0]))
         policy = (SCHEMAS / 'agenda_plan.md').read_text()
         self.assertIn('A service closure alone is not a personal', policy)
-        self.assertIn('an applicable pupil activity or duty', policy)
-        self.assertIn('uncertain, use review', policy)
+        self.assertLess(policy.index('First establish'), policy.index('metadata establishes applicability, use review'))
+        self.assertIn('Availability alone MUST use ignore even when', policy)
+        self.assertIn('recipients or participation are unknown', policy)
+        self.assertIn('A competition mention alone does not establish pupil participation', policy)
+        self.assertIn('Already-written contest papers may be viewed', policy)
         self.assertIn('Preserve voluntary school actions with an explicit task', policy)
         self.assertEqual(runtime.last_agenda_metadata['prompt_version'], AGENDA_VERSION)

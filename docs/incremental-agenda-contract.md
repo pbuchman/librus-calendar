@@ -11,6 +11,16 @@ ID must be referenced by at least one plan item before any checkpoint can advanc
 A grouped ignore can acknowledge multiple irrelevant/unavailable sources without
 an existing action. Catalog-only IDs need no acknowledgment.
 
+The planner first establishes an actual pupil activity, task or duty, then checks
+its applicability. Operational availability alone is ignored even when recipients
+or participation are unknown. For example, access hours for viewing already-written
+contest papers do not announce contest participation, signup or a pupil duty.
+An actual activity with unclear applicability still requires review, while a clear
+optional classroom task remains eligible for automatic creation. This is a planner
+instruction, not a lexical rule in application code; offline prompt/contract tests
+do not prove model interpretation. A bounded read-only live planning check must
+verify the distinction before rollout acceptance.
+
 `app.agenda_incremental.assemble_incremental_snapshot(database, calendar_events,
 current=..., owner_email=...)` is a pure read helper. It accepts an existing SQLite
 read-only connection; never instantiate AppStore for a production planning POC.
