@@ -79,6 +79,64 @@ class AgendaIntegrationTests(AgendaTests):
                                      agenda_calendar=planner.calendar, current=NOW)
         return queued
 
+    def test_scoped_cleanup_retires_only_unwritten_review_without_replaying_sources(self):
+        from app.agenda_incremental import assemble_incremental_snapshot
+        from app.source_admin import cleanup_existing
+
+        def reviews(snapshot):
+            return [item(snapshot, 'review', review_change='create',
+                         action=dict(action(), title='Fikcyjna propozycja %d' % index),
+                         sources=[{'source_id': source['id'], 'source_hash': source['content_hash']}])
+                    for index, source in enumerate(snapshot['sources'])]
+
+        result, runtime, planner = self.apply(reviews)
+        target = result['items'][0]['proposal_id']
+        others = [entry['proposal_id'] for entry in result['items'][1:]]
+        before = {table: [tuple(row) for row in self.store.db.execute('SELECT * FROM ' + table + ' ORDER BY 1')]
+                  for table in ('agenda_processed_sources', 'action_sources', 'canonical_decisions',
+                                'decision_intents', 'events', 'operations')}
+        other_proposals = [tuple(self.store.db.execute('SELECT * FROM proposals WHERE id=?', (pid,)).fetchone())
+                           for pid in others]
+        other_actions = [tuple(row) for row in self.store.db.execute(
+            'SELECT * FROM canonical_actions WHERE proposal_id<>? ORDER BY id', (target,))]
+        path = self.path.parent / 'fictional-scoped-cleanup.json'
+        request = {'changes': [{'proposal_id': target,
+                               'reason': 'Fikcyjna korekta: same godziny dostępu nie stanowią aktywności ucznia.'}]}
+        self.assertEqual(cleanup_existing(self.store, plan_path=path, request=request)['status'], 'preview')
+        self.assertEqual(cleanup_existing(self.store, plan_path=path, apply=True)['calendar_writes'], 0)
+        self.assertEqual(self.store.db.execute('SELECT status FROM proposals WHERE id=?', (target,)).fetchone()[0], 'superseded')
+        self.assertEqual(other_proposals, [tuple(self.store.db.execute('SELECT * FROM proposals WHERE id=?', (pid,)).fetchone())
+                                           for pid in others])
+        self.assertEqual(other_actions, [tuple(row) for row in self.store.db.execute(
+            'SELECT * FROM canonical_actions WHERE proposal_id<>? ORDER BY id', (target,))])
+        for table, rows in before.items():
+            self.assertEqual(rows, [tuple(row) for row in self.store.db.execute('SELECT * FROM ' + table + ' ORDER BY 1')])
+        snapshot, _ = assemble_incremental_snapshot(self.store, {}, current=NOW)
+        self.assertEqual(snapshot['sources'], [])
+        self.assertEqual(len(snapshot['source_catalog']), 3)
+        self.assertEqual(runtime.writes, [])
+
+    def test_planner_policy_change_invalidates_reuse_without_reselecting_ignored_history(self):
+        from app.agenda import AGENDA_VERSION
+        from app.agenda_incremental import INCREMENTAL_VERSION
+
+        self.assertEqual(AGENDA_VERSION, INCREMENTAL_VERSION)
+        result, runtime, planner = self.apply(lambda snapshot: [item(snapshot, 'ignore', action=None)])
+        ledger = [tuple(row) for row in self.store.db.execute('SELECT * FROM agenda_processed_sources ORDER BY source_id')]
+        self.assertEqual(planner.run(NOW)['status'], 'unchanged')
+        from app.agenda_incremental import assemble_incremental_snapshot
+        before, previous = assemble_incremental_snapshot(self.store, {}, current=NOW)
+        with patch('app.agenda.AGENDA_VERSION', 'fictional-new-policy'), \
+             patch('app.agenda_incremental.INCREMENTAL_VERSION', 'fictional-new-policy'):
+            snapshot, contract = assemble_incremental_snapshot(self.store, {}, current=NOW)
+            self.assertEqual(snapshot['sources'], [])
+            self.assertEqual(len(snapshot['source_catalog']), 3)
+            self.assertNotEqual(snapshot['snapshot_hash'], before['snapshot_hash'])
+            self.assertNotEqual(contract['full_snapshot_hash'], previous['full_snapshot_hash'])
+            self.assertFalse(planner.run(NOW)['reused'])
+        self.assertEqual(ledger, [tuple(row) for row in self.store.db.execute('SELECT * FROM agenda_processed_sources ORDER BY source_id')])
+        self.assertEqual(runtime.writes, [])
+
     def approved_cancel(self):
         result, runtime, planner = self.apply(lambda snapshot: [item(snapshot)])
         self.store.set_writes_paused(False)

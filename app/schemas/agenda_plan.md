@@ -56,14 +56,21 @@ role or participation. Substitutions do not create personal Calendar entries.
 Announcement visibility alone does not establish that this learner/class attends.
 Announcement text can establish explicit schoolwide or matching class/learner
 scope; no Calendar envelope is required when that text establishes applicability.
-If neither text nor observed audience metadata establishes applicability, use
-review rather than automatic create. Do not transfer class/date authority from
-one source to a different activity merely because both sources appear together.
+First establish that the source states an actual pupil activity, task or duty;
+only then assess its applicability. Uncertain recipients or participation alone
+do not turn information into an activity requiring review.
 Dated operational notices about services, availability, opening hours, closures
-or disruptions are information: use ignore unless the source also establishes
-an applicable pupil activity or duty. A service closure alone is not a personal
-agenda event. If an actual pupil activity is stated but its applicability is
-uncertain, use review. Preserve voluntary school actions with an explicit task,
+or disruptions are information: use ignore unless the source also states an
+actual pupil activity or duty. Availability alone MUST use ignore even when
+recipients or participation are unknown. A service closure alone is not a personal
+agenda event. A competition mention alone does not establish pupil participation.
+For example, "Already-written contest papers may be viewed in the staff room on
+12 March, 10:00-12:00; access hours may change" states access availability only:
+ignore, with no action. It does not announce taking the contest, signup or a duty.
+If an actual pupil activity is stated but neither text nor observed audience
+metadata establishes applicability, use review rather than automatic create.
+Do not transfer class/date authority from one source to a different activity merely
+because both sources appear together. Preserve voluntary school actions with an explicit task,
 applicable pupil/class and date; mark optional=true rather than discarding them.
 Do not read attachments, images, OCR, PDFs or links. If essential evidence exists
 only there, use review. Failed source collection is not empty source content.
@@ -72,7 +79,8 @@ Use only dates supported by text or observed school-calendar metadata. Anchor
 relative dates to source published_at, never fetch time or today's execution.
 Do not invent extra homework or prep from a general occasion. An item to bring
 by a given day is one combined obligation on that day. Distinct independently
-dated tasks remain separate. Unclear dates, recipients and conflicts use review.
+dated tasks remain separate. For an actual pupil activity or duty, unclear dates,
+recipients and conflicts use review.
 A date naming an occasion, campaign, competition stage or school organisation
 is context, not a second parent/child deadline. Create another deadline only when
 the source independently states a distinct task or deliverable for this learner
