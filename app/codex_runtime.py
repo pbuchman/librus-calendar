@@ -139,7 +139,7 @@ def _result(status, *, event=None, error=None, owner_email=""):
 
 
 class CodexRuntime:
-    READ_TOOLS = frozenset({'list_calendars', 'search_events', 'list_events', 'read_event', 'fetch'})
+    READ_TOOLS = frozenset({'list_calendars', 'search_events', 'list_events', 'read_event', 'batch_read_event', 'fetch'})
 
     def __init__(self, config=None, *, run_process=None, read_only=False):
         self.read_only = bool(read_only)
@@ -168,6 +168,7 @@ class CodexRuntime:
         self.last_invocation_metadata = {}
         self.last_probe_attempts = []
         self.probe_attempt_sink = None
+        self.invocation_sink = None
         self._version = None
         self._injected_runner = run_process is not None
         self._active_tool_request = None
@@ -241,6 +242,8 @@ class CodexRuntime:
 
     def _capture_interrupted_output(self, stdout, stderr, returncode):
         """Keep bounded technical evidence already emitted before termination."""
+        if type(returncode) is int:
+            self.last_invocation_metadata['process_code'] = returncode
         if (self._active_tool_request is None or not isinstance(stdout, str) or not isinstance(stderr, str)
                 or type(returncode) is not int):
             return
@@ -429,6 +432,34 @@ class CodexRuntime:
         return target
 
     def _invoke(self, prompt, schema, tools=(), expected_tool=None, expected_args=None):
+        started = time.monotonic()
+        requested = len(expected_args['event_ids']) if expected_tool == 'batch_read_event' else 1
+        metadata = dict(state='running', requested_count=requested, received_count=0,
+                        duration_seconds=0.0, process_code=None, started_count=0, completed_count=0)
+        self.last_invocation_metadata = {}
+        if self.invocation_sink:
+            self.invocation_sink(metadata)
+        state = 'failed'
+        try:
+            result = self._invoke_once(prompt, schema, tools, expected_tool, expected_args)
+            metadata['received_count'] = (len(result.get('responses', []))
+                if expected_tool == 'batch_read_event' and isinstance(result, dict) and isinstance(result.get('responses'), list)
+                else 1)
+            state = 'completed'
+            return result
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                state = 'interrupted'
+            raise
+        finally:
+            evidence = self.last_invocation_metadata
+            metadata.update(state=state, duration_seconds=min(time.monotonic()-started, 7*86400),
+                process_code=evidence.get('process_code'), started_count=evidence.get('started_count', 0),
+                completed_count=evidence.get('completed_count', 0))
+            if self.invocation_sink:
+                self.invocation_sink(metadata)
+
+    def _invoke_once(self, prompt, schema, tools=(), expected_tool=None, expected_args=None):
         with tempfile.TemporaryDirectory(prefix="librus-codex-") as directory:
             os.chmod(directory, 0o700)
             args = self._args(directory, schema, tools)
@@ -442,6 +473,7 @@ class CodexRuntime:
                 raise RuntimeFailure("codex_unavailable", possible_write=False)
             finally:
                 self._active_tool_request = None
+            self.last_invocation_metadata['process_code'] = returncode
             calls = self._tool_records(stdout, stderr, returncode, expected_tool, expected_args, write) if tools else []
             messages = []
             observed_write = False
@@ -639,6 +671,62 @@ class CodexRuntime:
     def read_event(self, event_id, expected_event=None):
         return self._fetch(event_id, expected_event)
 
+    def read_events(self, expected_events):
+        """Read every exact managed ID in bounded batches, with complete coverage."""
+        if not isinstance(expected_events, dict) or any(not isinstance(eid, str) or not eid for eid in expected_events):
+            raise RuntimeFailure('agenda_calendar_snapshot_invalid')
+        events = {}
+        ids = list(expected_events)
+        for offset in range(0, len(ids), 10):
+            requested = ids[offset:offset+10]
+            data = self._tool('batch_read_event', {'calendar_id': self.config.calendar_id, 'event_ids': requested})
+            responses = data.get('responses') if isinstance(data, dict) else None
+            if not isinstance(responses, list) or len(responses) != len(requested):
+                raise RuntimeFailure('agenda_calendar_snapshot_incomplete')
+            batch = {}
+            anonymous_errors = any(isinstance(event, dict) and 'error' in event for event in responses)
+            for position, event in enumerate(responses):
+                if self._batch_not_found(event):
+                    batch[requested[position]] = None
+                    continue
+                if (not isinstance(event, dict) or not isinstance(event.get('id'), str)
+                        or event['id'] not in requested or event['id'] in batch
+                        or anonymous_errors and event['id'] != requested[position]):
+                    raise RuntimeFailure('agenda_calendar_snapshot_invalid')
+                if event.get('error') or event.get('errors') or not self._event_from(event):
+                    raise RuntimeFailure('calendar_result_unreadable')
+                batch[event['id']] = self._normalize_read_event(event, event['id'], expected_events[event['id']])
+            if set(batch) != set(requested):
+                raise RuntimeFailure('agenda_calendar_snapshot_incomplete')
+            events.update(batch)
+        return events
+
+    @staticmethod
+    def _batch_not_found(value):
+        """Recognize the observed anonymous error envelope, never prose or omission.
+
+        The connector returns one response per input in request order. This
+        association is admitted only when all successful siblings verify that
+        ordering; a reordered mixed batch is rejected by read_events.
+        """
+        if (not isinstance(value, dict) or set(value) != {'error', 'detail'}
+                or value['error'] != 'Failed to read event' or not isinstance(value['detail'], str)):
+            return False
+        match = re.fullmatch(r'(404|410): HTTP request failed \(Response:\s*(\{.*\})\s*\)', value['detail'], re.S)
+        if not match:
+            return False
+        try:
+            payload = json.loads(match.group(2))
+        except (ValueError, TypeError):
+            return False
+        error = payload.get('error') if isinstance(payload, dict) and set(payload) == {'error'} else None
+        return (isinstance(error, dict) and set(error) == {'errors','code','message'}
+                and type(error['code']) is int and error['code'] == int(match.group(1))
+                and isinstance(error['message'], str) and isinstance(error['errors'], list)
+                and bool(error['errors']) and all(isinstance(item, dict)
+                    and set(item) == {'domain','reason','message'}
+                    and all(isinstance(field, str) for field in item.values()) for item in error['errors']))
+
     def discover_events(self):
         """Search all dates by ownership metadata, consuming every verified page."""
         found = {}
@@ -672,7 +760,9 @@ class CodexRuntime:
         # fetch's current all-day projection loses dates. read_event preserves
         # them as naive midnight strings; interpret those only with all-day context.
         data = self._tool("read_event", {"calendar_id": self.config.calendar_id, "event_id": event_id})
-        event = self._event_from(data)
+        return self._normalize_read_event(self._event_from(data), event_id, expected_event)
+
+    def _normalize_read_event(self, event, event_id, expected_event=None):
         if not event:
             raise RuntimeFailure("calendar_event_missing")
         if event.get("id") != event_id:

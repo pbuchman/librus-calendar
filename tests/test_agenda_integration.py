@@ -27,6 +27,17 @@ class Calendar:
     def probe(self):
         return {'calendar_id': TEST_CONFIG.calendar_id, 'access_role': 'owner'}
 
+    def read_events(self, expected_events):
+        result = {}
+        for eid, expected in expected_events.items():
+            try:
+                result[eid] = self.read_event(eid, expected)
+            except RuntimeFailure as error:
+                if error.code != 'calendar_event_not_found':
+                    raise
+                result[eid] = None
+        return result
+
     def read_event(self, eid, expected=None):
         if eid not in self.events:
             raise RuntimeFailure('calendar_event_not_found')

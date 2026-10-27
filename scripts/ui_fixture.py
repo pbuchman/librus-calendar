@@ -121,7 +121,7 @@ def _seed_store(path: Path) -> AppStore:
                                'operations': ['created_at', 'updated_at'], 'events': ['updated_at'], 'analysis_audit': ['analyzed_at']}.items():
             for column in columns:
                 store.db.execute(f'UPDATE {table} SET {column}=?', (DEMO_STAMP,))
-        store.db.execute("INSERT INTO sync_runs VALUES ('demo-run',?,?,'complete','ok',NULL,12)", (DEMO_STAMP, DEMO_STAMP))
+        store.db.execute("INSERT INTO sync_runs(id,started_at,finished_at,stage,result,error_code,duration_seconds) VALUES ('demo-run',?,?,'complete','ok',NULL,12)", (DEMO_STAMP, DEMO_STAMP))
     for key, value in {'health_initialized_at': DEMO_STAMP, 'last_sync': DEMO_STAMP,
                        'last_successful_sync': DEMO_STAMP, 'writes_paused': 'false',
                        'writes_paused_since': '', 'consecutive_sync_failures': '0'}.items():

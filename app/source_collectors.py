@@ -35,6 +35,9 @@ class SourceCollectionError(PocError):
         super().__init__(code)
 
 
+from .health_state import SOURCE_ERROR_CODES
+
+
 class Node:
     def __init__(self, tag='', attrs=(), parent=None):
         self.tag, self.attrs, self.parent = tag, dict(attrs), parent
@@ -423,12 +426,29 @@ def _months(start, end):
     return result
 
 
+def _set_holiday_dates(source, dates, detail_text):
+    """Represent only observed dates; gaps are distinct exclusive-end periods."""
+    dates = sorted(set(dates))
+    periods = []
+    for value in dates:
+        day = date.fromisoformat(value)
+        if periods and periods[-1]['end'] == value:
+            periods[-1]['end'] = (day + timedelta(days=1)).isoformat()
+        else:
+            periods.append({'start': value, 'end': (day + timedelta(days=1)).isoformat()})
+    metadata = source['metadata']
+    metadata.update(event_dates=dates, event_periods=periods, event_start=dates[0],
+                    event_end=periods[0]['end'] if len(periods) == 1 else None)
+    source['text'] = detail_text + '\nObserved event dates: ' + ', '.join(dates)
+    metadata['content_hash'] = _digest([source['title'], source['text'], source['published_at'], dates])
+
+
 def collect_calendar(client, *, learner_id, fetched_at, start, end, learner=None):
     html = _read(client, '/terminarz')
     form, unused = parse_calendar_month(html, start=start, end=end)
     original = (form['year'], form['month'])
     moved = False
-    result, seen = [], set()
+    result, seen, holidays = [], set(), {}
     try:
         for year, month in _months(start, end):
             if (form['year'], form['month']) != (year, month):
@@ -441,7 +461,8 @@ def collect_calendar(client, *, learner_id, fetched_at, start, end, learner=None
                 raise SourceCollectionError('learner_context_changed')
             for entry in entries:
                 identity = entry['kind'] + ':' + entry['upstream_id']
-                if identity in seen:
+                holiday = entry['detail_path'] is not None and entry['upstream_id'].startswith('holiday:')
+                if identity in seen and not holiday:
                     raise SourceCollectionError('calendar_identity_ambiguous')
                 seen.add(identity)
                 detail = parse_calendar_detail(_read(client, entry['detail_path']),
@@ -457,10 +478,22 @@ def collect_calendar(client, *, learner_id, fetched_at, start, end, learner=None
                             'window_start': start.isoformat(), 'window_end': end.isoformat(),
                             'scope': 'event_date_window', 'fields': {key: value for key, value in detail.items() if key != 'published_at'},
                             'content_hash': _digest([entry['title'], body, publication])}
-                result.append({'id': identity, 'kind': entry['kind'], 'upstream_id': entry['upstream_id'],
+                source = {'id': identity, 'kind': entry['kind'], 'upstream_id': entry['upstream_id'],
                                'learner_id': learner_id, 'title': entry['title'], 'sender': detail.get('nauczyciel', ''),
                                'published_at': publication, 'updated_at': None, 'fetched_at': fetched_at,
-                               'text': body, 'deleted': False, 'metadata': metadata})
+                               'text': body, 'deleted': False, 'metadata': metadata}
+                if holiday:
+                    signature = _digest([entry['kind'], entry['title'], metadata['fields'], publication])
+                    if identity in holidays:
+                        previous, previous_signature = holidays[identity]
+                        if (previous_signature != signature
+                                or entry['event_start'] in previous['metadata']['event_dates']):
+                            raise SourceCollectionError('calendar_identity_ambiguous')
+                        _set_holiday_dates(previous, previous['metadata']['event_dates'] + [entry['event_start']], body)
+                        continue
+                    _set_holiday_dates(source, [entry['event_start']], body)
+                    holidays[identity] = (source, signature)
+                result.append(source)
                 if len(result) > MAX_CALENDAR_ITEMS:
                     raise SourceCollectionError('calendar_limit')
     finally:
@@ -491,14 +524,16 @@ def collect_sources(client, *, current=None, past_days=30, future_days=60):
     current = current.astimezone(WARSAW)
     fetched_at = datetime.now(timezone.utc).isoformat()
     result = {'sources': [], 'complete_kinds': [], 'learner': None, 'status': 'partial', 'errors': [],
-              'fetched_at': fetched_at, 'window_start': (current.date() - timedelta(days=30)).isoformat(),
+              'kind_errors': {}, 'fetched_at': fetched_at, 'window_start': (current.date() - timedelta(days=30)).isoformat(),
               'window_end': (current.date() + timedelta(days=60)).isoformat()}
     try:
         _read(client, '/rodzic/index')
         learner = parse_learner_context(_read(client, '/informacja'))
         result['learner'] = learner
     except Exception as error:
-        result['errors'].append(error.code if isinstance(error, SourceCollectionError) else 'learner_collection_failed')
+        code = error.code if isinstance(error, SourceCollectionError) else 'learner_collection_failed'
+        result['errors'].append(code)
+        result['kind_errors'].update({kind: code for kind in KINDS})
         return result
     for kinds, collect in (
         (('announcement',), lambda: parse_announcements(_read(client, '/ogloszenia'), learner_id=learner['id'], fetched_at=fetched_at)),
@@ -510,14 +545,18 @@ def collect_sources(client, *, current=None, past_days=30, future_days=60):
             result['sources'].extend(sources)
             result['complete_kinds'].extend(kinds)
         except Exception as error:
-            result['errors'].append(error.code if isinstance(error, SourceCollectionError) else kinds[0] + '_collection_failed')
+            code = error.code if isinstance(error, SourceCollectionError) else kinds[0] + '_collection_failed'
+            result['errors'].append(code)
+            result['kind_errors'].update({kind: code for kind in kinds})
     try:
         _read(client,'/rodzic/index')
         if parse_learner_context(_read(client, '/informacja')) != learner:
             raise SourceCollectionError('learner_context_changed')
     except Exception as error:
         result['sources'], result['complete_kinds'] = [], []
-        result['errors'].append(error.code if isinstance(error, SourceCollectionError) else 'learner_collection_failed')
+        code = error.code if isinstance(error, SourceCollectionError) else 'learner_collection_failed'
+        result['errors'].append(code)
+        result['kind_errors'].update({kind: code for kind in KINDS})
     result['errors']=list(dict.fromkeys(result['errors']))
     if 'learner_context_changed'in result['errors']:
         result['sources'],result['complete_kinds']=[],[]

@@ -499,17 +499,24 @@ class DataAdminTests(unittest.TestCase):
             result = next(responses)
             if isinstance(result, Exception):
                 raise result
-            return result
+            return {'responses':[result['event']]} if name == 'batch_read_event' else result
         runtime._tool = tool
         from app.sync import SyncController
         failed_read = SyncController(self.store, FakeClient(count=0), runtime).run(current=NOW)
         self.assertEqual(failed_read['state']['operations_pending'], 1)
-        self.assertEqual(calls, ['read_event'])
+        self.assertEqual(calls, ['batch_read_event'])
         first = SyncController(self.store, FakeClient(count=0), runtime).run(current=NOW)
         self.assertEqual(first['state']['operations_unknown'], 1)
         operation = self.store.reconcile_operations()[0]
         self.assertEqual(operation['prior_snapshot'], original)
-        runtime._tool = lambda name, args: (_ for _ in ()).throw(RuntimeFailure('calendar_event_not_found'))
+        missing = {'error':'Failed to read event','detail':'404: HTTP request failed (Response: '+json.dumps({
+            'error':{'errors':[{'domain':'global','reason':'notFound','message':'Not Found'}],
+                     'code':404,'message':'Not Found'}})+'\n)'}
+        def missing_tool(name, args):
+            if name == 'batch_read_event':
+                return {'responses':[missing for _ in args['event_ids']]}
+            raise RuntimeFailure('calendar_event_not_found')
+        runtime._tool = missing_tool
         second = SyncController(self.store, FakeClient(count=0), runtime).run(current=NOW)
         self.assertEqual(second['state']['events_cancelled'], 1)
         self.assertEqual(second['state']['operations_unknown'], 0)

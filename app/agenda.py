@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import copy
-from datetime import datetime
+from datetime import date, datetime, timedelta
 import json
 
 import jsonschema
@@ -16,7 +16,7 @@ import jsonschema
 from .codex_runtime import SCHEMAS, CodexRuntime, RuntimeFailure, normalize_event, event_fingerprint
 from .core import WARSAW, digest, normalize_proposal, utcnow
 
-AGENDA_VERSION = 'simple-agenda-v6-activity-eligibility'
+AGENDA_VERSION = 'simple-agenda-v7-observed-holiday-dates'
 AGENDA_MODEL = 'gpt-6.1-sol'
 AGENDA_EFFORT = 'high'
 # UTF-8 bytes are a conservative upper bound on text tokens. Reserve space for
@@ -32,7 +32,7 @@ ACTION_FIELDS = ('kind', 'title', 'description', 'start', 'end', 'all_day', 'tem
                  'user_approved', 'user_edited', 'user_rejected', 'deletion_approved', 'default_duration',
                  'inventory_only', 'expired_without_authority', 'deferred_unknown_operation',
                  'blocked_by_group_decision', 'blocked_by_offer_group', 'alternative_group_id')
-SOURCE_METADATA = ('identity_basis', 'identity_ambiguous', 'event_start', 'event_end', 'event_precision',
+SOURCE_METADATA = ('identity_basis', 'identity_ambiguous', 'event_start', 'event_end', 'event_precision', 'event_dates', 'event_periods', 'window_start', 'window_end',
                    'publication_precision', 'scope', 'served_class_calendar', 'retained',
                    'image_count', 'document_link_count', 'link_count', 'attachment_count')
 
@@ -301,15 +301,9 @@ def validate_agenda_plan(plan, snapshot):
 
 def read_calendar(store, runtime):
     """Current managed state only. Failed reads never masquerade as not-found."""
-    events = {}
-    for row in store.db.execute("SELECT id,snapshot FROM events WHERE state='active' ORDER BY id").fetchall():
-        try:
-            events[row['id']] = runtime.read_event(row['id'], json.loads(row['snapshot']))
-        except RuntimeFailure as error:
-            if error.code != 'calendar_event_not_found':
-                raise
-            events[row['id']] = None
-    return events
+    expected = {row['id']: json.loads(row['snapshot']) for row in
+                store.db.execute("SELECT id,snapshot FROM events WHERE state='active' ORDER BY id").fetchall()}
+    return runtime.read_events(expected)
 
 
 def _message(store, source):
@@ -321,6 +315,42 @@ def _message(store, source):
     store.db.execute("INSERT INTO messages(id,payload,payload_hash,status,sent_at,fetched_at) VALUES (?,?,?,'analyzed',?,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,payload_hash=excluded.payload_hash,status='analyzed',sent_at=excluded.sent_at,fetched_at=excluded.fetched_at",
                      (message['id'], json.dumps(message, ensure_ascii=False), hashed, message.get('sent_at'), utcnow()))
     return store.get_message(message['id'])
+
+
+def _holiday_window_shortening(entry, proposed, sources):
+    """A bounded observation cannot automatically shorten an owned interval."""
+    if not proposed:
+        return False
+    for source in sources:
+        meta = source.get('metadata') or {}
+        if not source.get('upstream_id', '').startswith('holiday:') or not meta.get('event_dates'):
+            continue
+        try:
+            first = date.fromisoformat(meta['window_start'])
+            last = date.fromisoformat(meta['window_end']) + timedelta(days=1)
+            if proposed.get('all_day'):
+                new_start = datetime.combine(date.fromisoformat(proposed['start']), datetime.min.time(), tzinfo=WARSAW)
+                new_end = (datetime.combine(date.fromisoformat(proposed['end']), datetime.min.time(), tzinfo=WARSAW)
+                           if proposed.get('end') else new_start + timedelta(days=1))
+            else:
+                new_start = datetime.fromisoformat(proposed['start'].replace('Z', '+00:00'))
+                new_end = datetime.fromisoformat(proposed['end'].replace('Z', '+00:00')) if proposed.get('end') else new_start
+                if new_start.tzinfo is None or new_end.tzinfo is None:
+                    raise ValueError('Timed holiday boundaries require a timezone.')
+            for event in entry['calendar']:
+                current = event.get('current') or {}
+                if event['state'] != 'active' or not current.get('start', {}).get('date') or not current.get('end', {}).get('date'):
+                    continue
+                old_start = date.fromisoformat(current['start']['date'])
+                old_end = date.fromisoformat(current['end']['date'])
+                old_first = datetime.combine(old_start, datetime.min.time(), tzinfo=WARSAW)
+                old_last = datetime.combine(old_end, datetime.min.time(), tzinfo=WARSAW)
+                if old_start < first and new_start > old_first or old_end > last and new_end < old_last:
+                    return True
+        except (KeyError, TypeError, ValueError):
+            # Malformed holiday/window authority cannot admit an automatic change.
+            return True
+    return False
 
 
 def _protected(entry):
@@ -398,6 +428,9 @@ def _prepare_item(store, snapshot, item, plan_id, index, current):
         reason = 'Potential existing duplicate requires review. ' + reason
     refs = item['sources']
     sources = [store.get_source(ref['source_id']) for ref in refs]
+    if item['operation'] == 'update' and entry and _holiday_window_shortening(entry, item['action'], sources):
+        item.update(operation='review', review_change='update')
+        reason = 'Observed holiday window cannot shorten the existing Calendar interval automatically. ' + reason
     if any(source['deleted'] or source['status'] == 'retained' for source in sources):
         item.update(operation='review', review_change=item['review_change'] or ('update' if entry else 'create'))
         reason = 'Supporting current source text is unavailable. ' + reason

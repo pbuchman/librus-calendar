@@ -12,7 +12,7 @@ from app.core import AppStore, WARSAW
 from app.sync import SyncController, SyncInterrupted
 from test_core import NOW, QUOTE, proposal
 import test_runtime as runtime_fixtures
-from app.codex_runtime import CodexRuntime
+from app.codex_runtime import CodexRuntime, RuntimeFailure
 import json
 
 
@@ -75,6 +75,17 @@ class FakeRuntime:
             result.append(item(snapshot, 'ignore', action=None, sources=ignored))
         self.last_agenda_metadata = {key: value for key, value in getattr(self, 'last_analysis_metadata', {}).items() if key in ('model','effort','prompt_version')}
         return plan(snapshot, result)
+
+    def read_events(self, expected_events):
+        result = {}
+        for eid, expected in expected_events.items():
+            try:
+                result[eid] = self.read_event(eid, expected)
+            except RuntimeFailure as error:
+                if error.code != 'calendar_event_not_found':
+                    raise
+                result[eid] = None
+        return result
 
     def read_event(self, eid, expected=None):
         found = next((operation for operation in reversed(self.executed)

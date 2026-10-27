@@ -52,6 +52,18 @@ class WebTests(unittest.TestCase):
         self.client.get('/')
         return self.client.post(path,data={'csrf':self.client.cookies['__Host-librus_csrf'],**data},
                                 headers={'origin':origin},follow_redirects=False)
+    def test_additive_technical_diagnostics_are_readable_in_panel_and_status(self):
+        original=self.store.status
+        diagnostics={'invocations':[dict(phase='reconcile',state='failed',requested_count=10,
+            received_count=7,duration_seconds=3.25,process_code=-9,started_count=1,completed_count=0)],'omitted_count':0}
+        self.store.status=lambda:dict(original(),sync_diagnostics=diagnostics)
+        self.assertEqual(self.client.get('/api/status').json()['sync_diagnostics'],diagnostics)
+        response=self.client.get('/')
+        self.assertEqual(response.status_code,200)
+        self.assertIn('Diagnostyka ostatniej synchronizacji',response.text)
+        self.assertIn('10 / 7',response.text)
+        self.assertIn('reconcile',response.text)
+
     def test_identity_and_socket_are_required(self):
         self.client.headers.pop('Tailscale-User-Login')
         self.assertEqual(self.client.get('/').status_code,403)
