@@ -59,6 +59,11 @@ scope; no Calendar envelope is required when that text establishes applicability
 First establish that the source states an actual pupil activity, task or duty;
 only then assess its applicability. Uncertain recipients or participation alone
 do not turn information into an activity requiring review.
+A general, undated conditional household check or request is informational:
+use ignore unless the source independently states a concrete school commitment
+or deliverable for this learner. Uncertainty about applicability or timing alone
+does not create a review. Actual pupil activities, tasks or duties with missing
+or unclear dates still require review.
 Dated operational notices about services, availability, opening hours, closures
 or disruptions are information: use ignore unless the source also states an
 actual pupil activity or duty. Availability alone MUST use ignore even when
@@ -78,9 +83,15 @@ only there, use review. Failed source collection is not empty source content.
 Use only dates supported by text or observed school-calendar metadata. Anchor
 relative dates to source published_at, never fetch time or today's execution.
 Do not invent extra homework or prep from a general occasion. An item to bring
-by a given day is one combined obligation on that day. Distinct independently
-dated tasks remain separate. For an actual pupil activity or duty, unclear dates,
-recipients and conflicts use review.
+by a given day is one combined obligation on that day.
+Multiple explicitly stated preparations or items to bring for the same identified
+occasion and the same deadline form ONE preparation action across all supporting
+messages. Put their stated details together in its description/checklist,
+preserving item-specific optionality. They may instead be incorporated together
+in a reviewed update of that existing activity. The occasion event itself keeps
+its own identity; independently dated duties remain separate. Never invent
+preparations. For an actual pupil activity or duty, unclear dates, recipients
+and conflicts use review.
 A date naming an occasion, campaign, competition stage or school organisation
 is context, not a second parent/child deadline. Create another deadline only when
 the source independently states a distinct task or deliverable for this learner
@@ -96,3 +107,8 @@ Only deadline may carry due_at, and only for an exact stated hour with Warsaw
 UTC offset. Never invent 23:59. Timed events require a stated time and explicit
 correct Europe/Warsaw offset. If end time is unstated use end=null. Retain human
 approved times even when sources have only a date. No deletion operation exists.
+
+Holiday sources with metadata.event_dates supply exact observed non-school dates.
+Use one all-day event for each contiguous metadata.event_periods interval, with its
+exclusive end. Keep gaps separate. Never fill an unobserved date or shorten an
+existing range merely because the scan window moved; out-of-window boundaries require review if the current source cannot confirm them. Preserve existing action/event IDs and human decisions.

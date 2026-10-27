@@ -216,3 +216,52 @@ transaction. Preview, failure, stale input and omitted selected sources never
 advance any active checkpoint. Source content_hash is the collector's semantic
 content-version invariant; complete stored payloads still participate in CAS.
 See [incremental contract](../docs/incremental-agenda-contract.md).
+
+## Holiday observations and managed Calendar reads
+
+Only `/terminarz/szczegoly_wolne` rows may share a provider identity across dates.
+Their kind, title, detail fields (including scope) and publication must agree;
+a repeated date or incompatible row still fails collection. The existing learner
+scoped source ID remains unchanged. Sorted `metadata.event_dates` and the same
+literal date list in source text participate in the content hash.
+`metadata.event_periods` contains separate contiguous intervals with exclusive
+ends. No unobserved date fills a gap. Dates describe the current observed window;
+historical dates are not merged into fresh audience evidence. An automatic
+holiday update that would shorten an owned all-day boundary outside that window
+becomes review for that action, preserving its existing action and event IDs.
+Other independent valid plan items continue normally. Existing human decisions,
+rejections and offer guards still apply.
+
+`CodexRuntime.read_events({event_id: saved_snapshot})` reads the complete active
+managed inventory in batches of at most ten exact IDs using `batch_read_event`.
+The observed success contract is `{responses:[event DTO, ...]}`. Full success
+batches may reorder and are matched by exact ID. Foreign, duplicate, missing or
+unreadable responses fail the whole fresh read. A missing response is never a
+not-found result. The observed anonymous not-found envelope is accepted only with
+an exact response count, the fixed `Failed to read event` wrapper, a parsed
+embedded provider error with matching numeric 404/410 code, and every successful
+sibling in its requested position. Mixed reordered/error batches and authentication
+errors fail closed. Both batch and individual reads use the same existing
+all-day midnight normalization, including DST boundaries. Individual `read_event`
+remains the prewrite/write-verification mechanism. Full fresh planning and
+pre/post-application state reads remain in place; batch reads introduce no retry.
+
+`sync_runs.diagnostics` is an additive nullable JSON column. Legacy rows remain
+null. The local authenticated `/api/status` and synchronization panel expose
+only bounded technical invocation records: phase, lifecycle state, requested and
+received counts, duration, process exit code, tool started/completed counts.
+Each start is saved before launching the process and its end is saved on success,
+failure or interruption. Abandoned running records close as interrupted on the
+next locked run. The latest 512 records fit within 128 KiB; an omission counter
+reports older technical records removed from an unusually large run. Run history
+keeps the existing 90-day retention. No event IDs, arguments, prompts, tool output
+or provider error strings enter diagnostics. Netdata files, thresholds, labels
+and descriptions are unchanged. The process timeout remains 300 seconds and the
+whole-sync deadline remains 45 minutes.
+
+All public regression fixtures are fictional and offline, including inert HTML
+and injected CLI process outputs. Passing them is not live provider acceptance.
+A private read-only POC against the actual connector and current school snapshot
+must establish collection completeness, batch coverage, identity/decision
+preservation, observed-date planning, unchanged replay and uncertain-write
+reconciliation before deployment. Live writes are not part of that read-only POC.

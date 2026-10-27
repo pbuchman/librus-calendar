@@ -100,16 +100,24 @@ class SyncController:
 
     def _source_collection(self, current):
         """Collect only; all three channels feed the one agenda task."""
+        batch = None
         try:
-            return self.store.ingest_sources(self.client.collect_sources(current=current, past_days=30, future_days=60), current)
-        except Exception:
+            batch = self.client.collect_sources(current=current, past_days=30, future_days=60)
+            return self.store.ingest_sources(batch, current)
+        except Exception as error:
             stamp = utcnow()
             from .source_store import KINDS
+            from .health_state import SOURCE_ERROR_CODES
+            failures = batch.get('kind_errors', {}) if isinstance(batch, dict) else {}
+            code = getattr(error, 'code', None)
+            fallback = code if isinstance(code, str) and code in SOURCE_ERROR_CODES else 'source_collection_failed'
+            safe = {kind: value for kind, value in failures.items()
+                    if kind in KINDS and isinstance(value, str) and value in SOURCE_ERROR_CODES} if isinstance(failures, dict) else {}
             with self.store.lock, self.store.db:
                 for kind in KINDS - {'message'}:
                     self.store.db.execute('INSERT INTO source_health VALUES (?,?,NULL,?,?,0) ON CONFLICT(kind) DO UPDATE SET last_attempt_at=excluded.last_attempt_at,last_result=excluded.last_result,last_error=excluded.last_error,learner_verified=0',
-                        (kind, stamp, 'failed', 'source_collection_failed'))
-                for key, value in (('source_last_collection_at', stamp), ('source_last_collection_result', 'failed'), ('source_last_error', 'source_collection_failed')):
+                        (kind, stamp, 'failed', safe.get(kind, fallback)))
+                for key, value in (('source_last_collection_at', stamp), ('source_last_collection_result', 'failed'), ('source_last_error', next(iter(safe.values()), fallback))):
                     self.store.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (key, value))
             return {'status': 'partial', 'failures': 1}
 
@@ -147,6 +155,7 @@ class SyncController:
                     if self.runtime_factory is not None:
                         self._stage('runtime')
                         self.runtime = self.runtime_factory()
+                    self.runtime.invocation_sink = lambda item: self.store.record_sync_diagnostic(self.run_id, dict(item, phase=self.stage))
                     self._stage('calendar_probe')
                     self.runtime.probe_attempt_sink = lambda attempt: self.store.record_probe_attempt(self.run_id, attempt)
                     probe = self.runtime.probe()

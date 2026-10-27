@@ -1,6 +1,7 @@
 """Technical health metadata; the public reader never initializes or changes a DB."""
 from datetime import datetime, timedelta, timezone
 import math
+import json
 from pathlib import Path
 from .source_preview import PREVIEW_RETRY_SETTINGS, current_preview_sql, preview_queue_sql
 import sqlite3
@@ -32,6 +33,35 @@ PROBE_RESULTS = frozenset(('running', 'ok', 'failed', 'interrupted'))
 PROBE_FIELDS = ('attempt_number', 'model', 'effort', 'cli_version', 'started_at', 'completed_at', 'result',
     'safe_code', 'process_code', 'started_count', 'completed_count', 'parse_error_count', 'unknown_event_count',
     'incomplete_count', 'expected_tool_name', 'expected_tool_arguments')
+
+
+DIAGNOSTIC_FIELDS = frozenset({'phase', 'state', 'requested_count', 'received_count',
+    'duration_seconds', 'process_code', 'started_count', 'completed_count'})
+
+
+def sync_diagnostics(value):
+    """Bounded technical fields only; never tool names, IDs, arguments or text."""
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or set(value) != {'invocations', 'omitted_count'}
+            or not isinstance(value['invocations'], list) or len(value['invocations']) > 512
+            or type(value['omitted_count']) is not int or value['omitted_count'] < 0):
+        raise ValueError('Invalid sync diagnostics.')
+    for item in value['invocations']:
+        if (not isinstance(item, dict) or set(item) != DIAGNOSTIC_FIELDS
+                or item['phase'] not in STAGES or item['state'] not in {'running','completed','failed','interrupted'}):
+            raise ValueError('Invalid sync diagnostic fields.')
+        for key in ('requested_count','received_count','started_count','completed_count'):
+            if type(item[key]) is not int or not 0 <= item[key] <= 1000000:
+                raise ValueError('Invalid sync diagnostic count.')
+        duration = item['duration_seconds']
+        code = item['process_code']
+        if (type(duration) not in (int,float) or not math.isfinite(duration) or not 0 <= duration <= 7*86400
+                or code is not None and (type(code) is not int or not -255 <= code <= 255)):
+            raise ValueError('Invalid sync diagnostic process metadata.')
+    if len(json.dumps(value)) > 131072:
+        raise ValueError('Sync diagnostics exceed limit.')
+    return value
 
 
 def probe_metadata(value):
@@ -202,6 +232,9 @@ def read_connection_state(db, now=None):
         cursor = db.execute('SELECT id,started_at,finished_at,stage,result,error_code,duration_seconds FROM sync_runs ORDER BY started_at DESC,rowid DESC LIMIT 1')
         row = cursor.fetchone()
         last = dict(zip((col[0] for col in cursor.description), row)) if row else None
+        if last and 'diagnostics' in {row[1] for row in db.execute('PRAGMA table_info(sync_runs)')}:
+            raw = db.execute('SELECT diagnostics FROM sync_runs WHERE id=?', (last['id'],)).fetchone()[0]
+            last['diagnostics'] = sync_diagnostics(json.loads(raw)) if raw else None
         # A running attempt, preview or pause does not resolve an earlier sync
         # failure. Keep the latest finished actual sync, ordered by UTC instant.
         row = db.execute("SELECT result,stage,error_code,finished_at FROM sync_runs "
@@ -255,6 +288,7 @@ def read_connection_state(db, now=None):
     return dict(schema_version=1, sources=read_source_health(db, tables), agenda=read_agenda_health(db, tables), **probe, **completed, initialized_at=timestamp(settings.get('health_initialized_at')),
         last_attempt_at=timestamp(last['started_at'] if last else settings.get('last_sync')),
         last_successful_sync=timestamp(settings.get('last_successful_sync')),
+        sync_diagnostics=last.get('diagnostics') if last else None,
         last_result=result, last_stage=stage, last_error_code=code, last_duration_seconds=duration,
         running_since=timestamp(last['started_at']) if last and result == 'running' else None,
         consecutive_failures=failures, writes_paused=settings.get('writes_paused', 'true') == 'true',

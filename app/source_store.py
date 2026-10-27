@@ -279,11 +279,15 @@ class SourceStoreMixin:
                         self.db.execute('UPDATE proposals SET payload=? WHERE id=?',(json.dumps(item,ensure_ascii=False),proposal['id']))
                         self.db.execute('UPDATE canonical_actions SET payload=? WHERE id=?',(json.dumps(item,ensure_ascii=False),action['id']))
                     else:self._review_unwritten_locked(item,'Supporting source unavailable in a complete snapshot; explicit review required.')
+            from .source_collectors import SOURCE_ERROR_CODES
+            kind_errors = batch.get('kind_errors') or {}
+            safe_errors = {kind: value for kind, value in kind_errors.items()
+                           if kind in KINDS and isinstance(value, str) and value in SOURCE_ERROR_CODES}
             for kind in KINDS-{'message'}:
                 success=kind in complete
                 self.db.execute('INSERT INTO source_health VALUES (?,?,?,?,?,?) ON CONFLICT(kind) DO UPDATE SET last_attempt_at=excluded.last_attempt_at,last_successful_fetch=COALESCE(excluded.last_successful_fetch,source_health.last_successful_fetch),last_result=excluded.last_result,last_error=excluded.last_error,learner_verified=excluded.learner_verified',
-                    (kind,stamp,stamp if success else None,'ok' if success else 'partial',None if success else 'source_collection_incomplete',1))
-            for key,value in (('source_last_collection_at',stamp),('source_last_collection_result','ok' if batch.get('status')=='ok' and complete==KINDS-{'message'} else 'partial'),('source_last_error','' if batch.get('status')=='ok' else 'source_collection_incomplete')):
+                    (kind,stamp,stamp if success else None,'ok' if success else 'partial',None if success else safe_errors.get(kind, 'source_collection_incomplete'),1))
+            for key,value in (('source_last_collection_at',stamp),('source_last_collection_result','ok' if batch.get('status')=='ok' and complete==KINDS-{'message'} else 'partial'),('source_last_error','' if batch.get('status')=='ok' else next(iter(safe_errors.values()), 'source_collection_incomplete'))):
                 self.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)',(key,value))
         return {'changed':changed,'collected':len(clean),'status':self._setting('source_last_collection_result')}
 

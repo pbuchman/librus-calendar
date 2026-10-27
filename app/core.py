@@ -288,6 +288,8 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             CREATE TABLE IF NOT EXISTS metadata_refresh(id TEXT PRIMARY KEY,event_id TEXT NOT NULL,version TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,result TEXT,last_error TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(event_id,version));
             ''')
             self.db.executescript(GROUP_SCHEMA)
+            if 'diagnostics' not in {row[1] for row in self.db.execute('PRAGMA table_info(sync_runs)')}:
+                self.db.execute('ALTER TABLE sync_runs ADD COLUMN diagnostics TEXT')
             if 'state' not in {row[1] for row in self.db.execute('PRAGMA table_info(events)')}:
                 self.db.execute("ALTER TABLE events ADD COLUMN state TEXT NOT NULL DEFAULT 'active'")
             if 'blocking' not in {row[1] for row in self.db.execute('PRAGMA table_info(calendar_discovery_review)')}:
@@ -360,6 +362,7 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
         with self.lock, self.db:
             abandoned = self.db.execute("SELECT id,started_at FROM sync_runs WHERE result='running'").fetchall()
             for row in abandoned:
+                self._close_sync_diagnostic(row['id'], 'interrupted')
                 duration = max(0, (datetime.fromisoformat(stamp) - datetime.fromisoformat(row['started_at'])).total_seconds())
                 self.db.execute("UPDATE sync_runs SET result='interrupted',error_code='worker_interrupted',finished_at=?,duration_seconds=? WHERE id=?", (stamp, duration, row['id']))
                 self.db.execute("UPDATE calendar_probe_attempts SET result='interrupted',safe_code='worker_interrupted',completed_at=? WHERE sync_run_id=? AND result='running'", (stamp, row['id']))
@@ -399,11 +402,41 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                 self.db.execute('INSERT INTO calendar_probe_attempts(sync_run_id,' + ','.join(PROBE_FIELDS) + ') VALUES (' + ','.join('?' for _ in range(len(PROBE_FIELDS) + 1)) + ')',
                     (run_id,) + tuple(metadata[key] for key in PROBE_FIELDS))
 
+    def record_sync_diagnostic(self, run_id, metadata):
+        from .health_state import sync_diagnostics
+        # Replace the current invocation on completion, retaining its durable start.
+        with self.lock, self.db:
+            row = self.db.execute("SELECT diagnostics FROM sync_runs WHERE id=? AND result='running'", (run_id,)).fetchone()
+            if row is None:
+                raise ValueError('Sync run is not active.')
+            value = json.loads(row[0]) if row[0] else {'invocations': [], 'omitted_count': 0}
+            sync_diagnostics({'invocations': [metadata], 'omitted_count': 0})
+            entries = value['invocations']
+            if entries and entries[-1]['state'] == 'running':
+                entries[-1] = metadata
+            elif metadata['state'] == 'running':
+                if len(entries) == 512:
+                    entries.pop(0)
+                    value['omitted_count'] += 1
+                entries.append(metadata)
+            else:
+                raise ValueError('Invocation must start durably.')
+            sync_diagnostics(value)
+            self.db.execute('UPDATE sync_runs SET diagnostics=? WHERE id=?', (json.dumps(value), run_id))
+
     def sync_stage(self, run_id, stage):
         if stage not in STAGES:
             raise ValueError('Invalid technical sync stage.')
         with self.lock, self.db:
             self.db.execute("UPDATE sync_runs SET stage=? WHERE id=? AND result='running'", (stage, run_id))
+
+    def _close_sync_diagnostic(self, run_id, state):
+        row = self.db.execute('SELECT diagnostics FROM sync_runs WHERE id=?', (run_id,)).fetchone()
+        if row and row[0]:
+            value = json.loads(row[0])
+            if value['invocations'] and value['invocations'][-1]['state'] == 'running':
+                value['invocations'][-1]['state'] = state
+                self.db.execute('UPDATE sync_runs SET diagnostics=? WHERE id=?', (json.dumps(value), run_id))
 
     def finish_sync_run(self, run_id, result, error_code=None, duration_seconds=None):
         if result not in RESULTS - {'idle', 'running'} or (error_code is not None and error_code not in ERROR_CODES):
@@ -415,6 +448,7 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                 raise ValueError('Sync run is not active.')
             if duration_seconds is None:
                 duration_seconds = max(0, (datetime.fromisoformat(stamp) - datetime.fromisoformat(row['started_at'])).total_seconds())
+            self._close_sync_diagnostic(run_id, 'interrupted' if result == 'interrupted' else 'failed')
             self.db.execute('UPDATE sync_runs SET finished_at=?,result=?,error_code=?,duration_seconds=? WHERE id=?', (stamp, result, error_code, duration_seconds, run_id))
             if result in ('failed', 'interrupted'):
                 self.db.execute('UPDATE calendar_probe_attempts SET completed_at=?,result=?,safe_code=? WHERE sync_run_id=? AND result=\'running\'',

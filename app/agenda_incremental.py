@@ -16,7 +16,7 @@ from contextlib import nullcontext
 from .agenda import assemble_agenda_snapshot, agenda_prompt
 from .core import digest
 
-INCREMENTAL_VERSION = 'simple-agenda-v6-activity-eligibility'
+INCREMENTAL_VERSION = 'simple-agenda-v7-observed-holiday-dates'
 COMPATIBLE_FULL_VERSIONS = frozenset({'simple-agenda-v4-shared-learner'})
 LEDGER_TABLE = 'agenda_processed_sources'
 LEDGER_SCHEMA = '''CREATE TABLE IF NOT EXISTS agenda_processed_sources(
@@ -164,8 +164,12 @@ def assemble_incremental_snapshot(database, calendar_events, *, current=None, ow
 
 def content_baseline_hash(snapshot):
     """Reuse excludes observation/day clocks; CAS and requests retain the day."""
-    return digest({key: value for key, value in snapshot.items()
-                   if key not in ('observation', 'snapshot_hash', 'as_of_date')})
+    content = {key: value for key, value in snapshot.items()
+               if key not in ('observation', 'snapshot_hash', 'as_of_date')}
+    content['sources'] = [{**source, 'metadata': {
+        key: value for key, value in source.get('metadata', {}).items()
+        if key not in ('window_start', 'window_end')}} for source in snapshot['sources']]
+    return digest(content)
 
 
 def commit_processed_sources(store, snapshot, contract, plan_id, stamp):
