@@ -399,6 +399,10 @@ class SourceStoreMixin:
         action = self.db.execute('SELECT proposal_id FROM canonical_actions WHERE id=?', (item['canonical_action_id'],)).fetchone()
         if not action or action[0] != item['id']:
             return 'A newer agenda revision supersedes this proposal.'
+        if item.get('preference_decision') and not item.get('user_approved'):
+            from .preferences import authorizes_participation
+            if not authorizes_participation(self, item):
+                return 'Learned participation evidence changed; fresh review is required.'
         group_id = item.get('alternative_group_id')
         if group_id and not self.db.execute('SELECT 1 FROM proposal_group_members WHERE group_id=? AND proposal_id=?', (group_id, item['id'])).fetchone():
             selected = self.db.execute("SELECT p.id,p.payload FROM proposal_groups g JOIN proposal_group_members m ON m.group_id=g.id AND m.proposal_id=g.selected_proposal_id JOIN proposals p ON p.id=m.proposal_id WHERE g.id=? AND g.status='selected'", (group_id,)).fetchone()

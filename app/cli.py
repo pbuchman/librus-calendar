@@ -15,6 +15,9 @@ def main(argv=None, *, config=None):
     parser.add_argument('--state', type=Path)
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('status')
+    sub.add_parser('preferences-status', help='Report opt-in learning status and example counts only.')
+    preference = sub.add_parser('preferences-enable', help='Enable future human-choice examples using an explicit protected administrative boundary receipt; no Calendar access.')
+    preference.add_argument('--receipt-file', type=Path, required=True)
     sub.add_parser('agenda-preview', help='Plan the complete stored successful collection with fresh read-only Calendar state; does not refresh Librus sources or apply decisions.')
     backup = sub.add_parser('backup')
     backup.add_argument('--destination', type=Path)
@@ -71,6 +74,14 @@ def main(argv=None, *, config=None):
         store = AppStore(args.state, config=config)
         if args.command == 'status':
             result = store.status()
+        elif args.command in ('preferences-enable', 'preferences-status'):
+            from .preferences import enable_preferences, preference_status
+            from .sync import sync_lock
+            with sync_lock(store.path) as acquired:
+                if not acquired:
+                    result = {'status': 'already_running', 'calendar_writes': 0}
+                else:
+                    result = enable_preferences(store, args.receipt_file) if args.command == 'preferences-enable' else preference_status(store.db)
         elif args.command == 'backup':
             result = {'status': 'backed_up', 'path': store.backup(args.destination)}
         elif args.command == 'pause-writes':

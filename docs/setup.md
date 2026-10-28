@@ -147,3 +147,24 @@ The ordinary sync and `prune --days 30` retain minimal IDs, hashes, human decisi
 Prefer a reviewed forward fix after failure; keep the current database and operation journal. A prior code package is usable only after explicit schema/journal compatibility checks. Never restore an older SQLite database: it can lose proof of external writes and cause duplicates. Review visible `agenda_*` failure codes and pending/failed sources; context overflow and malformed/stale plans refuse writes rather than silently dropping input. The read-only monitor exports fixed technical plan outcomes and source counts only; existing charts and alarm thresholds remain.
 
 For local development use `scripts/ui_fixture.py --port 8796` with temporary fictional data. Real school data, configuration, snapshots and plan output stay outside Git and public screenshots.
+
+## Future human-choice examples
+
+This optional feature is disabled on existing installations. It adds one table to the same SQLite database and does not create another model, service, scheduler or training job. Existing decisions remain exact-action constraints. They are never imported as participation preferences.
+
+After the owner authorizes automatic future choices, use a protected administrative boundary receipt. It must contain `kind=administrative_bulk_cleanup`, `created_at` with an explicit timezone, `excluded_from_preference_learning=true`, and complete `preexisting_proposal_ids_excluded_from_future_examples` / `preexisting_group_ids_excluded_from_future_examples` arrays. The receipt contains private IDs and must be an owned regular file with mode 0600. It is boundary metadata, not a database backup. Complete ordinary upgrade verification and a read-only agenda preview before enabling:
+
+```sh
+python -m app.cli preferences-enable --receipt-file /private/path/boundary.json
+python -m app.cli preferences-status
+```
+
+The CLI acquires the application sync lock, validates receipt coverage and persists the boundary through the application API. It never contacts Calendar. Repeating the same boundary is safe; another boundary is refused. No existing decisions, queue records or Calendar entries are rewritten. Do not insert synthetic examples into a real installation. A zero-example live preview proves only compatibility with that state, not successful learned choices.
+
+Only explicit `approve` / `ignore` calls for create proposals created after the cutoff and outside the excluded IDs become examples after enablement. A supported group select/reject records one participation choice; unselected date options are never separate negative preferences. Identical resubmissions are deduplicated. A later different choice remains visible as opposing evidence. Automatic Calendar results, ordinary sync bookkeeping and the historical administrative cleanup are not examples.
+
+The planner sees the latest50 human examples, with total/used/omitted counts; all rows remain in the private ledger. Example descriptions have a 400-character excerpt and an explicit truncation flag. Omitted details must not justify confident similarity. The complete source/agenda safety context is still measured without truncation and fails visibly if it exceeds the existing input budget. This documented preference window prevents a growing learning history from blocking ordinary synchronization.
+
+At least two independent, consistent examples from different sources are required for learned standalone acceptance or decline. The same SOL/high task judges similarity and must consider every relevant opposing example in the supplied window. The application validates cited IDs, outcomes and source independence; these structural checks cannot prove semantic similarity or detect a contradiction the model fails to identify. A similar title alone does not authorize participation. Uncertain applicability/dates, material human edits, cancellations, duplicate/unknown-write conflicts and one-of-many offer selection still require review. Clear ordinary school duties retain their existing automatic behavior.
+
+Learned creates carry the cited IDs, action/context hashes and applied-plan binding, without `user_approved`. Queueing and claiming recheck that proof; changed example context or action content refuses execution and requires review. An applied plan stores the reason for acceptance/decline, and Calendar descriptions identify learned acceptance. No automatically applied action creates another learning example. Compact human-choice ledger content is retained independently of the ordinary 30-day source-text pruning window.

@@ -21,6 +21,8 @@ first run the read-only planning POC, then replace the old engine after its acce
 - Review blocks affected actions only; keep dependent offer choices atomic. Missing sources or plan items never authorize deletion.
 - Reconcile uncertain writes read-only before retrying; preview cannot mutate active decisions, queue or Calendar.
 - External edits, decisions and policy/planner changes invalidate reuse; own successful writes advance content and authority baselines. Day/fetch clocks alone do not cause inference. Unchanged runs still reconcile and check health.
+- Preference learning is explicit opt-in and future-only. Import only the protected administrative cutoff/excluded IDs, never old decisions as examples. Record examples only at supported human decision APIs; automatic bookkeeping and administrative cleanup are excluded.
+- Use the same SOL/high task with an explicit latest50 compact example window. Require two independent consistent choices before automatic standalone participation/decline; model judges similarity. Preserve manual changes, cancellations, audience/date checks, unknown-write reconciliation and human one-choice offers. Never invent a human approval flag; bind learned creates to the applied plan, example context and action content at queue/claim time.
 
 ## Complexity, models and privacy
 

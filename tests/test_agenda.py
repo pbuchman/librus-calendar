@@ -29,7 +29,7 @@ def item(snapshot, operation='create', **changes):
               'sources': [{'source_id': source['id'], 'source_hash': source['content_hash']}
                           for source in snapshot['sources']],
               'reason': 'Jedno zadanie potwierdzone przez źródła.', 'action': action(),
-              'review_change': None, 'offer_group_id': None, 'new_offer_key': None}
+              'review_change': None, 'offer_group_id': None, 'new_offer_key': None, 'preference_basis': None}
     result.update(changes)
     return result
 

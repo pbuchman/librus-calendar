@@ -16,7 +16,7 @@ import jsonschema
 from .codex_runtime import SCHEMAS, CodexRuntime, RuntimeFailure, normalize_event, event_fingerprint
 from .core import WARSAW, digest, normalize_proposal, utcnow
 
-AGENDA_VERSION = 'simple-agenda-v7-observed-holiday-dates'
+AGENDA_VERSION = 'simple-agenda-v8-future-preferences'
 AGENDA_MODEL = 'gpt-6.1-sol'
 AGENDA_EFFORT = 'high'
 # UTF-8 bytes are a conservative upper bound on text tokens. Reserve space for
@@ -31,7 +31,7 @@ ACTION_FIELDS = ('kind', 'title', 'description', 'start', 'end', 'all_day', 'tem
                  'needs_review', 'review_reason',
                  'user_approved', 'user_edited', 'user_rejected', 'deletion_approved', 'default_duration',
                  'inventory_only', 'expired_without_authority', 'deferred_unknown_operation',
-                 'blocked_by_group_decision', 'blocked_by_offer_group', 'alternative_group_id')
+                 'blocked_by_group_decision', 'blocked_by_offer_group', 'alternative_group_id', 'preference_decision')
 SOURCE_METADATA = ('identity_basis', 'identity_ambiguous', 'event_start', 'event_end', 'event_precision', 'event_dates', 'event_periods', 'window_start', 'window_end',
                    'publication_precision', 'scope', 'served_class_calendar', 'retained',
                    'image_count', 'document_link_count', 'link_count', 'attachment_count')
@@ -205,6 +205,8 @@ def assemble_agenda_snapshot(database, calendar_events, *, current=None, owner_e
                         'calendar_binding': settings.get('calendar_binding'),
                         'learner': context, 'sources': sources, 'collection_health': health,
                         'agenda': agenda, 'offer_groups': offers}
+            from .preferences import preference_snapshot
+            snapshot['preferences'] = preference_snapshot(db)
             snapshot['snapshot_hash'] = digest(snapshot)
             # Observation freshness is separate from content identity. The caller
             # must require a successful fresh collection for a live private POC.
@@ -289,8 +291,12 @@ def validate_agenda_plan(plan, snapshot):
             raise RuntimeFailure('agenda_action_reference_invalid')
         if action is not None:
             CodexRuntime._validate_analysis_time(action)
-        # Extra-school participation is always a human decision, not automatic.
-        if operation == 'create' and action['activity_scope'] != 'school':
+        from .preferences import basis_outcome
+        preference = basis_outcome(snapshot.get('preferences', {}), item.get('preference_basis'))
+        # Unknown applicability never gains authority from a participation choice.
+        # Insufficient/conflicting supplied preference evidence becomes review.
+        if operation == 'create' and (action['activity_scope'] == 'unknown'
+                or action['activity_scope'] != 'school' and preference is None):
             raise RuntimeFailure('agenda_review_required')
     if 'source_catalog' in snapshot:
         handled = {ref['source_id'] for item in plan['items'] for ref in item['sources']}
@@ -374,8 +380,10 @@ def _prepare_item(store, snapshot, item, plan_id, index, current):
         item.update(operation='ignore', action=None, review_change=None, proposal_id=None,
                     reason='Substitutions are informational and do not create personal Calendar actions.')
         return item, None
-    if entry and _rejected(entry) and item['operation'] != 'link':
-        item.update(operation='ignore', action=None, review_change=None, reason='Saved rejection retained.')
+    if entry and _rejected(entry):
+        item['preference_basis'] = None
+        if item['operation'] != 'link':
+            item.update(operation='ignore', action=None, review_change=None, reason='Saved rejection retained.')
     group = next((group for group in snapshot['offer_groups'] if group['id'] == item['offer_group_id']), None)
     if entry and group is None:
         group = next((group for group in snapshot['offer_groups']
@@ -393,8 +401,19 @@ def _prepare_item(store, snapshot, item, plan_id, index, current):
         if selected_change:
             item.update(operation='review', review_change=item['review_change'] or 'update')
         else:
-            item.update(operation='ignore', action=None, review_change=None, reason='Saved complete offer decision retained.')
+            item.update(operation='ignore', action=None, review_change=None, preference_basis=None,
+                        reason='Saved complete offer decision retained.')
+    from .preferences import basis_outcome
+    preference = basis_outcome(snapshot.get('preferences', {}), item.get('preference_basis'))
+    if preference and (preference == 'uncertain'
+                       or preference == 'accept' and item['operation'] != 'create'
+                       or preference == 'reject' and item['operation'] != 'ignore'
+                       or item['new_offer_key'] or group and group['status'] == 'open'):
+        item.update(operation='review', review_change=item['review_change'] or ('update' if entry else 'create'),
+                    reason='Preference evidence does not authorize this action; human review required. ' + item['reason'])
     if item['operation'] in ('link', 'ignore'):
+        if preference == 'reject' and item['operation'] == 'ignore':
+            item['reason'] = 'Automatic decline from ' + str(len(item['preference_basis']['example_ids'])) + ' independent future human choices. ' + item['reason']
         item['proposal_id'] = entry['proposal_id'] if entry else None
         return item, None
     if entry and item['operation'] == 'review' and item['review_change'] == 'cancel':
@@ -420,6 +439,9 @@ def _prepare_item(store, snapshot, item, plan_id, index, current):
                         reason='Unchanged approved pending cancellation retained.')
             return item, None
     reason = item['reason']
+    learned_accept = (preference == 'accept' and item['operation'] == 'create'
+                      and not entry and not item['candidate_action_ids']
+                      and not item['new_offer_key'] and not group)
     if item['operation'] == 'update' and entry and (_protected(entry) or any(event['externally_changed'] for event in entry['calendar'])):
         item.update(operation='review', review_change='update')
         reason = 'Existing human intent or external Calendar edit requires approval. ' + reason
@@ -453,7 +475,7 @@ def _prepare_item(store, snapshot, item, plan_id, index, current):
                    end=raw.get('end'), all_day=raw.get('all_day', True), temporal_kind=raw.get('temporal_kind', 'event'),
                    due_at=raw.get('due_at'), activity_scope=raw.get('activity_scope', 'unknown'))
     try:
-        proposal = normalize_proposal(raw, current)
+        proposal = normalize_proposal(raw, current, participation_preference=learned_accept)
     except (ValueError, TypeError, OverflowError):
         if item['operation'] != 'review':
             raise RuntimeFailure('agenda_plan_invalid') from None
@@ -489,6 +511,15 @@ def _prepare_item(store, snapshot, item, plan_id, index, current):
                     source_version_at=sources[0].get('updated_at') or sources[0].get('published_at'),
                     agenda_plan_id=plan_id, agenda_sources=refs, agenda_message_hash=message['payload_hash'],
                     agenda_learner={'id': snapshot['learner']['id'], 'class_id': snapshot['learner'].get('class_id')})
+    if learned_accept and proposal['status'] == 'pending':
+        from .preferences import action_digest
+        proof = {**item['preference_basis'], 'boundary_hash': snapshot['preferences']['boundary_hash'],
+                 'action_hash': action_digest(proposal),
+                 'examples_hash': digest(snapshot['preferences']['examples'])}
+        proposal['preference_decision'] = proof
+        item['preference_decision'] = proof
+        reason = 'Automatic acceptance from ' + str(len(proof['example_ids'])) + ' independent future human choices. ' + reason
+        proposal['review_reason'] = reason
     if selected_change:
         proposal['alternative_group_id'] = group['id']
     # Unknown/inflight intent cannot be superseded or followed by another create.

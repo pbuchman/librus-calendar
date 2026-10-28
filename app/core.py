@@ -121,7 +121,7 @@ def analysis_metadata(data, proposal_count):
     return result
 
 
-def normalize_proposal(data, current=None):
+def normalize_proposal(data, current=None, *, participation_preference=False):
     if not isinstance(data, dict):
         raise ValueError('Proposal must be an object.')
     current = current or datetime.now(WARSAW)
@@ -142,7 +142,7 @@ def normalize_proposal(data, current=None):
                     temporal_kind=temporal_kind, due_at=data.get('due_at'), activity_scope=activity_scope,
                     deletion_approved=data.get('deletion_approved') is True, user_approved=data.get('user_approved') is True,
                     user_edited=data.get('user_edited') is True)
-    for key in ('agenda_plan_id','agenda_sources','agenda_learner','canonical_action_id','source_id','source_hash','source_kind','provenance','recipient','recipient_basis','optional','date_certainty','action_identity','match_evidence','source_version_at','offer_identity','informational','alternative_group','alternative_group_id','alternative_group_evidence','user_rejected','deferred_unknown_operation','blocked_by_offer_group','blocked_by_group_decision'):
+    for key in ('agenda_plan_id','agenda_sources','agenda_learner','canonical_action_id','source_id','source_hash','source_kind','provenance','recipient','recipient_basis','optional','date_certainty','action_identity','match_evidence','source_version_at','offer_identity','informational','alternative_group','alternative_group_id','alternative_group_evidence','user_rejected','deferred_unknown_operation','blocked_by_offer_group','blocked_by_group_decision','preference_decision'):
         if key in data:
             proposal[key] = data[key]
     if proposal.get('optional') is True:
@@ -193,7 +193,7 @@ def normalize_proposal(data, current=None):
         proposal.update(status='ignored', review_reason='Past date: no calendar write.')
     elif kind == 'cancel' and not proposal.get('deletion_approved'):
         proposal.update(status='review', needs_review=True, review_reason=proposal['review_reason'] or 'Cancellation requires manual review; no automatic deletion.')
-    elif (activity_scope == 'unknown' or (kind == 'create' and activity_scope == 'extracurricular')) and not proposal['user_approved']:
+    elif (activity_scope == 'unknown' or (kind == 'create' and activity_scope == 'extracurricular' and not participation_preference)) and not proposal['user_approved']:
         proposal.update(status='review', needs_review=True, review_reason=proposal['review_reason'] or 'Extra activity or unclassified participation requires confirmation.')
     elif proposal['needs_review'] or (proposal['confidence'] != 'high' and not (activity_scope == 'school' and proposal['confidence'] == 'medium')):
         proposal.update(status='review', needs_review=True, review_reason=proposal['review_reason'] or 'Date or meaning needs confirmation.')
@@ -211,6 +211,8 @@ def event_body(proposal, message, marker, synchronization_started_at=None):
         source += '\nFragment: ' + proposal['source_quote']
     if proposal.get('default_duration'):
         source += '\nCzas trwania 60 minut przyjęty automatycznie; wiadomość nie podaje końca.'
+    if proposal.get('preference_decision') and not proposal.get('user_approved'):
+        source += '\nAutomatyczna akceptacja na podstawie wcześniejszych decyzji rodzica (' + str(len(proposal['preference_decision']['example_ids'])) + ' przykłady).'
     source += '\n' + marker
     field = 'date' if proposal['all_day'] else 'dateTime'
     start, end = {field: proposal['start']}, {field: proposal['end']}
@@ -288,6 +290,8 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             CREATE TABLE IF NOT EXISTS metadata_refresh(id TEXT PRIMARY KEY,event_id TEXT NOT NULL,version TEXT NOT NULL,payload TEXT NOT NULL,status TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,result TEXT,last_error TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL,UNIQUE(event_id,version));
             ''')
             self.db.executescript(GROUP_SCHEMA)
+            from .preferences import SCHEMA as PREFERENCE_SCHEMA
+            self.db.executescript(PREFERENCE_SCHEMA)
             if 'diagnostics' not in {row[1] for row in self.db.execute('PRAGMA table_info(sync_runs)')}:
                 self.db.execute('ALTER TABLE sync_runs ADD COLUMN diagnostics TEXT')
             if 'state' not in {row[1] for row in self.db.execute('PRAGMA table_info(events)')}:
@@ -340,6 +344,7 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             self.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (key, str(value)))
 
     def status(self):
+        from .preferences import preference_status
         with self.lock:
             own_snapshot = not self.db.in_transaction
             if own_snapshot:
@@ -351,7 +356,8 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                         'events': count('events', " WHERE state='active'"), 'events_cancelled': count('events', " WHERE state='cancelled'"),
                         'writes_paused': self._setting('writes_paused', 'true') == 'true',
                         'last_sync': self._setting('last_sync'), 'last_error': self._setting('last_error'), 'sync_requested_at': self._setting('sync_requested_at'),
-                        'calendar_id': self.calendar_id, 'timezone': 'Europe/Warsaw', 'sources': self.source_status(), 'agenda': self.agenda_status()}
+                        'calendar_id': self.calendar_id, 'timezone': 'Europe/Warsaw', 'sources': self.source_status(), 'agenda': self.agenda_status(),
+                        'preferences': preference_status(self.db)}
             finally:
                 if own_snapshot:
                     self.db.rollback()
@@ -742,6 +748,8 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             from .data_admin import remember_decision
             remember_decision(self, row, item, original=self._proposal(row))
             self.remember_canonical_decision(row['id'])
+            from .preferences import remember_proposal_choice
+            remember_proposal_choice(self, row, item, decision)
             self.db.execute('UPDATE canonical_actions SET payload=?,status=?,updated_at=? WHERE proposal_id=?', (json.dumps(item,ensure_ascii=False),item['status'],stamp,row['id']))
             return item
 
@@ -796,7 +804,9 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                     self._review_unwritten_locked(item, reason)
                     continue
                 try:
-                    checked = normalize_proposal(item, current)
+                    from .preferences import authorizes_participation
+                    checked = (normalize_proposal(item, current, participation_preference=True)
+                               if authorizes_participation(self, item) else normalize_proposal(item, current))
                 except (ValueError, TypeError, OverflowError):
                     self._review_unwritten_locked(item, 'Invalid or ambiguous event date; manual correction required.')
                     continue

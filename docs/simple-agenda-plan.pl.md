@@ -133,3 +133,11 @@ odtwarza wpisów Calendar i nie przelicza całej historycznej skrzynki jako nowy
 Gotowe oznacza: zachowane dotychczasowe wpisy i decyzje, poprawne nowe obowiązki,
 brak duplikatów po replay i restarcie, zero unknown oraz jeden aktywny planer.
 Po spełnieniu tych warunków zlecone wykonanie zastępuje stary silnik bez dodatkowej bramki zgody.
+
+## Uczenie z przyszłych decyzji rodzica
+
+Opcjonalne uczenie włącza administrator poleceniem `preferences-enable --receipt-file` z prywatnym potwierdzeniem granicy czasowej i listą wykluczonych starych propozycji/ofert. Starsze decyzje nadal chronią konkretne działania, ale nie są przykładami preferencji. Nowy przykład powstaje dopiero po ręcznej akceptacji/odrzuceniu nowej propozycji po tej granicy; wynik automatycznego zapisu i porządkowanie starej kolejki nie uczą systemu.
+
+Ten sam SOL/high dostaje jawne okno ostatnich 50 przykładów oraz liczbę pominiętych starszych. Pełny rejestr zostaje w bazie. Opisy przykładów mają oznaczony skrót do 400 znaków; nie wolno opierać pewnej oceny podobieństwa na pominiętych szczegółach. Co najmniej dwie niezależne zgodne decyzje mogą uzasadnić automatyczną akceptację albo odrzucenie podobnej pojedynczej aktywności. Podobieństwo ocenia model w tym samym zadaniu; kod sprawdza cytowane przykłady i ich niezależność. Sprzeczne lub niewystarczające dane wymagają review.
+
+Wybór jednego z kilku terminów pozostaje ręczny. Niewybrane daty jednej oferty nie są odrębnymi negatywnymi preferencjami. Zostają ograniczenia dat, odbiorcy, ręcznych zmian, odwołań i nieznanych wyników zapisów. Automatyczna akceptacja ma zapisane pochodzenie, ale nie dostaje flagi ręcznego `user_approved`; kolejka i wykonawca ponownie sprawdzają powiązanie z planem oraz niezmienionymi przykładami. Szczegółowy kontrakt i komendy są w [instrukcji uruchomienia](setup.md#future-human-choice-examples).
