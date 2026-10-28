@@ -25,7 +25,7 @@ def intent_signature(item):
 
 def minimal_proposal(item):
     """Keep a chosen action, never the original teacher quote or AI reasoning."""
-    keep = ('agenda_plan_id', 'agenda_sources', 'agenda_learner', 'id', 'message_id', 'kind', 'title', 'start', 'end', 'all_day', 'temporal_kind',
+    keep = ('preference_decision', 'agenda_plan_id', 'agenda_sources', 'agenda_learner', 'id', 'message_id', 'kind', 'title', 'start', 'end', 'all_day', 'temporal_kind',
             'due_at', 'activity_scope', 'canonical_action_id', 'source_id', 'source_hash', 'source_kind', 'source_version_at', 'optional', 'recipient_basis', 'deferred_unknown_operation', 'action_identity', 'recipient', 'event_id', 'default_duration', 'alternative_group_id', 'blocked_by_group_decision', 'blocked_by_offer_group', *FLAGS)
     result = {key: item[key] for key in keep if key in item}
     if isinstance(result.get('action_identity'),dict):result['action_identity']={k:v for k,v in result['action_identity'].items() if k!='evidence'}

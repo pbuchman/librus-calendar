@@ -316,6 +316,8 @@ class ProposalGroupsMixin:
                 remember_decision(self, member, item, original=original)
             self.db.execute('UPDATE proposal_groups SET status=?,selected_proposal_id=?,revision=revision+1,updated_at=? WHERE id=?',
                 (wanted,proposal_id,stamp,row['id']))
+            from .preferences import remember_group_choice
+            remember_group_choice(self, row, members, decision, proposal_id)
             return self.get_proposal_group(row['id'], current)
 
 

@@ -265,8 +265,8 @@ class HumanEventDecisionTests(unittest.TestCase):
 
         worker = threading.Thread(target=approve)
 
-        def normalize_during_edit(item, current=None):
-            result = normalize_proposal(item, current)
+        def normalize_during_edit(item, current=None, **options):
+            result = normalize_proposal(item, current, **options)
             if item.get('id') == update['id'] and not launched.is_set():
                 launched.set()
                 worker.start()

@@ -33,7 +33,8 @@
           "action",
           "review_change",
           "offer_group_id",
-          "new_offer_key"
+          "new_offer_key",
+          "preference_basis"
         ],
         "properties": {
           "operation": {
@@ -186,6 +187,36 @@
               "null"
             ],
             "maxLength": 100
+          },
+          "preference_basis": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "additionalProperties": false,
+            "required": [
+              "outcome",
+              "example_ids"
+            ],
+            "properties": {
+              "outcome": {
+                "type": "string",
+                "enum": [
+                  "accept",
+                  "reject",
+                  "uncertain"
+                ]
+              },
+              "example_ids": {
+                "type": "array",
+                "maxItems": 50,
+                "items": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 64
+                }
+              }
+            }
           }
         }
       }
