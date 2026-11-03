@@ -16,7 +16,7 @@ first run the read-only planning POC, then replace the old engine after its acce
 
 ## Preserve intent and state
 
-- Preserve IDs, ownership, history, approved hours, manual edits, rejections and one-choice offers; never reset the database.
+- Preserve IDs, ownership, history, approved hours, manual edits, rejections and one-choice offers; never reset the database. A materially new available changed confirmation of a previously uncertain standalone school trip may request same-action review with a new proposal revision; preserve the old rejection and require new approval. Repetition, context/catalog alone and closed offers cannot reopen it. Latest canonical human decision governs historical decisions.
 - Check current Calendar state before applying; material changes to user-controlled entries and cancellations require approval.
 - Review blocks affected actions only; keep dependent offer choices atomic. Missing sources or plan items never authorize deletion.
 - Reconcile uncertain writes read-only before retrying; preview cannot mutate active decisions, queue or Calendar.

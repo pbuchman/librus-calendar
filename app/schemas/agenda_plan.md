@@ -18,7 +18,11 @@ source IDs and current hashes. Existing agenda IDs are authoritative;
 never invent an action_id. For a new action use null; application assigns IDs.
 Each agenda entry merges canonical and latest legacy proposal state once. Its
 action is the current semantic state; links, origin, legacy_quotes, decisions and
-calendar describe saved authority. Calendar.current is the fresh observed event,
+calendar describe saved authority. current_decision contains the latest canonical
+human decision flags (or the current proposal's legacy intent if no canonical
+decision exists); it supersedes historical decisions. The decisions list preserves
+history, so an old rejection must not override a later current approval.
+Calendar.current is the fresh observed event,
 saved_fingerprint is the write baseline and externally_changed flags conflict.
 Offer_groups include saved status, selected proposal, members, revision and keys.
 These existing states and saved source quotes describe legacy state;
@@ -37,8 +41,16 @@ existing actions unnecessarily. Omission or an empty plan never deletes anything
 Cancellation ALWAYS uses review with review_change=cancel and existing action_id.
 
 Preserve existing IDs, event ownership, approved/edited hours, rejections and
-offer choices. Never overwrite a human change, revive a rejected obligation or
-reopen a selected/rejected offer group. A material change to user-controlled
+offer choices. Never overwrite a human change or automatically revive a rejected
+obligation. Do not reopen a selected/rejected offer group. Repetition of a rejected
+proposal or of an already handled confirmation stays ignored. A materially NEW
+confirmation of a previously uncertain standalone class trip may instead request
+review for the SAME existing action_id, with current facts, source refs and a
+concrete reason for reconsideration. Use review_change=create or update; do not
+make a duplicate create. This requires a referenced full available source_role=changed
+body in this request; context/catalog alone, unavailable bodies, cancellations
+and offer choices cannot justify reconsideration. Preserve the old rejection
+and request new approval before any write. A material change to user-controlled
 state requires review. Current Calendar snapshot overrides an old saved snapshot;
 an external edit or missing managed event requires review before any overwrite.
 Read every agenda entry's decisions and the offer_groups. Identical canonical
@@ -143,3 +155,8 @@ Holiday sources with metadata.event_dates supply exact observed non-school dates
 Use one all-day event for each contiguous metadata.event_periods interval, with its
 exclusive end. Keep gaps separate. Never fill an unobserved date or shorten an
 existing range merely because the scan window moved; out-of-window boundaries require review if the current source cannot confirm them. Preserve existing action/event IDs and human decisions.
+
+A clearly confirmed trip for the pupil's class is a school event. A request for
+a parent volunteer/chaperone does not make the child's participation optional or
+unknown. With clear applicability and no prior rejection it may use create; with
+a prior rejection and a new confirmation use the same-action review above.

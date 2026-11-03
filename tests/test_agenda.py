@@ -123,6 +123,29 @@ class AgendaTests(unittest.TestCase):
         linked = item(decided, 'link', action_id='existing-action', action=None)
         self.assertEqual(validate_agenda_plan(plan(decided, [linked]), decided)['items'][0]['action_id'], 'existing-action')
 
+    def test_current_decision_is_compact_and_legacy_rejection_fallback_is_safe(self):
+        from app.agenda import _rejected
+        event = self.inventory()
+        approved = {'proposal': dict(action(), user_approved=True, description='Saved detail. ' * 500)}
+        with self.store.db:
+            self.store.db.execute('INSERT INTO canonical_decisions VALUES (?,?,?)',
+                ('existing-action', json.dumps(approved), NOW.isoformat()))
+            self.store.db.execute('INSERT INTO decision_intents VALUES (?,?,?,?,?)',
+                ('existing-proposal', 'fictional-message', 'fictional-hash', '{"proposal":{"user_rejected":true}}', NOW.isoformat()))
+        entry = self.snapshot({event['id']: event})['agenda'][0]
+        self.assertIn('current_decision', entry)
+        self.assertEqual(entry['current_decision'], {'user_approved': True})
+        self.assertLess(len(json.dumps(entry['current_decision'])), 100)
+        legacy = dict(entry, action={'user_rejected': True}, decisions=[{'user_rejected': True}])
+        legacy.pop('current_decision')
+        self.assertTrue(_rejected(legacy))
+        self.assertFalse(_rejected(dict(legacy, current_decision={'user_approved': True})))
+        with self.store.db:
+            self.store.db.execute('DELETE FROM canonical_decisions')
+        fallback = self.snapshot({event['id']: event})['agenda'][0]
+        self.assertEqual(fallback['current_decision'], {'user_rejected': True})
+        self.assertTrue(_rejected(fallback))
+
     def test_missing_calendar_fetch_is_error_but_observed_not_found_is_context(self):
         event = self.inventory()
         with self.assertRaisesRegex(RuntimeFailure, 'agenda_calendar_snapshot_incomplete'):

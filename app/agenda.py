@@ -16,7 +16,7 @@ import jsonschema
 from .codex_runtime import SCHEMAS, CodexRuntime, RuntimeFailure, normalize_event, event_fingerprint
 from .core import WARSAW, digest, normalize_proposal, utcnow
 
-AGENDA_VERSION = 'simple-agenda-v8-future-preferences'
+AGENDA_VERSION = 'simple-agenda-v9-school-reconfirmation'
 AGENDA_MODEL = 'gpt-6.1-sol'
 AGENDA_EFFORT = 'high'
 # UTF-8 bytes are a conservative upper bound on text tokens. Reserve space for
@@ -26,6 +26,7 @@ OUTPUT_RESERVE_TOKENS = 32_000
 OVERHEAD_RESERVE_TOKENS = 8_000
 MAX_INPUT_BYTES = CONTEXT_TOKENS - OUTPUT_RESERVE_TOKENS - OVERHEAD_RESERVE_TOKENS
 MAX_ROWS = 5_000
+DECISION_FLAGS = ('user_approved', 'user_edited', 'user_rejected', 'deletion_approved')
 ACTION_FIELDS = ('kind', 'title', 'description', 'start', 'end', 'all_day', 'temporal_kind', 'due_at',
                  'activity_scope', 'optional', 'recipient', 'action_identity', 'offer_identity', 'event_id',
                  'needs_review', 'review_reason',
@@ -117,6 +118,15 @@ def _agenda(tables, calendar_events, owner_email):
             decision = _decision(json.loads(row['payload']))
             if decision not in entry['decisions']:
                 entry['decisions'].append(decision)
+    # Keep history intact, but name the latest canonical authority explicitly.
+    # Flags suffice here: full saved facts already appear in decisions/action.
+    canonical = {row['action_id']: json.loads(row['payload']) for row in tables['canonical_decisions']}
+    intents = {row['id']: json.loads(row['payload']) for row in tables['decision_intents']}
+    for entry in entries.values():
+        decision = canonical.get(entry['id'], intents.get(entry['proposal_id']))
+        if decision is not None:
+            authority = decision.get('proposal') or decision
+            entry['current_decision'] = {flag: True for flag in DECISION_FLAGS if authority.get(flag) is True}
     for row in tables['events']:
         eid = row['id']
         if row['state'] == 'active' and eid not in calendar_events:
@@ -365,8 +375,29 @@ def _protected(entry):
 
 
 def _rejected(entry):
+    if entry.get('current_decision') is not None:
+        return entry['current_decision'].get('user_rejected') is True
+    # Older snapshots have no explicit current authority: retain conservative
+    # rejection protection rather than guessing historical ordering.
     return entry['action'].get('user_rejected') or any(
         (decision.get('proposal') or decision).get('user_rejected') for decision in entry['decisions'])
+
+
+def _reconsideration_review(snapshot, entry, item):
+    # Semantics (new confirmation versus repetition) belong to the one planner.
+    # This gate grants review only, with the exact changed body in this request.
+    action = item.get('action') or {}
+    if ('source_catalog' not in snapshot or item['operation'] != 'review'
+            or item['review_change'] not in ('create', 'update')
+            or action.get('activity_scope') != 'school' or entry['calendar']
+            or item['candidate_action_ids'] or item['offer_group_id'] or item['new_offer_key']
+            or any(entry['action'].get(flag) for flag in ('alternative_group_id', 'blocked_by_offer_group', 'blocked_by_group_decision'))):
+        return False
+    refs = {(ref['source_id'], ref['source_hash']) for ref in item['sources']}
+    return any((source['id'], source['content_hash']) in refs
+               and source.get('source_role') == 'changed' and source.get('body_available') is True
+               and not source.get('deleted') and source.get('status') != 'retained'
+               and bool(source.get('text')) for source in snapshot['sources'])
 
 
 def _prepare_item(store, snapshot, item, plan_id, index, current):
@@ -380,10 +411,6 @@ def _prepare_item(store, snapshot, item, plan_id, index, current):
         item.update(operation='ignore', action=None, review_change=None, proposal_id=None,
                     reason='Substitutions are informational and do not create personal Calendar actions.')
         return item, None
-    if entry and _rejected(entry):
-        item['preference_basis'] = None
-        if item['operation'] != 'link':
-            item.update(operation='ignore', action=None, review_change=None, reason='Saved rejection retained.')
     group = next((group for group in snapshot['offer_groups'] if group['id'] == item['offer_group_id']), None)
     if entry and group is None:
         group = next((group for group in snapshot['offer_groups']
@@ -391,6 +418,10 @@ def _prepare_item(store, snapshot, item, plan_id, index, current):
                           or any(member['proposal_id'] == entry['proposal_id'] for member in group['members']))), None)
         if group:
             item['offer_group_id'] = group['id']
+    if entry and _rejected(entry):
+        item['preference_basis'] = None
+        if item['operation'] != 'link' and not _reconsideration_review(snapshot, entry, item):
+            item.update(operation='ignore', action=None, review_change=None, reason='Saved rejection retained.')
     selected_change = False
     if group and entry and group['status'] == 'selected':
         selected = store.db.execute('SELECT payload FROM proposals WHERE id=?', (group['selected_proposal_id'],)).fetchone()

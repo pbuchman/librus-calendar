@@ -90,6 +90,156 @@ class AgendaIntegrationTests(AgendaTests):
                                      agenda_calendar=planner.calendar, current=NOW)
         return queued
 
+    def rejected_trip(self):
+        result, runtime, planner = self.apply(lambda snapshot: [item(snapshot, 'review', review_change='create',
+            action=dict(action(), title='Wycieczka klasy 1x', temporal_kind='event', activity_scope='unknown'))])
+        original = result['items'][0]
+        self.store.resolve_proposal(original['proposal_id'], 'ignore')
+        return original, runtime, planner
+
+    def confirm_trip(self, original, runtime):
+        with self.store.db:
+            self.store.db.execute("UPDATE sources SET content_hash='fictional-confirmed-trip',payload=json_set(payload,'$.text',?) WHERE kind='announcement'",
+                ('Wycieczka klasy 1x jest potwierdzona 14 marca od 9 do 13. Prosimy o jednego rodzica do pomocy.',))
+        runtime.select = lambda snapshot: [item(snapshot, 'review', review_change='update',
+            action_id=original['action_id'], action=dict(action(), title='Wycieczka klasy 1x', temporal_kind='event',
+            start='2030-03-14T09:00:00+01:00', end='2030-03-14T13:00:00+01:00', all_day=False))]
+
+    def test_new_trip_confirmation_reviews_same_action_and_preserves_rejection(self):
+        original, runtime, planner = self.rejected_trip()
+        old_proposal = tuple(self.store.db.execute('SELECT * FROM proposals WHERE id=?', (original['proposal_id'],)).fetchone())
+        old_intent = tuple(self.store.db.execute('SELECT * FROM decision_intents WHERE id=?', (original['proposal_id'],)).fetchone())
+        self.confirm_trip(original, runtime)
+        revised = planner.run(NOW)['items'][0]
+        self.assertEqual(revised['operation'], 'review')
+        self.assertEqual(revised['action_id'], original['action_id'])
+        self.assertNotEqual(revised['proposal_id'], original['proposal_id'])
+        proposal = next(p for p in self.store.list_proposals() if p['id'] == revised['proposal_id'])
+        self.assertEqual((proposal['kind'], proposal['status'], proposal['start']), ('create', 'review', '2030-03-14T09:00:00+01:00'))
+        self.store.set_writes_paused(False)
+        self.assertEqual(self.store.queue_operations(NOW), [])
+        self.assertEqual(runtime.writes, [])
+        self.assertEqual(tuple(self.store.db.execute('SELECT * FROM proposals WHERE id=?', (original['proposal_id'],)).fetchone()), old_proposal)
+        self.assertEqual(tuple(self.store.db.execute('SELECT * FROM decision_intents WHERE id=?', (original['proposal_id'],)).fetchone()), old_intent)
+        self.assertEqual(planner.run(NOW)['status'], 'unchanged')
+        self.assertEqual(len(self.store.list_proposals()), 2)
+
+    def test_new_trip_approval_governs_after_later_inference_and_one_calendar_write(self):
+        from app.agenda import _rejected
+        original, runtime, planner = self.rejected_trip()
+        self.confirm_trip(original, runtime)
+        revised = planner.run(NOW)['items'][0]
+        self.assertEqual(revised['operation'], 'review')
+        self.store.resolve_proposal(revised['proposal_id'], 'approve')
+        runtime.select = lambda snapshot: [item(snapshot, 'link', action_id=original['action_id'], action=None)]
+        planner.run(NOW)  # New human decision with both approval and rejection history.
+        entry = self.snapshot()['agenda'][0]
+        self.assertEqual(entry['current_decision'], {'user_approved': True})
+        self.assertTrue(any((decision.get('proposal') or decision).get('user_rejected') for decision in entry['decisions']))
+        self.assertFalse(_rejected(entry))
+        self.store.set_writes_paused(False)
+        self.assertEqual(len(self.execute_pending(runtime, planner)), 1)
+        self.assertEqual(self.store.queue_operations(NOW), [])
+        self.assertEqual(len(runtime.writes), 1)
+        self.assertEqual(planner.run(NOW)['status'], 'unchanged')
+        with self.store.db:
+            self.store.db.execute("UPDATE sources SET content_hash='fictional-later-trip-update' WHERE kind='announcement'")
+        runtime.select = lambda snapshot: [item(snapshot, 'update', action_id=original['action_id'],
+            action=dict(action(), title='Wycieczka klasy 1x', start='2030-03-15'))]
+        changed = planner.run(NOW)['items'][0]
+        self.assertEqual(changed['operation'], 'review')
+        self.assertEqual(changed['review_change'], 'update')
+        self.assertFalse(_rejected(self.snapshot(runtime.events)['agenda'][0]))
+        self.assertEqual(len(runtime.writes), 1)
+
+    def test_reject_new_confirmation_does_not_review_it_again_from_context(self):
+        original, runtime, planner = self.rejected_trip()
+        self.confirm_trip(original, runtime)
+        revised = planner.run(NOW)['items'][0]
+        self.assertEqual(revised['operation'], 'review')
+        self.store.resolve_proposal(revised['proposal_id'], 'ignore')
+        repeated = planner.run(NOW)['items'][0]
+        self.assertEqual(repeated['operation'], 'ignore')
+        self.assertEqual(planner.run(NOW)['status'], 'unchanged')
+        self.assertEqual(len(self.store.list_proposals()), 2)
+        self.assertEqual(runtime.writes, [])
+
+    def test_reconfirmation_guards_require_changed_available_referenced_school_body(self):
+        from app.agenda import _prepare_item
+        from app.agenda_incremental import assemble_incremental_snapshot
+        original, runtime, planner = self.rejected_trip()
+        self.confirm_trip(original, runtime)
+        snapshot, _ = assemble_incremental_snapshot(self.store, {}, current=NOW)
+        for mode in ('context', 'catalog', 'deleted', 'retained', 'unreferenced', 'automatic', 'cancel', 'extracurricular', 'candidate', 'offer'):
+            with self.subTest(mode=mode):
+                selected = copy.deepcopy(snapshot)
+                proposed = runtime.select(selected)[0]
+                changed = next(source for source in selected['sources'] if source['kind'] == 'announcement')
+                if mode == 'context':
+                    changed['source_role'] = 'context'
+                elif mode == 'catalog':
+                    selected['sources'] = [source for source in selected['sources'] if source != changed]
+                elif mode in ('deleted', 'retained'):
+                    changed['body_available'] = False
+                    changed['deleted'] = mode == 'deleted'
+                    changed['status'] = mode
+                elif mode == 'unreferenced':
+                    proposed['sources'] = [ref for ref in proposed['sources'] if ref['source_id'] != changed['id']]
+                elif mode == 'automatic':
+                    proposed.update(operation='update', review_change=None)
+                elif mode == 'cancel':
+                    proposed.update(review_change='cancel', action=None)
+                elif mode == 'extracurricular':
+                    proposed['action']['activity_scope'] = 'extracurricular'
+                elif mode == 'candidate':
+                    proposed['candidate_action_ids'] = [original['action_id']]
+                elif mode == 'offer':
+                    proposed['new_offer_key'] = 'fictional-offer'
+                prepared, proposal = _prepare_item(self.store, selected, proposed, 'fictional-guard-plan', 0, NOW)
+                self.assertEqual(prepared['operation'], 'ignore')
+                self.assertIsNone(proposal)
+        self.assertEqual(runtime.writes, [])
+
+    def test_reconfirmation_cannot_reopen_implicit_school_offer_membership(self):
+        result, runtime, planner = self.apply(lambda snapshot: [item(snapshot, 'review', review_change='create',
+            action=dict(action(), title='Wycieczka klasy 1x', temporal_kind='event', start='2030-03-%02d' % day),
+            new_offer_key='fictional-class-offer') for day in (12, 13)])
+        target = result['items'][0]['action_id']
+        group = self.store.list_proposal_groups()[0]
+        # Legacy rejection authority may coexist with still-open membership.
+        with self.store.db:
+            self.store.db.execute('INSERT INTO canonical_decisions VALUES (?,?,?)',
+                (target, '{"user_rejected":true}', NOW.isoformat()))
+            self.store.db.execute("UPDATE sources SET content_hash='fictional-new-class-offer-confirmation' WHERE kind='announcement'")
+        runtime.select = lambda snapshot: [item(snapshot, 'review', action_id=target, review_change='create')]
+        guarded = planner.run(NOW)['items'][0]
+        self.assertEqual(guarded['operation'], 'ignore')
+        self.assertEqual(len(self.store.list_proposals()), 2)
+        self.assertEqual(self.store.list_proposal_groups()[0]['status'], group['status'])
+        self.assertEqual(self.store.queue_operations(NOW), [])
+        self.assertEqual(runtime.writes, [])
+
+    def test_v8_authority_baseline_does_not_replay_history_on_v9_upgrade(self):
+        from app.agenda_incremental import assemble_incremental_snapshot
+        from app.core import digest
+        original, runtime, planner = self.rejected_trip()
+        runtime.select = lambda snapshot: [item(snapshot, 'ignore', action=None)]
+        planner.run(NOW)  # The old rejection and its exact source versions were handled.
+        previous = self.snapshot()
+        old_authority = {}
+        for entry in previous['agenda']:
+            controlled = any(entry['action'].get(flag) for flag in
+                ('user_approved', 'user_edited', 'user_rejected', 'deletion_approved'))
+            old_authority[entry['id']] = digest({'decisions': entry['decisions'],
+                'human_action': entry['action'] if controlled else {}, 'calendar': entry['calendar']})
+        with self.store.db:
+            self.store.db.execute("UPDATE settings SET value=? WHERE key='agenda_authority_baseline'", (json.dumps(old_authority),))
+            self.store.db.execute("UPDATE settings SET value='fictional-v8-content-baseline' WHERE key='agenda_baseline_hash'")
+        upgraded, _ = assemble_incremental_snapshot(self.store, {}, current=NOW)
+        self.assertEqual(upgraded['sources'], [])
+        self.assertEqual(len(upgraded['source_catalog']), 3)
+        self.assertEqual(runtime.writes, [])
+
     def test_scoped_cleanup_retires_only_unwritten_review_without_replaying_sources(self):
         from app.agenda_incremental import assemble_incremental_snapshot
         from app.source_admin import cleanup_existing

@@ -11,6 +11,19 @@ ID must be referenced by at least one plan item before any checkpoint can advanc
 A grouped ignore can acknowledge multiple irrelevant/unavailable sources without
 an existing action. Catalog-only IDs need no acknowledgment.
 
+The v9 school-reconfirmation policy preserves historical decisions and exposes
+compact `current_decision` flags separately. Latest canonical authority takes
+precedence over old rejection records; legacy snapshots without that field retain
+conservative rejection protection. A materially new confirmation of a previously
+uncertain standalone class trip can request review for the same action ID only
+from a referenced available changed body. It creates a new proposal revision,
+keeps the old rejection and requires approval through the existing decision API.
+Context/catalog-only input, handled confirmation versions and complete closed
+offers cannot reopen review. Automatic revival and cancellation remain blocked.
+A confirmed class trip is a school event even when a parent volunteer is requested.
+This distinction is model semantics within the single SOL/high task. Policy/version
+invalidation does not replay processed ignored sources.
+
 The planner first establishes an actual pupil activity, task or duty, then checks
 its applicability. Operational availability alone is ignored even when recipients
 or participation are unknown. For example, access hours for viewing already-written

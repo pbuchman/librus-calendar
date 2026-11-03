@@ -29,7 +29,7 @@ Istniejące wpisy i decyzje rodzica są stanem wejściowym, który trzeba zachow
 4. Jeden tool-free task na jawnie skonfigurowanym `gpt-6.1-sol/high` zwraca plan całej zmiany:
    `create`, `link`, `update`, `review`, `ignore`, z uzasadnieniem i wskazaniem źródeł.
    `link` dołącza kolejne źródło do istniejącej czynności bez zapisu Calendar.
-   Model widzi również odrzucenia i wybrane terminy, żeby nie proponować ich ponownie.
+   Model widzi również odrzucenia i wybrane terminy, żeby nie proponować ich ponownie. Materialnie nowe potwierdzenie wcześniej niepewnej pojedynczej wycieczki szkolnej może skierować to samo działanie do ponownej oceny, tylko na podstawie dostępnej zmienionej treści. Stare odrzucenie pozostaje w historii, nowa wersja wymaga zatwierdzenia; aktualna decyzja kanoniczna ma pierwszeństwo przed historią.
 5. Kod waliduje schemat, daty, istniejące referencje, zakres ucznia, własność, decyzje
    oraz sprzeczne/podwójne operacje w jednym planie. Nadaje stabilne ID i zapisuje plan
    w tej samej bazie przed przygotowaniem operacji; zapis i kolejka są transakcyjne.

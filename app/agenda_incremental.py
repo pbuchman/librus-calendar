@@ -16,7 +16,7 @@ from contextlib import nullcontext
 from .agenda import assemble_agenda_snapshot, agenda_prompt
 from .core import digest
 
-INCREMENTAL_VERSION = 'simple-agenda-v8-future-preferences'
+INCREMENTAL_VERSION = 'simple-agenda-v9-school-reconfirmation'
 COMPATIBLE_FULL_VERSIONS = frozenset({'simple-agenda-v4-shared-learner'})
 LEDGER_TABLE = 'agenda_processed_sources'
 LEDGER_SCHEMA = '''CREATE TABLE IF NOT EXISTS agenda_processed_sources(
@@ -110,6 +110,8 @@ def assemble_incremental_snapshot(database, calendar_events, *, current=None, ow
             proposal_times = {row['id']: row['updated_at'] for row in _rows(db, 'SELECT id,updated_at FROM proposals')}
             for entry in full['agenda']:
                 controlled = any(entry['action'].get(flag) for flag in ('user_approved', 'user_edited', 'user_rejected', 'deletion_approved'))
+                # Keep the authority fingerprint compatible with v8. Current decision
+                # is a projection of these saved decisions, not new human activity.
                 authority = {'decisions': entry['decisions'],
                     'human_action': entry['action'] if controlled else {}, 'calendar': entry['calendar']}
                 authority_versions[entry['id']] = digest(authority)
