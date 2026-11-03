@@ -26,6 +26,31 @@ def diagnostic(**changes):
 
 
 class FormDiagnosticsTests(unittest.TestCase):
+    def test_restore_http_status_survives_wrapping_and_primary_failure_wins(self):
+        for primary_failure in (False, True):
+            client = SchoolClient()
+            saved = []
+            client.collection_diagnostic_sink = lambda item: saved.append(dict(item))
+            original = client.request
+            response = requests.Response()
+            response.status_code = 503
+            def request(method, url, *, data):
+                previous_month = client.month
+                if data['miesiac'] == '5' and (previous_month == 7 or primary_failure):
+                    raise requests.HTTPError('PRIVATE response URL', response=response)
+                result = original(method, url, data=data)
+                if primary_failure and data['miesiac'] == '4':
+                    result.text = result.text.replace('scheduleForm', 'PRIVATE')
+                return result
+            client.request = request
+            batch = collect_sources(client, current=CURRENT)
+            with self.subTest(primary_failure=primary_failure):
+                self.assertEqual(batch['errors'], ['calendar_form_invalid' if primary_failure else 'calendar_restore_failed'])
+                restore, = [item for item in saved if item['state'] == 'failed' and item.get('collection_step') == 'calendar_restore']
+                self.assertEqual(restore['error_code'], 'calendar_restore_failed')
+                self.assertEqual(restore.get('http_status'), 503)
+                self.assertNotIn('PRIVATE', json.dumps(saved))
+
     def test_each_form_invariant_has_a_distinct_safe_cause(self):
         valid = calendar_page()
         mutations = [

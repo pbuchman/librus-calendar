@@ -6,7 +6,7 @@ secrets or session URLs leave this module. Unknown markup is a failed collection
 not evidence that a source disappeared.
 """
 from calendar import monthrange
-from .health_state import collection_attempt
+from .health_state import collection_attempt, failure_diagnostic
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 from html import escape
@@ -544,7 +544,9 @@ def collect_calendar(client, *, learner_id, fetched_at, start, end, learner=None
                         try:
                             _select_month(client, latest, *original)
                         except Exception as error:
-                            raise SourceCollectionError('calendar_restore_failed', diagnostic_code=getattr(error, 'diagnostic_code', 'calendar_restore_failed'), http_status=getattr(error, 'http_status', None)) from None
+                            raise SourceCollectionError('calendar_restore_failed',
+                                diagnostic_code=getattr(error, 'diagnostic_code', 'calendar_restore_failed'),
+                                http_status=failure_diagnostic(error).get('http_status')) from None
                     if learner is not None and parse_learner_context(_read(client,'/informacja'))!=learner:
                         raise SourceCollectionError('learner_context_changed')
             except Exception:
