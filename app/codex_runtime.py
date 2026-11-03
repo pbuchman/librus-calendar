@@ -43,6 +43,15 @@ class RuntimeFailure(RuntimeError):
         self.retryable_probe = retryable_probe
 
 
+def _process_failure_code(stderr, error_hints):
+    """Only process stderr and explicit protocol error fields are evidence."""
+    hints = (stderr + '\n'.join(error_hints)).lower()
+    return ('codex_limit' if any(hint in hints for hint in ('usage limit', 'rate limit', 'quota', 'credits'))
+        else 'codex_permission_denied' if any(hint in hints for hint in ('permission denied', 'access denied', 'unauthorized', 'forbidden', 'authentication required'))
+        else 'codex_configuration_failed' if any(hint in hints for hint in ('invalid configuration', 'failed to load config', 'configuration error'))
+        else None)
+
+
 def marker_present(description, marker):
     """Calendar's text renderer may insert soft wrapping inside the marker."""
     compact_marker = "".join(str(marker or "").split())
@@ -369,11 +378,7 @@ class CodexRuntime:
             raise RuntimeFailure('codex_protocol_invalid', possible_write=write or observed_write)
         # Tool results and agent messages can contain school/calendar text. Only
         # protocol error fields and process stderr may classify process failures.
-        hints = (stderr + '\n'.join(error_hints)).lower()
-        process_code = ('codex_limit' if any(hint in hints for hint in ('usage limit', 'rate limit', 'quota', 'credits'))
-            else 'codex_permission_denied' if any(hint in hints for hint in ('permission denied', 'access denied', 'unauthorized', 'forbidden', 'authentication required'))
-            else 'codex_configuration_failed' if any(hint in hints for hint in ('invalid configuration', 'failed to load config', 'configuration error'))
-            else None)
+        process_code = _process_failure_code(stderr, error_hints)
         if returncode or protocol_failure or process_code:
             code = process_code or 'codex_failed'
             raise RuntimeFailure(code, possible_write=observed_write)
@@ -448,6 +453,8 @@ class CodexRuntime:
             state = 'completed'
             return result
         except BaseException as error:
+            from .health_state import failure_diagnostic
+            metadata.update(failure_diagnostic(error))
             if not isinstance(error, Exception):
                 state = 'interrupted'
             raise
@@ -477,12 +484,24 @@ class CodexRuntime:
             calls = self._tool_records(stdout, stderr, returncode, expected_tool, expected_args, write) if tools else []
             messages = []
             observed_write = False
+            protocol_failure, error_hints = False, []
             for line in (() if tools else stdout.splitlines()):
                 try:
                     record = json.loads(line)
                 except (ValueError, TypeError):
                     continue
+                if record.get('type') in {'turn.failed', 'error'}:
+                    protocol_failure = True
+                    error_hints.append(str(record.get('message') or record.get('error') or ''))
+                    continue
                 item = record.get("item") or {}
+                if item.get('type') == 'error':
+                    protocol_failure = True
+                    error_hints.append(str(item.get('message') or item.get('error') or ''))
+                    continue
+                if item.get('type') == 'mcp_tool_call' and record.get('type') in {'item.started', 'item.completed'}:
+                    key = 'started_count' if record['type'] == 'item.started' else 'completed_count'
+                    self.last_invocation_metadata[key] = self.last_invocation_metadata.get(key, 0) + 1
                 if item.get("type") == "mcp_tool_call" and item.get("tool") in {"google_calendar.create_event", "google_calendar.update_event", "google_calendar.delete_event"}:
                     observed_write = True
                 if item.get("type") == "agent_message" and record.get("type") == "item.completed":
@@ -491,9 +510,9 @@ class CodexRuntime:
                     calls.append(item)
                 if item.get("type") in {"command_execution", "file_change", "web_search", "image_generation"}:
                     raise RuntimeFailure("unexpected_tool", possible_write=write)
-            if returncode:
-                error = "codex_limit" if any(x in (stderr + stdout).lower() for x in ("usage limit", "rate limit", "quota", "credits")) else "codex_failed"
-                raise RuntimeFailure(error, possible_write=observed_write)
+            process_failure = _process_failure_code(stderr, error_hints) if not tools else None
+            if returncode or protocol_failure or process_failure:
+                raise RuntimeFailure(process_failure or 'codex_failed', possible_write=observed_write)
             if not tools and calls:
                 raise RuntimeFailure("analysis_tool_forbidden")
             if tools:

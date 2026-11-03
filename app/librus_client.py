@@ -30,6 +30,10 @@ class DiscoveryParsingError(PocError):
     code = 'discovery_parsing_failed'
 
 
+class MessageParsingError(PocError):
+    diagnostic_code = 'message_fetch_parsing'
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
@@ -170,13 +174,16 @@ class LibrusClient:
         response = self.request('GET', INBOX_URL + '/' + quote(message_id, safe=''))
         if response.is_redirect:
             raise PocError('Librus API session expired.')
-        data = self.json(response).get('data')
+        try:
+            data = self.json(response).get('data')
+        except PocError:
+            raise MessageParsingError('Message response could not be parsed.') from None
         if not isinstance(data, dict) or str(data.get('messageId')) != message_id:
-            raise PocError('Unexpected message schema or identity mismatch.')
+            raise MessageParsingError('Unexpected message schema or identity mismatch.')
         try:
             html = base64.b64decode(data['Message'], validate=True).decode('utf-8', errors='replace')
         except (KeyError, ValueError, TypeError):
-            raise PocError('Message body is not the expected base64 content.') from None
+            raise MessageParsingError('Message body is not the expected base64 content.') from None
         return {'message_id': message_id, 'subject': clean_text(data.get('topic', '')),
                 'sender': clean_text(data.get('senderName') or ' '.join(str(data.get(k) or '') for k in ('senderFirstName', 'senderLastName'))).strip(),
                 'sent_at': clean_text(data.get('sendDate', '')), 'text': html_to_text(html),

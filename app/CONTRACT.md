@@ -250,9 +250,26 @@ pre/post-application state reads remain in place; batch reads introduce no retry
 null. The local authenticated `/api/status` and synchronization panel expose
 only bounded technical invocation records: phase, lifecycle state, requested and
 received counts, duration, process exit code, tool started/completed counts.
+Optional closed fields add a safe error code, source kind, collection step and
+numeric HTTP status (100–599). Older records without these fields remain valid.
+Form invariant failures retain the compatibility code `calendar_form_invalid`
+in source health; local diagnostics distinguish each form rule and initial load,
+month selection and restoration. A restoration failure cannot replace a prior
+collection error; both attempts retain their own safe evidence. Shared calendar
+stages omit source kind because they collect events and substitutions together.
+Message failures distinguish timeout, connection, HTTP, parsing and unknown causes
+from exception types or structured metadata, never exception text. Process failure
+classification is shared by planner and Calendar calls and uses only stderr and
+protocol error fields, excluding model messages and tool result bodies.
 Each start is saved before launching the process and its end is saved on success,
 failure or interruption. Abandoned running records close as interrupted on the
-next locked run. The latest 512 records fit within 128 KiB; an omission counter
+next locked run. Source/message collection stages follow the same durable start/end
+contract: their requested/received counts describe one stage attempt/result, and
+tool counts are zero because these stages do not invoke Codex tools. A stage result
+does not imply completion of the whole source snapshot. Planner schema/process
+failures are failed invocations; subsequent semantic plan validation is a separate
+application failure after an invocation has returned its structured result.
+The latest records are bounded by both 512 entries and 128 KiB; an omission counter
 reports older technical records removed from an unusually large run. Run history
 keeps the existing 90-day retention. No event IDs, arguments, prompts, tool output
 or provider error strings enter diagnostics. Netdata files, thresholds, labels

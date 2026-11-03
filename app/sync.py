@@ -8,7 +8,7 @@ import threading
 import time
 from pathlib import Path
 from .core import AppStore, WARSAW, analysis_metadata, as_datetime, utcnow
-from .health_state import ERROR_CODES, error_code
+from .health_state import ERROR_CODES, error_code, collection_attempt
 
 
 def safe_error(error):
@@ -89,6 +89,9 @@ class SyncController:
         self.stage = stage
         self.store.sync_stage(self.run_id, stage)
 
+    def _collection_diagnostic(self, item):
+        self.store.record_sync_diagnostic(self.run_id, dict(item, phase=self.stage))
+
     def _in_window(self, value, cutoff):
         if not value:
             return True
@@ -101,7 +104,9 @@ class SyncController:
     def _source_collection(self, current):
         """Collect only; all three channels feed the one agenda task."""
         batch = None
+        previous_sink = getattr(self.client, 'collection_diagnostic_sink', None)
         try:
+            self.client.collection_diagnostic_sink = self._collection_diagnostic if getattr(self, 'run_id', None) else previous_sink
             batch = self.client.collect_sources(current=current, past_days=30, future_days=60)
             return self.store.ingest_sources(batch, current)
         except Exception as error:
@@ -120,6 +125,8 @@ class SyncController:
                 for key, value in (('source_last_collection_at', stamp), ('source_last_collection_result', 'failed'), ('source_last_error', next(iter(safe.values()), fallback))):
                     self.store.db.execute('INSERT OR REPLACE INTO settings VALUES (?,?)', (key, value))
             return {'status': 'partial', 'failures': 1}
+        finally:
+            self.client.collection_diagnostic_sink = previous_sink
 
     def reanalyze(self, message_ids, *, apply=False, current=None):
         return self._reanalyze_locked(message_ids, apply=apply, current=current)
@@ -233,7 +240,8 @@ class SyncController:
             pages_seen.add(page)
             last_page = page
             try:
-                snippets, total = self.client.messages(limit=page_size, page=page)
+                with collection_attempt(self._collection_diagnostic, source_kind='message', collection_step='message_list'):
+                    snippets, total = self.client.messages(limit=page_size, page=page)
             except Exception as error:
                 self.store.set_setting('last_error', safe_error(error))
                 result.update(status='partial', error_code=error_code(error, 'discovery'), error_stage='discovery')
@@ -275,8 +283,9 @@ class SyncController:
         unread_probe = None
         for message_id in selected[:self.max_messages]:
             try:
-                data = self.client.message(message_id)
-                changed = self.store.save_message(data)
+                with collection_attempt(self._collection_diagnostic, source_kind='message', collection_step='message_body'):
+                    data = self.client.message(message_id)
+                    changed = self.store.save_message(data)
                 result['fetched'] += 1
                 result['changed'] += int(changed)
                 snippet = snippets_by_id.get(message_id)
@@ -289,7 +298,8 @@ class SyncController:
         if unread_probe:
             # Observe the normal read's effect without changing the server read state.
             try:
-                after = self.client.message(unread_probe['message_id'])
+                with collection_attempt(self._collection_diagnostic, source_kind='message', collection_step='message_observation'):
+                    after = self.client.message(unread_probe['message_id'])
                 unread_probe['after_read_date'] = after.get('read_date_returned')
                 unread_probe['observation'] = 'unread_before_read_after' if unread_probe['after_read_date'] else 'no_read_date_observed'
                 self.store.set_setting('read_marking_observation', __import__('json').dumps(unread_probe))

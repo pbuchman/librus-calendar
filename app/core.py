@@ -368,7 +368,7 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
         with self.lock, self.db:
             abandoned = self.db.execute("SELECT id,started_at FROM sync_runs WHERE result='running'").fetchall()
             for row in abandoned:
-                self._close_sync_diagnostic(row['id'], 'interrupted')
+                self._close_sync_diagnostic(row['id'], 'interrupted', 'worker_interrupted')
                 duration = max(0, (datetime.fromisoformat(stamp) - datetime.fromisoformat(row['started_at'])).total_seconds())
                 self.db.execute("UPDATE sync_runs SET result='interrupted',error_code='worker_interrupted',finished_at=?,duration_seconds=? WHERE id=?", (stamp, duration, row['id']))
                 self.db.execute("UPDATE calendar_probe_attempts SET result='interrupted',safe_code='worker_interrupted',completed_at=? WHERE sync_run_id=? AND result='running'", (stamp, row['id']))
@@ -427,8 +427,15 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                 entries.append(metadata)
             else:
                 raise ValueError('Invocation must start durably.')
+            self._bound_sync_diagnostics(value)
             sync_diagnostics(value)
             self.db.execute('UPDATE sync_runs SET diagnostics=? WHERE id=?', (json.dumps(value), run_id))
+
+    @staticmethod
+    def _bound_sync_diagnostics(value):
+        while len(value['invocations']) > 512 or len(json.dumps(value)) > 131072:
+            value['invocations'].pop(0)
+            value['omitted_count'] += 1
 
     def sync_stage(self, run_id, stage):
         if stage not in STAGES:
@@ -436,12 +443,14 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
         with self.lock, self.db:
             self.db.execute("UPDATE sync_runs SET stage=? WHERE id=? AND result='running'", (stage, run_id))
 
-    def _close_sync_diagnostic(self, run_id, state):
+    def _close_sync_diagnostic(self, run_id, state, error_code=None):
         row = self.db.execute('SELECT diagnostics FROM sync_runs WHERE id=?', (run_id,)).fetchone()
         if row and row[0]:
             value = json.loads(row[0])
             if value['invocations'] and value['invocations'][-1]['state'] == 'running':
                 value['invocations'][-1]['state'] = state
+                value['invocations'][-1]['error_code'] = error_code or 'operation_failed'
+                self._bound_sync_diagnostics(value)
                 self.db.execute('UPDATE sync_runs SET diagnostics=? WHERE id=?', (json.dumps(value), run_id))
 
     def finish_sync_run(self, run_id, result, error_code=None, duration_seconds=None):
@@ -454,7 +463,7 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                 raise ValueError('Sync run is not active.')
             if duration_seconds is None:
                 duration_seconds = max(0, (datetime.fromisoformat(stamp) - datetime.fromisoformat(row['started_at'])).total_seconds())
-            self._close_sync_diagnostic(run_id, 'interrupted' if result == 'interrupted' else 'failed')
+            self._close_sync_diagnostic(run_id, 'interrupted' if result == 'interrupted' else 'failed', error_code)
             self.db.execute('UPDATE sync_runs SET finished_at=?,result=?,error_code=?,duration_seconds=? WHERE id=?', (stamp, result, error_code, duration_seconds, run_id))
             if result in ('failed', 'interrupted'):
                 self.db.execute('UPDATE calendar_probe_attempts SET completed_at=?,result=?,safe_code=? WHERE sync_run_id=? AND result=\'running\'',

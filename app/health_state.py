@@ -6,6 +6,8 @@ from pathlib import Path
 from .source_preview import PREVIEW_RETRY_SETTINGS, current_preview_sql, preview_queue_sql
 import sqlite3
 import re
+import time
+from contextlib import contextmanager
 
 RESULTS = frozenset(('idle', 'running', 'ok', 'partial', 'failed', 'interrupted', 'paused', 'dry_run'))
 COMPLETED_SYNC_RESULTS = frozenset(('ok', 'partial', 'failed', 'interrupted'))
@@ -37,6 +39,17 @@ PROBE_FIELDS = ('attempt_number', 'model', 'effort', 'cli_version', 'started_at'
 
 DIAGNOSTIC_FIELDS = frozenset({'phase', 'state', 'requested_count', 'received_count',
     'duration_seconds', 'process_code', 'started_count', 'completed_count'})
+DIAGNOSTIC_OPTIONAL_FIELDS = frozenset({'error_code', 'source_kind', 'collection_step', 'http_status'})
+FORM_DIAGNOSTIC_CODES = frozenset('calendar_form_' + suffix for suffix in (
+    'count', 'id', 'target', 'method', 'button', 'textarea', 'external_control', 'external_form',
+    'language_id', 'language_name', 'language_duplicate', 'language_empty', 'language_limit',
+    'learner_switch', 'select_name', 'select_duplicate', 'selected_count', 'selected_value',
+    'month_missing', 'year_missing', 'month_range', 'year_range', 'hidden_name',
+    'hidden_type', 'hidden_field', 'hidden_duplicate', 'token_missing'))
+MESSAGE_DIAGNOSTIC_CODES = frozenset('message_fetch_' + suffix for suffix in (
+    'timeout', 'connection', 'http', 'parsing', 'unknown'))
+COLLECTION_STEPS = frozenset(('learner', 'learner_check', 'announcement', 'calendar_initial',
+    'calendar_collect', 'calendar_select', 'calendar_restore', 'message_list', 'message_body', 'message_observation'))
 
 
 def sync_diagnostics(value):
@@ -48,9 +61,15 @@ def sync_diagnostics(value):
             or type(value['omitted_count']) is not int or value['omitted_count'] < 0):
         raise ValueError('Invalid sync diagnostics.')
     for item in value['invocations']:
-        if (not isinstance(item, dict) or set(item) != DIAGNOSTIC_FIELDS
+        if (not isinstance(item, dict) or not DIAGNOSTIC_FIELDS <= set(item)
+                or set(item) - DIAGNOSTIC_FIELDS - DIAGNOSTIC_OPTIONAL_FIELDS
                 or item['phase'] not in STAGES or item['state'] not in {'running','completed','failed','interrupted'}):
             raise ValueError('Invalid sync diagnostic fields.')
+        if ('error_code' in item and (not isinstance(item['error_code'], str) or item['error_code'] not in ERROR_CODES | SOURCE_ERROR_CODES | FORM_DIAGNOSTIC_CODES | MESSAGE_DIAGNOSTIC_CODES)
+                or 'source_kind' in item and (not isinstance(item['source_kind'], str) or item['source_kind'] not in SOURCE_KINDS)
+                or 'collection_step' in item and (not isinstance(item['collection_step'], str) or item['collection_step'] not in COLLECTION_STEPS)
+                or 'http_status' in item and (type(item['http_status']) is not int or not 100 <= item['http_status'] <= 599)):
+            raise ValueError('Invalid sync diagnostic detail.')
         for key in ('requested_count','received_count','started_count','completed_count'):
             if type(item[key]) is not int or not 0 <= item[key] <= 1000000:
                 raise ValueError('Invalid sync diagnostic count.')
@@ -62,6 +81,60 @@ def sync_diagnostics(value):
     if len(json.dumps(value)) > 131072:
         raise ValueError('Sync diagnostics exceed limit.')
     return value
+
+
+def failure_diagnostic(error, *, source_kind=None, collection_step=None):
+    """Classify trusted types/metadata only; exception text is never inspected."""
+    import requests
+    allowed = ERROR_CODES | SOURCE_ERROR_CODES | FORM_DIAGNOSTIC_CODES | MESSAGE_DIAGNOSTIC_CODES
+    code = getattr(error, 'diagnostic_code', None)
+    if not isinstance(code, str) or code not in allowed:
+        code = getattr(error, 'code', None)
+    if not isinstance(code, str) or code not in allowed:
+        code = 'source_collection_failed' if collection_step else 'codex_failed'
+    if not isinstance(error, Exception):
+        code = code if code in {'sync_timeout', 'sync_interrupted'} else 'sync_interrupted'
+    elif source_kind == 'message' and collection_step != 'message_list':
+        code = ('message_fetch_timeout' if isinstance(error, (TimeoutError, requests.exceptions.Timeout))
+            else 'message_fetch_http' if isinstance(error, requests.exceptions.HTTPError)
+            else 'message_fetch_connection' if isinstance(error, (ConnectionError, requests.exceptions.ConnectionError))
+            else 'message_fetch_parsing' if isinstance(error, (ValueError, TypeError, KeyError)) or code == 'message_fetch_parsing'
+            else 'message_fetch_unknown')
+    elif collection_step == 'message_list':
+        code = error_code(error, 'discovery')
+    result = {'error_code': code}
+    status = (getattr(getattr(error, 'response', None), 'status_code', None)
+              if isinstance(error, requests.exceptions.HTTPError) else getattr(error, 'http_status', None))
+    if type(status) is int and 100 <= status <= 599:
+        result['http_status'] = status
+    return result
+
+
+@contextmanager
+def collection_attempt(sink, *, source_kind=None, collection_step):
+    """Use the same sequential durable start/end contract as Codex invocations."""
+    metadata = dict(state='running', requested_count=1, received_count=0,
+                    duration_seconds=0.0, process_code=None, started_count=0, completed_count=0,
+                    collection_step=collection_step)
+    if source_kind is not None:
+        metadata['source_kind'] = source_kind
+    started = time.monotonic()
+    if sink:
+        sink(dict(metadata))
+    try:
+        yield
+    except BaseException as error:
+        metadata['state'] = 'failed' if isinstance(error, Exception) else 'interrupted'
+        metadata.update(failure_diagnostic(error, source_kind=source_kind, collection_step=collection_step))
+        if collection_step == 'calendar_collect' and getattr(error, 'collection_step', None) in COLLECTION_STEPS:
+            metadata['collection_step'] = error.collection_step
+        raise
+    else:
+        metadata.update(state='completed', received_count=1)
+    finally:
+        metadata['duration_seconds'] = min(max(0, time.monotonic()-started), 7*86400)
+        if sink:
+            sink(dict(metadata))
 
 
 def probe_metadata(value):

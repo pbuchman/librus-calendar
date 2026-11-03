@@ -54,15 +54,22 @@ class WebTests(unittest.TestCase):
                                 headers={'origin':origin},follow_redirects=False)
     def test_additive_technical_diagnostics_are_readable_in_panel_and_status(self):
         original=self.store.status
-        diagnostics={'invocations':[dict(phase='reconcile',state='failed',requested_count=10,
-            received_count=7,duration_seconds=3.25,process_code=-9,started_count=1,completed_count=0)],'omitted_count':0}
-        self.store.status=lambda:dict(original(),sync_diagnostics=diagnostics)
-        self.assertEqual(self.client.get('/api/status').json()['sync_diagnostics'],diagnostics)
-        response=self.client.get('/')
-        self.assertEqual(response.status_code,200)
-        self.assertIn('Diagnostyka ostatniej synchronizacji',response.text)
-        self.assertIn('10 / 7',response.text)
-        self.assertIn('reconcile',response.text)
+        legacy=dict(phase='reconcile',state='failed',requested_count=10,
+            received_count=7,duration_seconds=3.25,process_code=-9,started_count=1,completed_count=0)
+        for details in ({},dict(error_code='message_fetch_http',source_kind='message',collection_step='message_body',http_status=503)):
+            with self.subTest(enriched=bool(details)):
+                diagnostics={'invocations':[dict(legacy,**details)],'omitted_count':0}
+                self.store.status=lambda:dict(original(),sync_diagnostics=diagnostics)
+                self.assertEqual(self.client.get('/api/status').json()['sync_diagnostics'],diagnostics)
+                response=self.client.get('/')
+                self.assertEqual(response.status_code,200)
+                self.assertIn('Diagnostyka ostatniej synchronizacji',response.text)
+                self.assertIn('10 / 7',response.text)
+                self.assertIn('reconcile',response.text)
+                if details:
+                    self.assertIn('message_fetch_http',response.text)
+                    self.assertIn('message_body',response.text)
+                    self.assertIn('HTTP 503',response.text)
 
     def test_identity_and_socket_are_required(self):
         self.client.headers.pop('Tailscale-User-Login')
