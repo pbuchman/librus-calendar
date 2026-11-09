@@ -10,11 +10,11 @@ import requests
 
 from app.codex_runtime import CodexRuntime, RuntimeFailure
 from app.core import AppStore
-from app.health_state import sync_diagnostics
+from app.health_state import failure_diagnostic, sync_diagnostics
 from app.librus_client import LibrusClient
 from app.source_collectors import Document, SourceCollectionError, _calendar_form, collect_sources
 from app.sync import SyncController, SyncInterrupted
-from test_source_collectors import CURRENT, FakeClient as SchoolClient, calendar_page
+from test_source_collectors import CURRENT, FakeClient as SchoolClient, calendar_page, cancellation_row
 from test_support import TEST_CONFIG
 from test_sync import FakeClient, FakeRuntime
 from test_core import NOW
@@ -26,6 +26,79 @@ def diagnostic(**changes):
 
 
 class FormDiagnosticsTests(unittest.TestCase):
+    def test_form_count_records_actual_count(self):
+        for count in (0, 2, 3):
+            html = calendar_page()
+            if count == 0:
+                html = html[:html.index('<form')] + html[html.index('</form>') + 7:]
+            else:
+                html = html.replace('</body>', '<form></form>' * (count - 1) + '</body>')
+            with self.subTest(count=count), self.assertRaises(SourceCollectionError) as caught:
+                _calendar_form(Document(html))
+            self.assertEqual(failure_diagnostic(caught.exception)['evidence'], {'form_count': count})
+
+    def test_cell_structure_is_safe_and_primary_survives_restore_failure(self):
+        for failure_step in ('calendar_initial', 'calendar_select', 'both'):
+            client = SchoolClient()
+            records = []
+            client.collection_diagnostic_sink = lambda item: records.append(dict(item))
+            original_calendar, original_request = client.calendar, client.request
+            # Unknown names/values and private text must collapse to enum evidence.
+            row = cancellation_row().replace('<br>', '<br><private-tag private-attribute="PRIVATE">PRIVATE</private-tag>')
+            bad = lambda text: text.replace('<table></table>', '<table><tbody>' + row + '</tbody></table>', 1)
+            def calendar():
+                text = original_calendar()
+                return bad(text) if failure_step == 'calendar_initial' else text
+            def request(method, url, *, data):
+                previous = client.month
+                response = original_request(method, url, data=data)
+                if data['miesiac'] == '5' and previous == 4 and failure_step == 'both':
+                    response.text = response.text.replace('</body>', '<form></form></body>')
+                return response
+            client.calendar, client.request = calendar, request
+            # Put bad rows on an in-window date even in the earlier month.
+            if failure_step in ('calendar_select', 'both'):
+                client.events[(2028, 4)] = {16: row}
+            batch = collect_sources(client, current=CURRENT)
+            failures = [entry for entry in records if entry['state'] == 'failed']
+            with self.subTest(step=failure_step):
+                self.assertTrue(failures)
+                expected = 'calendar_select' if failure_step == 'both' else failure_step
+                self.assertEqual(failures[0]['collection_step'], expected)
+                self.assertEqual(failures[0]['error_code'], 'calendar_identity_unverified')
+                evidence = failures[0]['evidence']
+                self.assertEqual(evidence['provider_type'], 'cancelled_lessons')
+                self.assertEqual(evidence['child_tags'], ['br', 'other'])
+                self.assertEqual(evidence['tag_path'], ['div', 'table', 'tbody', 'tr', 'td'] if failure_step == 'calendar_initial' else ['div', 'table', 'tr', 'td'])
+                self.assertEqual(evidence['attribute_categories'], ['other', 'style'])
+                self.assertEqual(evidence['row_cell_count'], 1)
+                self.assertEqual(evidence['child_count'], 2)
+                self.assertEqual(batch['errors'], ['calendar_identity_unverified'])
+                if failure_step == 'both':
+                    self.assertEqual(failures[-1]['collection_step'], 'calendar_restore')
+                    self.assertEqual(failures[-1]['evidence'], {'form_count': 2})
+                for private in ('PRIVATE', 'private-tag', 'private-attribute', 'color', 'Example Teacher'):
+                    self.assertNotIn(private, json.dumps(records))
+
+    def test_restore_form_evidence_survives_wrapping_without_primary_error(self):
+        client = SchoolClient()
+        records = []
+        client.collection_diagnostic_sink = lambda item: records.append(dict(item))
+        original = client.request
+        def request(method, url, *, data):
+            previous = client.month
+            response = original(method, url, data=data)
+            if data['miesiac'] == '5' and previous == 7:
+                response.text = response.text.replace('</body>', '<form></form></body>')
+            return response
+        client.request = request
+        batch = collect_sources(client, current=CURRENT)
+        self.assertEqual(batch['errors'], ['calendar_restore_failed'])
+        failure, = [entry for entry in records if entry['state'] == 'failed']
+        self.assertEqual(failure['collection_step'], 'calendar_restore')
+        self.assertEqual(failure['error_code'], 'calendar_form_count')
+        self.assertEqual(failure['evidence'], {'form_count': 2})
+
     def test_restore_http_status_survives_wrapping_and_primary_failure_wins(self):
         for primary_failure in (False, True):
             client = SchoolClient()
@@ -129,13 +202,14 @@ class MessageDiagnosticsTests(unittest.TestCase):
             try:
                 school = SchoolClient()
                 original = school.calendar
-                school.calendar = lambda: original().replace('scheduleForm', 'PRIVATE')
+                school.calendar = lambda: original().replace('</body>', '<form id="PRIVATE"></form></body>')
                 client = FakeClient(count=0)
                 client.follow, client.request = school.follow, school.request
                 client.collect_sources = lambda **_: collect_sources(client, current=CURRENT)
                 SyncController(store, client, FakeRuntime(propose=False)).run(current=NOW)
                 saved = store.status()['sync_diagnostics']
-                self.assertTrue(any(item.get('error_code') == 'calendar_form_id' for item in saved['invocations']))
+                failure, = [item for item in saved['invocations'] if item.get('error_code') == 'calendar_form_count']
+                self.assertEqual(failure['evidence'], {'form_count': 2})
                 self.assertIsNone(getattr(client, 'collection_diagnostic_sink', None))
                 store.ingest_sources(collect_sources(SchoolClient(), current=CURRENT), NOW)
                 self.assertEqual(store.source_status()['health']['school_event']['last_result'], 'ok')
@@ -244,6 +318,31 @@ class ProcessDiagnosticsTests(unittest.TestCase):
 
 
 class DiagnosticStorageTests(unittest.TestCase):
+    def test_structure_evidence_is_closed_bounded_and_rejects_private_injection(self):
+        valid = {'tag_path': ['div', 'table', 'tr', 'td'], 'child_tags': ['br', 'other'],
+                 'attribute_categories': ['style', 'other'], 'provider_type': 'cancelled_lessons',
+                 'child_count': 2, 'row_cell_count': 1}
+        def validate(evidence):
+            return sync_diagnostics({'invocations': [diagnostic(evidence=evidence)], 'omitted_count': 0})
+        self.assertEqual(validate(valid)['invocations'][0]['evidence'], valid)
+        bad = [None, [], {}, {'raw': 'PRIVATE'}, dict(valid, raw='PRIVATE'),
+               dict(valid, tag_path=['PRIVATE']), dict(valid, tag_path=[]), dict(valid, tag_path=['td'] * 9),
+               dict(valid, tag_path=[{}]), dict(valid, child_tags=['PRIVATE']),
+               dict(valid, child_tags=['br', 'br']), dict(valid, child_tags=[{'tag': 'br'}]),
+               dict(valid, attribute_categories=['PRIVATE']), dict(valid, attribute_categories=['style', 'style']),
+               dict(valid, provider_type='PRIVATE'),
+               dict(valid, provider_type={}), dict(valid, child_count=-1), dict(valid, child_count=True),
+               dict(valid, child_count=1000001), dict(valid, row_cell_count=True),
+               dict(valid, row_cell_count=-1), dict(valid, row_cell_count=1000001),
+               {'form_count': True}, {'form_count': -1}, {'form_count': 1000001}, {'form_count': 'PRIVATE'},
+               {'evidence': {'form_count': 1}}]
+        for evidence in bad:
+            with self.subTest(evidence=evidence), self.assertRaises(ValueError):
+                validate(evidence)
+        error = SourceCollectionError('calendar_identity_unverified')
+        error.evidence = dict(valid, raw='PRIVATE')
+        self.assertNotIn('evidence', failure_diagnostic(error))
+
     def test_optional_fields_closed_values_and_old_records(self):
         old = {'invocations': [diagnostic()], 'omitted_count': 0}
         self.assertEqual(sync_diagnostics(old), old)
@@ -263,7 +362,8 @@ class DiagnosticStorageTests(unittest.TestCase):
                 for _ in range(520):
                     entry = diagnostic(state='running', source_kind='school_event', collection_step='calendar_restore')
                     store.record_sync_diagnostic(run, entry)
-                    store.record_sync_diagnostic(run, dict(entry, state='failed', error_code='calendar_form_hidden_type', http_status=503))
+                    store.record_sync_diagnostic(run, dict(entry, state='failed', error_code='calendar_form_count',
+                                                          http_status=503, evidence={'form_count': 2}))
                 store.record_sync_diagnostic(run, diagnostic(state='running'))
                 store.start_sync_run()
                 saved = json.loads(store.db.execute('SELECT diagnostics FROM sync_runs WHERE id=?', (run,)).fetchone()[0])

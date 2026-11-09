@@ -67,6 +67,39 @@ class Calendar:
 
 
 class AgendaIntegrationTests(AgendaTests):
+    def test_collected_cancellation_cannot_create_or_cancel_calendar_actions(self):
+        from app.source_collectors import collect_calendar
+        from test_source_collectors import CURRENT, FETCHED, FakeClient, cancellation_row
+        from test_agenda import LEARNER
+        client = FakeClient()
+        event = self.inventory()
+        before = [tuple(row) for row in self.store.db.execute('SELECT * FROM events')]
+        for operation in ('create', 'cancel'):
+            with self.subTest(operation=operation):
+                client.events = {(2028, 5): {16: cancellation_row().replace('Example subject', 'Example ' + operation + ' subject')}}
+                sources = collect_calendar(client, learner_id=LEARNER['id'], fetched_at=FETCHED,
+                                           start=CURRENT.date(), end=CURRENT.date() + timedelta(days=2))
+                source, = sources
+                self.assertEqual(source['kind'], 'substitution')
+                self.store.ingest_sources({'learner': LEARNER, 'sources': sources, 'complete_kinds': []}, NOW)
+                snapshot = self.snapshot({event['id']: event})
+                ref = next(entry for entry in snapshot['sources'] if entry['title'] == source['title'])
+                selected = item(snapshot, 'create' if operation == 'create' else 'review',
+                                sources=[{'source_id': ref['id'], 'source_hash': ref['content_hash']}],
+                                action=action() if operation == 'create' else None,
+                                action_id=None if operation == 'create' else 'existing-action',
+                                review_change=None if operation == 'create' else 'cancel')
+                result = materialize_plan(self.store, snapshot, plan(snapshot, [selected]),
+                                          {event['id']: event}, current=NOW)
+                self.assertFalse(result.get('reused', False))
+                self.assertEqual(result['items'][0]['operation'], 'ignore')
+                self.assertIsNone(result['items'][0]['proposal_id'])
+                self.assertEqual(self.store.list_proposals(), [])
+                self.store.set_writes_paused(False)
+                self.assertEqual(self.store.queue_operations(NOW), [])
+                self.assertEqual(self.store.pending_operations(), [])
+                self.assertEqual([tuple(row) for row in self.store.db.execute('SELECT * FROM events')], before)
+
     def ready(self):
         with self.store.db:
             self.store.db.execute("UPDATE settings SET value='ok' WHERE key='source_last_collection_result'")

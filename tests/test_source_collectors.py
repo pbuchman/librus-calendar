@@ -51,6 +51,10 @@ def calendar_cell(title='Synthetic science lesson', route='/terminarz/szczegoly/
     return '<tr><td' + onclick + ' title="' + escape(tooltip, quote=True) + '">' + escape(title) + '</td></tr>'
 
 
+def cancellation_row():
+    return '<tr><td style="color: gray">Odwołane zajęcia<br>Example Teacher na lekcji nr: 4 (Example subject)</td></tr>'
+
+
 def detail(published='2028-05-01 10:20:30'):
     return page('<table class="decorated"><tr><th colspan="2">Szczegóły</th></tr>' + ''.join(
         f'<tr><td>{key}</td><td>{value}</td></tr>' for key, value in [
@@ -192,6 +196,52 @@ class CalendarParserTests(unittest.TestCase):
         self.assertEqual(entries[0]['event_start'], '2028-05-16')
         self.assertEqual(entries[0]['published_at'], '2028-05-01T10:20:30+02:00')
 
+    def test_observed_cancellation_row_retains_full_informational_notice(self):
+        for row in (cancellation_row(), '<tbody>' + cancellation_row() + '</tbody>', cancellation_row().replace(' style="color: gray"', '')):
+            with self.subTest(tbody=row.startswith('<tbody>')):
+                unused, entries = self.parse(calendar_page(events={16: row}))
+                notice, = entries
+                self.assertEqual(notice['kind'], 'substitution')
+                self.assertEqual(notice['title'], 'Odwołane zajęcia Example Teacher na lekcji nr: 4 (Example subject)')
+                self.assertEqual(notice['event_start'], '2028-05-16')
+                self.assertTrue(notice['upstream_id'].startswith('metadata:'))
+                self.assertIsNone(notice['detail_path'])
+
+    def test_cancellation_lookalikes_and_active_or_nested_shapes_fail_closed(self):
+        row = cancellation_row()
+        variants = [
+            row.replace('Odwołane zajęcia', 'Notes about Odwołane zajęcia'),
+            row.replace('Odwołane zajęcia', 'odwołane zajęcia'),
+            row.replace('<br>', ' '),
+            row.replace('<br>', '<br><span>Extra</span>'),
+            row.replace('<br>', '<br><script>private</script>'),
+            row.replace('<br>', '<br><a href="https://external.example">Link</a>'),
+            row.replace('<br>', '<br><form></form>'),
+            row.replace('style="color: gray"', 'onclick="arbitrary()"'),
+            row.replace('<tr>', '<tr onclick="arbitrary()">'),
+            row.replace('</tr>', '<td>Extra cell</td></tr>'),
+            '<tr><td><table>' + row + '</table></td></tr>',
+            row.removeprefix('<tr>').removesuffix('</tr>'),
+            row.replace('Example Teacher na lekcji nr: 4 (Example subject)', ''),
+        ]
+        for value in variants:
+            with self.subTest(row=value), self.assertRaises(SourceCollectionError):
+                self.parse(calendar_page(events={16: value}))
+        # Color is presentation, never the provider identity.
+        unused, entries = self.parse(calendar_page(events={16: row.replace('color: gray', 'color: blue')}))
+        self.assertEqual(entries[0]['kind'], 'substitution')
+
+    def test_cancellation_does_not_bypass_month_validation(self):
+        with self.assertRaisesRegex(SourceCollectionError, 'calendar_month_incomplete'):
+            self.parse(calendar_page(events={16: cancellation_row()}, missing_day=31))
+
+    def test_duplicate_cancellation_metadata_still_fails_collection(self):
+        client = FakeClient()
+        client.events = {(2028, 5): {16: cancellation_row() * 2}}
+        batch = collect_sources(client, current=CURRENT)
+        self.assertEqual(batch['errors'], ['calendar_identity_ambiguous'])
+        self.assertEqual(batch['complete_kinds'], ['announcement'])
+
     def test_event_window_is_distinct_from_publication_window(self):
         html = calendar_page(events={1: calendar_cell(), 16: calendar_cell('Zastępstwo', None, 'old notice')})
         unused, entries = parse_calendar_month(html, start=date(2028, 5, 10), end=date(2028, 5, 20))
@@ -245,6 +295,22 @@ class CalendarParserTests(unittest.TestCase):
 
 
 class SourceCollectionTests(unittest.TestCase):
+    def test_cancellation_collection_retains_text_and_ambiguous_metadata_identity(self):
+        client = FakeClient()
+        client.events = {(2028, 5): {16: cancellation_row()}}
+        first = collect_sources(client, current=CURRENT)
+        second = collect_sources(client, current=CURRENT)
+        self.assertEqual(first['status'], 'ok')
+        source, = [source for source in first['sources'] if source['kind'] == 'substitution']
+        other, = [source for source in second['sources'] if source['kind'] == 'substitution']
+        self.assertEqual(source['id'], other['id'])
+        self.assertEqual(source['text'], source['title'])
+        self.assertIn('Example Teacher na lekcji nr: 4 (Example subject)', source['text'])
+        self.assertEqual(source['metadata']['event_start'], '2028-05-16')
+        self.assertEqual(source['metadata']['identity_basis'], 'metadata_key')
+        self.assertTrue(source['metadata']['identity_ambiguous'])
+        self.assertFalse(any('/szczegoly' in url for method, url in client.calls))
+
     def test_only_school_entries_gain_stable_observed_class_audience(self):
         from app.source_audience import AUDIENCE_KEY,valid_calendar_audience
         first=collect_sources(FakeClient(),current=CURRENT)

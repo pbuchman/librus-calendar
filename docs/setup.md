@@ -124,6 +124,22 @@ Probe audit rows contain technical metadata only: sync run/attempt identity, tim
 
 The retry policy covers this initial read probe only. It does not directly retry create/update/delete calls. When a write outcome is uncertain, retain the journal and use read-only reconciliation before any later decision to execute work.
 
+### Reproducing a rejected school-calendar row
+
+The existing synchronization diagnostics table shows an optional structural outline for rejected calendar identities/routes, and the actual form count for `calendar_form_count`. The outline is stored in the same bounded `sync_runs.diagnostics` history (at most 512 records and 128 KiB); older records without it remain readable. Initial reads, month selection and restoration preserve the safe evidence and the original primary failure.
+
+Cell evidence contains only closed enums and bounded counts: `tag_path` is the nearest eight ancestor/self tags ending at the cell (stopping at the day container); `child_tags` lists distinct direct child tag categories; `child_count` counts those direct element children; `row_cell_count` counts direct `td`/`th` children of the parent row. `attribute_categories` lists known attribute names present on the cell or its descendants. Unknown tag and attribute names collapse to `other`. `provider_type` is `cancelled_lessons`, `substitution` or `unknown`, based on a known leading provider heading. No raw HTML, text, IDs, dates, URLs, attribute values, class strings or style values are retained in diagnostic evidence.
+
+To make a fictional regression fixture, use the outline inside the existing `calendar_page` test helper. For example, `div / table / tbody / tr / td`, child tags `br`, attribute category `style`, type `cancelled_lessons`, child count 1 and row cell count 1 correspond to this shape inside the day container:
+
+```html
+<table><tbody><tr><td style="color: gray">Odwołane zajęcia<br>Example Teacher na lekcji nr: 4 (Example subject)</td></tr></tbody></table>
+```
+
+The helper already supplies the day container and its direct table. Pass only the inner `<tbody><tr>...</tr></tbody>` (or `<tr>...</tr>`) as `events={16: row}`; passing the whole table would create an intentionally rejected nested shape.
+
+Replace all narrative content with fictional text and use arbitrary presentation values. An `other` category deliberately cannot reconstruct the original name/value; investigate an unknown shape through an authorized private read before extending recognition. The accepted cancellation notice requires the exact leading `Odwołane zajęcia` heading separated by `br`, a direct single-cell day-table row, and inert text only. It is retained as an ambiguously identified informational substitution. It does not authorize personal Calendar creation or cancellation.
+
 ## Single-agenda operation
 
 Normal `sync` collects all required source kinds and reads current owned Calendar state before planning. Collection failure is not an empty successful source list. The selected learner/class must stay verified. The configured planner is `gpt-6.1-sol/high`; no per-source extractor/matcher/verifier chain or activation receipt is used.

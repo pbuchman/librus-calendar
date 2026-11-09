@@ -39,7 +39,12 @@ PROBE_FIELDS = ('attempt_number', 'model', 'effort', 'cli_version', 'started_at'
 
 DIAGNOSTIC_FIELDS = frozenset({'phase', 'state', 'requested_count', 'received_count',
     'duration_seconds', 'process_code', 'started_count', 'completed_count'})
-DIAGNOSTIC_OPTIONAL_FIELDS = frozenset({'error_code', 'source_kind', 'collection_step', 'http_status'})
+DIAGNOSTIC_OPTIONAL_FIELDS = frozenset({'error_code', 'source_kind', 'collection_step', 'http_status', 'evidence'})
+STRUCTURE_TAGS = frozenset(('html', 'body', 'div', 'table', 'tbody', 'thead', 'tfoot', 'tr',
+    'td', 'th', 'br', 'a', 'span', 'p', 'b', 'strong', 'script', 'form', 'input', 'select', 'other'))
+STRUCTURE_ATTRIBUTES = frozenset(('class', 'style', 'title', 'onclick', 'href', 'id', 'form', 'other'))
+CELL_EVIDENCE_FIELDS = frozenset(('tag_path', 'child_tags', 'attribute_categories',
+    'provider_type', 'child_count', 'row_cell_count'))
 FORM_DIAGNOSTIC_CODES = frozenset('calendar_form_' + suffix for suffix in (
     'count', 'id', 'target', 'method', 'button', 'textarea', 'external_control', 'external_form',
     'language_id', 'language_name', 'language_duplicate', 'language_empty', 'language_limit',
@@ -50,6 +55,32 @@ MESSAGE_DIAGNOSTIC_CODES = frozenset('message_fetch_' + suffix for suffix in (
     'timeout', 'connection', 'http', 'parsing', 'unknown'))
 COLLECTION_STEPS = frozenset(('learner', 'learner_check', 'announcement', 'calendar_initial',
     'calendar_collect', 'calendar_select', 'calendar_restore', 'message_list', 'message_body', 'message_observation'))
+
+
+def structural_evidence(value):
+    """Closed structural outline only; names/values/text from HTML never pass."""
+    if not isinstance(value, dict):
+        raise ValueError('Invalid structural evidence.')
+    if set(value) == {'form_count'}:
+        counts = ('form_count',)
+    elif set(value) == CELL_EVIDENCE_FIELDS:
+        counts = ('child_count', 'row_cell_count')
+        for key, allowed, limit in (('tag_path', STRUCTURE_TAGS, 8),
+                                    ('child_tags', STRUCTURE_TAGS, len(STRUCTURE_TAGS)),
+                                    ('attribute_categories', STRUCTURE_ATTRIBUTES, len(STRUCTURE_ATTRIBUTES))):
+            values = value[key]
+            if (not isinstance(values, list) or len(values) > limit
+                    or key == 'tag_path' and not values
+                    or any(not isinstance(entry, str) or entry not in allowed for entry in values)
+                    or key != 'tag_path' and len(values) != len(set(values))):
+                raise ValueError('Invalid structural evidence enum.')
+        if not isinstance(value['provider_type'], str) or value['provider_type'] not in {'cancelled_lessons', 'substitution', 'unknown'}:
+            raise ValueError('Invalid structural evidence type.')
+    else:
+        raise ValueError('Invalid structural evidence fields.')
+    if any(type(value[key]) is not int or not 0 <= value[key] <= 1000000 for key in counts):
+        raise ValueError('Invalid structural evidence count.')
+    return {key: list(entry) if isinstance(entry, list) else entry for key, entry in value.items()}
 
 
 def sync_diagnostics(value):
@@ -70,6 +101,8 @@ def sync_diagnostics(value):
                 or 'collection_step' in item and (not isinstance(item['collection_step'], str) or item['collection_step'] not in COLLECTION_STEPS)
                 or 'http_status' in item and (type(item['http_status']) is not int or not 100 <= item['http_status'] <= 599)):
             raise ValueError('Invalid sync diagnostic detail.')
+        if 'evidence' in item:
+            structural_evidence(item['evidence'])
         for key in ('requested_count','received_count','started_count','completed_count'):
             if type(item[key]) is not int or not 0 <= item[key] <= 1000000:
                 raise ValueError('Invalid sync diagnostic count.')
@@ -107,6 +140,12 @@ def failure_diagnostic(error, *, source_kind=None, collection_step=None):
               if isinstance(error, requests.exceptions.HTTPError) else getattr(error, 'http_status', None))
     if type(status) is int and 100 <= status <= 599:
         result['http_status'] = status
+    evidence = getattr(error, 'evidence', None)
+    if evidence is not None:
+        try:
+            result['evidence'] = structural_evidence(evidence)
+        except ValueError:
+            pass
     return result
 
 

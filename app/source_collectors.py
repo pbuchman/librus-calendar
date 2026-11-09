@@ -6,7 +6,7 @@ secrets or session URLs leave this module. Unknown markup is a failed collection
 not evidence that a source disappeared.
 """
 from calendar import monthrange
-from .health_state import collection_attempt, failure_diagnostic
+from .health_state import collection_attempt, failure_diagnostic, STRUCTURE_TAGS, STRUCTURE_ATTRIBUTES
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 from html import escape
@@ -31,10 +31,11 @@ class SourceCollectionError(PocError):
     """An allowlisted category, containing no provider content or request data."""
     code = 'source_collection_failed'
 
-    def __init__(self, code='source_collection_failed', *, diagnostic_code=None, http_status=None):
+    def __init__(self, code='source_collection_failed', *, diagnostic_code=None, http_status=None, evidence=None):
         self.code = code
         self.diagnostic_code = diagnostic_code or code
         self.http_status = http_status
+        self.evidence = evidence
         super().__init__(code)
 
 
@@ -258,7 +259,8 @@ def parse_learner_context(html):
 def _calendar_form(doc):
     forms = list(doc.root.walk('form'))
     if len(forms) != 1:
-        raise SourceCollectionError('calendar_form_invalid', diagnostic_code='calendar_form_count')
+        raise SourceCollectionError('calendar_form_invalid', diagnostic_code='calendar_form_count',
+                                    evidence={'form_count': len(forms)})
     if forms[0].attrs.get('id')!='scheduleForm':
         raise SourceCollectionError('calendar_form_invalid', diagnostic_code='calendar_form_id')
     form = forms[0]
@@ -331,6 +333,56 @@ def _calendar_form(doc):
     return {'year': selected['rok'], 'month': selected['miesiac'], 'hidden': hidden, 'choices': choices}
 
 
+def _is_cancellation_notice(cell, day):
+    """Only the observed provider-labelled, inert single-cell day-table row."""
+    row = cell.parent
+    if row is None or row.tag != 'tr' or row.attrs:
+        return False
+    parent = row.parent
+    if parent is not None and parent.tag == 'tbody' and not parent.attrs:
+        parent = parent.parent
+    if (parent is None or parent.tag != 'table' or parent.parent is not day
+            or set(parent.attrs) - {'class', 'style'}
+            or set(cell.attrs) - {'style'}
+            or [node for node in row.children if isinstance(node, Node)] != [cell]
+            or any(isinstance(node, str) and node.strip() for node in row.children)):
+        return False
+    children = [node for node in cell.children if isinstance(node, Node)]
+    if len(children) != 1 or children[0].tag != 'br' or children[0].attrs or children[0].children:
+        return False
+    separator = cell.children.index(children[0])
+    heading = _norm(''.join(cell.children[:separator]))
+    body = _norm(''.join(cell.children[separator + 1:]))
+    return heading == 'Odwołane zajęcia' and bool(body)
+
+
+def _calendar_cell_evidence(cell, day):
+    """Reduce provider markup to fixed enums and counts, excluding all values."""
+    path, current = [], cell
+    while current is not None:
+        path.append(current.tag if current.tag in STRUCTURE_TAGS else 'other')
+        if current is day or len(path) == 8:
+            break
+        current = current.parent
+    children = [node for node in cell.children if isinstance(node, Node)]
+    descendants = [cell, *cell.walk()]
+    attributes = {key if key in STRUCTURE_ATTRIBUTES else 'other' for node in descendants for key in node.attrs}
+    heading = []
+    for child in cell.children:
+        if isinstance(child, Node):
+            if child.tag != 'br':
+                heading = []
+            break
+        heading.append(child)
+    provider_type = {'Odwołane zajęcia': 'cancelled_lessons', 'Zastępstwo': 'substitution'}.get(_norm(''.join(heading)), 'unknown')
+    row = cell.parent
+    return {'tag_path': list(reversed(path)),
+            'child_tags': sorted({node.tag if node.tag in STRUCTURE_TAGS else 'other' for node in children}),
+            'attribute_categories': sorted(attributes), 'provider_type': provider_type,
+            'child_count': len(children),
+            'row_cell_count': sum(isinstance(node, Node) and node.tag in {'td', 'th'} for node in row.children) if row and row.tag == 'tr' else 0}
+
+
 def parse_calendar_month(html, *, start, end):
     doc = Document(html)
     form = _calendar_form(doc)
@@ -362,15 +414,15 @@ def parse_calendar_month(html, *, start, end):
             # The rendered text can concatenate the type and following lesson
             # number without whitespace ("Zastępstwo4."). This is the observed
             # type label inside a validated calendar event cell, not prose.
-            is_substitution = bool(re.search(r'zastępstwo', title, re.I))
+            is_substitution = bool(re.search(r'zastępstwo', title, re.I)) or _is_cancellation_notice(cell, day)
             if onclick and not match:
-                raise SourceCollectionError('calendar_detail_route_invalid')
+                raise SourceCollectionError('calendar_detail_route_invalid', evidence=_calendar_cell_evidence(cell, day))
             # Historical calendar entries can remain visible after their detail
             # action disappears. Accept only their observed event-cell shape,
             # retaining an explicitly ambiguous metadata identity for review.
             is_unlinked_event = (cell.has_class('no-border-left') and cell.has_class('no-border-right'))
             if not match and not is_substitution and not is_unlinked_event:
-                raise SourceCollectionError('calendar_identity_unverified')
+                raise SourceCollectionError('calendar_identity_unverified', evidence=_calendar_cell_evidence(cell, day))
             tooltip = html_to_text(cell.attrs.get('title', ''))
             published = re.search(r'Data dodania:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?)', tooltip, re.I)
             published = _date(published.group(1), with_time=True) if published else None
@@ -484,12 +536,19 @@ def collect_calendar(client, *, learner_id, fetched_at, start, end, learner=None
     try:
         with collection_attempt(sink, collection_step='calendar_collect'):
             for year, month in _months(start, end):
+                selected = False
                 if (form['year'], form['month']) != (year, month):
                     # A failed POST may still change the session view. Restore in
                     # finally even when parsing/verifying its response failed.
                     moved = True
                     html, form = _select_month(client, form, year, month)
-                form, entries = parse_calendar_month(html, start=start, end=end)
+                    selected = True
+                try:
+                    form, entries = parse_calendar_month(html, start=start, end=end)
+                except SourceCollectionError as error:
+                    if selected:
+                        error.collection_step = 'calendar_select'
+                    raise
                 if learner is not None and parse_learner_context(_read(client,'/informacja'))!=learner:
                     raise SourceCollectionError('learner_context_changed')
                 for entry in entries:
@@ -546,7 +605,8 @@ def collect_calendar(client, *, learner_id, fetched_at, start, end, learner=None
                         except Exception as error:
                             raise SourceCollectionError('calendar_restore_failed',
                                 diagnostic_code=getattr(error, 'diagnostic_code', 'calendar_restore_failed'),
-                                http_status=failure_diagnostic(error).get('http_status')) from None
+                                http_status=failure_diagnostic(error).get('http_status'),
+                                evidence=failure_diagnostic(error).get('evidence')) from None
                     if learner is not None and parse_learner_context(_read(client,'/informacja'))!=learner:
                         raise SourceCollectionError('learner_context_changed')
             except Exception:

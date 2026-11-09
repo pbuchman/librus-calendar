@@ -71,6 +71,28 @@ class WebTests(unittest.TestCase):
                     self.assertIn('message_body',response.text)
                     self.assertIn('HTTP 503',response.text)
 
+    def test_structural_diagnostics_render_in_existing_table(self):
+        original = self.store.status
+        evidence = {'tag_path': ['div', 'table', 'tr', 'td'], 'child_tags': ['br', 'other'],
+                    'attribute_categories': ['style', 'other'], 'provider_type': 'cancelled_lessons',
+                    'child_count': 2, 'row_cell_count': 1}
+        for outline in (evidence, {'form_count': 3}):
+            diagnostic = dict(phase='fetch', state='failed', requested_count=1, received_count=0,
+                duration_seconds=0.1, process_code=None, started_count=0, completed_count=0,
+                error_code='calendar_identity_unverified', evidence=outline)
+            self.store.status = lambda: dict(original(), sync_diagnostics={'invocations': [diagnostic], 'omitted_count': 0})
+            response = self.client.get('/')
+            self.assertEqual(response.status_code, 200)
+            self.assertIn('Struktura:', response.text)
+            if 'form_count' in outline:
+                self.assertIn('formularze: 3', response.text)
+            else:
+                self.assertIn('div / table / tr / td', response.text)
+                self.assertIn('cancelled_lessons', response.text)
+                self.assertIn('br, other', response.text)
+                self.assertIn('style, other', response.text)
+                self.assertIn('komórki wiersza: 1', response.text)
+
     def test_identity_and_socket_are_required(self):
         self.client.headers.pop('Tailscale-User-Login')
         self.assertEqual(self.client.get('/').status_code,403)
