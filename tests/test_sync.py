@@ -351,13 +351,25 @@ class SyncTests(unittest.TestCase):
         from app.cli import main
         from contextlib import redirect_stdout
         self.store.set_writes_paused(False)
-        with patch('app.librus_client.load_credentials', return_value={'login': 'synthetic-login', 'password': 'dummy-password'}), \
-                patch('app.librus_client.LibrusClient', return_value=FakeClient()), \
-                patch('app.codex_runtime.CodexRuntime', return_value=FakeRuntime(outcome='failed')):
+        client, runtime = FakeClient(), FakeRuntime(outcome='failed')
+        with patch('app.sync.datetime', wraps=datetime) as clock, \
+                patch('app.librus_client.load_credentials', return_value={'login': 'synthetic-login', 'password': 'dummy-password'}), \
+                patch('app.librus_client.LibrusClient', return_value=client), \
+                patch('app.codex_runtime.CodexRuntime', return_value=runtime):
+            clock.now.return_value = NOW
             output = io.StringIO()
             with redirect_stdout(output):
                 code = main(['--state', str(self.store.path), 'sync'], config=TEST_CONFIG)
             self.assertEqual(code, 1)
+            result = json.loads(output.getvalue())
+            self.assertEqual((result['status'], result['error_code']), ('partial', 'operations_pending'))
+            self.assertEqual(client.details, ['0'])
+            self.assertEqual(len(runtime.executed), 1)
+            self.assertEqual(runtime.executed[0]['action'], 'create')
+            operation, = self.store.db.execute('SELECT status,attempts,result FROM operations').fetchall()
+            self.assertEqual((operation['status'], operation['attempts']), ('pending', 1))
+            self.assertEqual(json.loads(operation['result'])['status'], 'failed')
+            self.assertEqual(result['state']['operations_pending'], 1)
             self.assertNotIn('PRIVATE', output.getvalue())
         with patch('app.librus_client.load_credentials', side_effect=FileNotFoundError('PRIVATE-FILE')):
             with redirect_stdout(io.StringIO()):
