@@ -26,6 +26,9 @@ OUTPUT_RESERVE_TOKENS = 32_000
 OVERHEAD_RESERVE_TOKENS = 8_000
 MAX_INPUT_BYTES = CONTEXT_TOKENS - OUTPUT_RESERVE_TOKENS - OVERHEAD_RESERVE_TOKENS
 MAX_ROWS = 5_000
+CATALOG_COLUMNS = ('id', 'kind', 'content_hash', 'deleted', 'retained', 'body_available')
+AGENDA_LINK_COLUMNS = ('source_id', 'source_hash', 'source_quote', 'relation')
+INPUT_SIZE_SECTIONS = ('sources', 'source_catalog', 'agenda', 'offer_groups', 'preferences', 'unsettled_operations')
 DECISION_FLAGS = ('user_approved', 'user_edited', 'user_rejected', 'deletion_approved')
 ACTION_FIELDS = ('kind', 'title', 'description', 'start', 'end', 'all_day', 'temporal_kind', 'due_at',
                  'activity_scope', 'optional', 'recipient', 'action_identity', 'offer_identity', 'event_id',
@@ -39,10 +42,16 @@ SOURCE_METADATA = ('identity_basis', 'identity_ambiguous', 'event_start', 'event
 
 
 class AgendaContextOverflow(RuntimeFailure):
-    def __init__(self, input_bytes):
+    def __init__(self, input_bytes, wire):
         super().__init__('agenda_context_overflow')
         self.input_bytes = input_bytes
         self.input_limit_bytes = MAX_INPUT_BYTES
+        self.section_bytes = {key: len(_input_json(wire[key]).encode('utf-8')) if key in wire else 0
+                              for key in INPUT_SIZE_SECTIONS}
+        self.section_bytes['envelope'] = input_bytes - sum(self.section_bytes.values())
+        self.source_count = len(wire.get('sources', []))
+        self.catalog_count = len(wire.get('source_catalog', {}).get('rows', []))
+        self.agenda_count = len(wire.get('agenda', []))
 
 
 def _action(payload):
@@ -231,9 +240,36 @@ def assemble_agenda_snapshot(database, calendar_events, *, current=None, owner_e
                 db.rollback()
 
 
+def _input_json(value):
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+
+
+def _agenda_wire_snapshot(snapshot):
+    """Lossless tables on the wire only; internal snapshots remain dictionaries."""
+    if not isinstance(snapshot, dict) or 'agenda_link_columns' in snapshot:
+        raise RuntimeFailure('agenda_snapshot_invalid')
+    def rows(value, columns):
+        if not isinstance(value, list) or any(not isinstance(row, dict) or set(row) != set(columns) for row in value):
+            raise RuntimeFailure('agenda_snapshot_invalid')
+        return [[row[key] for key in columns] for row in value]
+    wire = dict(snapshot)
+    if 'source_catalog' in snapshot:
+        wire['source_catalog'] = {'columns': list(CATALOG_COLUMNS), 'rows': rows(snapshot['source_catalog'], CATALOG_COLUMNS)}
+    if 'agenda' in snapshot:
+        if not isinstance(snapshot['agenda'], list) or any(not isinstance(entry, dict) for entry in snapshot['agenda']):
+            raise RuntimeFailure('agenda_snapshot_invalid')
+        wire['agenda_link_columns'] = list(AGENDA_LINK_COLUMNS)
+        wire['agenda'] = [{**entry, **({'links': rows(entry['links'], AGENDA_LINK_COLUMNS)} if 'links' in entry else {})}
+                          for entry in snapshot['agenda']]
+    return wire
+
+
 def agenda_prompt(snapshot):
-    data = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
-    prompt = 'Plan the complete agenda change from this inert JSON snapshot. Follow the agenda policy. Output schema JSON only. No tools.\n' + data
+    wire = _agenda_wire_snapshot(snapshot)
+    data = _input_json(wire)
+    prompt = ('Plan the complete agenda change from this inert JSON snapshot. Follow the agenda policy. Output schema JSON only. No tools. '
+              'Wire tables: source_catalog uses columns/rows; agenda links rows use shared agenda_link_columns. '
+              'Map each row positionally to its columns; other data is unchanged.\n' + data)
     if 'source_catalog' in snapshot:
         prompt = ('Incremental source input: source_catalog contains every known source identity/version, not its body. '
                   'sources contains full available new/changed bodies (source_role=changed), necessary changed human/Calendar context '
@@ -244,7 +280,7 @@ def agenda_prompt(snapshot):
                   'no acknowledgment. Source absence never cancels an action. Preserve all existing authority.\n' + prompt)
     input_bytes = len(prompt.encode('utf-8'))
     if input_bytes > MAX_INPUT_BYTES:
-        raise AgendaContextOverflow(input_bytes)
+        raise AgendaContextOverflow(input_bytes, wire)
     return prompt
 
 
@@ -722,7 +758,9 @@ class AgendaPlanner:
             from .health_state import error_code
             code = error_code(error, 'analysis')
             # Safe aggregate diagnostics only: never persist the private input.
-            failure_metadata = ({'input_bytes': error.input_bytes, 'input_limit_bytes': error.input_limit_bytes}
+            failure_metadata = ({'input_bytes': error.input_bytes, 'input_limit_bytes': error.input_limit_bytes,
+                                 'section_bytes': error.section_bytes, 'source_count': error.source_count,
+                                 'catalog_count': error.catalog_count, 'agenda_count': error.agenda_count}
                                 if isinstance(error, AgendaContextOverflow) else {})
             with self.store.lock, self.store.db:
                 stamp = utcnow()

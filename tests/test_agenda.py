@@ -171,6 +171,23 @@ class AgendaTests(unittest.TestCase):
             self.runtime(plan(snapshot, []), calls).plan_agenda(snapshot)
         self.assertEqual(calls, [])
 
+    def test_runtime_measures_and_hashes_the_actual_lossless_wire_request(self):
+        import hashlib
+        from app.agenda_incremental import assemble_incremental_snapshot
+        from test_agenda_wire import decode_wire, wire_data
+        snapshot, contract = assemble_incremental_snapshot(self.store, {}, current=NOW)
+        original = json.loads(json.dumps(snapshot))
+        calls = []
+        runtime = self.runtime(plan(snapshot, [item(snapshot, 'ignore', action=None)]), calls)
+        runtime.plan_agenda(snapshot)
+        prompt = agenda_prompt(snapshot)
+        self.assertEqual(calls[0][1], prompt)
+        self.assertEqual(runtime.last_agenda_metadata['input_bytes'], len(prompt.encode()))
+        self.assertEqual(runtime.last_agenda_metadata['request_hash'], hashlib.sha256(prompt.encode()).hexdigest())
+        self.assertEqual(contract['request_hash'], runtime.last_agenda_metadata['request_hash'])
+        self.assertEqual(decode_wire(wire_data(prompt)), original)
+        self.assertEqual(snapshot, original)
+
     def test_shared_verified_learner_keeps_complete_input_under_budget(self):
         sources = [{'kind': 'announcement', 'upstream_id': 'fictional-extra-%d' % index,
                     'learner_id': LEARNER['id'], 'title': 'Materiały', 'sender': 'Szkoła',

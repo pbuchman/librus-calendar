@@ -331,6 +331,35 @@ class AgendaIntegrationTests(AgendaTests):
         self.assertEqual(ledger, [tuple(row) for row in self.store.db.execute('SELECT * FROM agenda_processed_sources ORDER BY source_id')])
         self.assertEqual(runtime.writes, [])
 
+    def test_wire_policy_hash_invalidates_preview_without_replaying_processed_sources(self):
+        import tempfile
+        from pathlib import Path
+        from app.agenda import SCHEMAS
+        self.ready()
+        runtime = Calendar(lambda snapshot: [item(snapshot)] if snapshot['sources'] else [])
+        planner = AgendaPlanner(self.store, runtime)
+        with tempfile.TemporaryDirectory() as directory:
+            schemas = Path(directory)
+            for name in ('agenda_plan.md', 'agenda_plan.json'):
+                (schemas / name).write_text((SCHEMAS / name).read_text())
+            (schemas / 'agenda_plan.md').write_text('Fictional preceding wire policy.\n' + (SCHEMAS / 'agenda_plan.md').read_text())
+            with patch('app.agenda.SCHEMAS', schemas):
+                planner.run(NOW)
+                planner.run(NOW, preview=True)
+                previous = self.store.latest_agenda_plan(preview=True)
+        ledger = [tuple(row) for row in self.store.db.execute('SELECT * FROM agenda_processed_sources ORDER BY source_id')]
+        before_calls = runtime.calls
+        result = planner.run(NOW)
+        self.assertEqual(result['model_calls'], 1)
+        self.assertFalse(result['reused'])
+        self.assertEqual(runtime.calls, before_calls + 1)
+        self.assertEqual(result['source_count'], 0)
+        current = self.store.latest_agenda_plan()
+        self.assertNotEqual(previous['input_hash'], current['input_hash'])
+        self.assertNotEqual(previous['metadata']['request_hash'], current['metadata']['request_hash'])
+        self.assertEqual(ledger, [tuple(row) for row in self.store.db.execute('SELECT * FROM agenda_processed_sources ORDER BY source_id')])
+        self.assertEqual(runtime.writes, [])
+
     def approved_cancel(self):
         result, runtime, planner = self.apply(lambda snapshot: [item(snapshot)])
         self.store.set_writes_paused(False)
@@ -724,9 +753,11 @@ class AgendaIntegrationTests(AgendaTests):
         self.store.ingest_sources({'learner': {'id': 'fictional-child', 'class_id': '1x'},
             'sources': sources + [added], 'complete_kinds': ['announcement','school_event','substitution'], 'status':'ok'}, NOW)
         calls = runtime.calls
+        ledger = [tuple(row) for row in self.store.db.execute('SELECT * FROM agenda_processed_sources ORDER BY source_id')]
         with self.assertRaisesRegex(RuntimeFailure, 'agenda_context_overflow'):
             planner.run(NOW)
         self.assertEqual(runtime.calls, calls)
+        self.assertEqual(ledger, [tuple(row) for row in self.store.db.execute('SELECT * FROM agenda_processed_sources ORDER BY source_id')])
         self.assertEqual(len(self.store.list_actions()), 41)
         self.assertEqual(len(runtime.writes), 2)
         self.assertEqual(self.store.agenda_status()['latest_plan']['status'], 'failed')
@@ -735,11 +766,18 @@ class AgendaIntegrationTests(AgendaTests):
         self.assertEqual(failed['payload'], {})
         with patch('app.agenda.MAX_INPUT_BYTES', 1000000):
             from app.agenda_incremental import assemble_incremental_snapshot
-            full_input_bytes = len(agenda_prompt(assemble_incremental_snapshot(
-                self.store, runtime.events, current=NOW, enforce_budget=False)[0]).encode())
+            oversized = assemble_incremental_snapshot(self.store, runtime.events, current=NOW, enforce_budget=False)[0]
+            full_prompt = agenda_prompt(oversized)
+            full_input_bytes = len(full_prompt.encode())
+        wire = json.loads(full_prompt.rsplit('\n', 1)[1])
+        sections = {key: len(json.dumps(wire[key], ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode())
+                    for key in ('sources', 'source_catalog', 'agenda', 'offer_groups', 'preferences', 'unsettled_operations')}
+        sections['envelope'] = full_input_bytes - sum(sections.values())
         self.assertEqual(failed['metadata'], {
             'input_bytes': full_input_bytes,
-            'input_limit_bytes': 160000})
+            'input_limit_bytes': 160000,
+            'section_bytes': sections, 'source_count': len(oversized['sources']),
+            'catalog_count': len(oversized['source_catalog']), 'agenda_count': len(oversized['agenda'])})
 
     def test_exact_duplicate_create_plan_fails_before_persistence_or_queue(self):
         self.ready()

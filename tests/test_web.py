@@ -93,6 +93,35 @@ class WebTests(unittest.TestCase):
                 self.assertIn('style, other', response.text)
                 self.assertIn('komórki wiersza: 1', response.text)
 
+    def test_overflow_panel_renders_only_fixed_numeric_size_evidence(self):
+        original = self.store.status
+        sections = dict(sources=12000, source_catalog=10000, agenda=140000, offer_groups=200,
+                        preferences=100, unsettled_operations=2, envelope=800)
+        metadata = dict(input_bytes=163102, input_limit_bytes=160000, section_bytes=sections,
+                        source_count=17, catalog_count=133, agenda_count=70, private_field='PRIVATE_VALUE')
+        sections['PRIVATE_KEY'] = 'PRIVATE_VALUE'
+        for evidence in (metadata, {}, dict(metadata, input_bytes='PRIVATE_VALUE', input_limit_bytes=True,
+                                            section_bytes={'agenda': 'PRIVATE_VALUE', 'sources': True}, source_count={'text': 'PRIVATE_VALUE'}),
+                         dict(metadata, input_bytes=-1, input_limit_bytes=2**63, source_count=True,
+                              catalog_count=5001, agenda_count=1.5, section_bytes={'agenda': 2**63, 'sources': -1})):
+            self.store.status = lambda: dict(original(), agenda={'latest_plan': {
+                'status': 'failed', 'error_code': 'agenda_context_overflow', 'metadata': evidence}})
+            response = self.client.get('/')
+            self.assertEqual(response.status_code, 200)
+            self.assertIn('agenda_context_overflow', response.text)
+            self.assertNotIn('PRIVATE', response.text)
+            if evidence is metadata:
+                self.assertIn('163102 / 160000 B', response.text)
+                for key, value in sections.items():
+                    if key != 'PRIVATE_KEY':
+                        self.assertIn('%s: %d B' % (key, value), response.text)
+                self.assertIn('source_count: 17', response.text)
+            elif evidence:
+                self.assertNotIn('sources: True', response.text)
+                self.assertNotIn('sources: -1', response.text)
+                self.assertNotIn('catalog_count: 5001', response.text)
+                self.assertNotIn(str(2**63), response.text)
+
     def test_identity_and_socket_are_required(self):
         self.client.headers.pop('Tailscale-User-Login')
         self.assertEqual(self.client.get('/').status_code,403)

@@ -16,7 +16,12 @@
 {% else %}{{ item.evidence.tag_path|join(' / ') }} · typ: {{ item.evidence.provider_type }} · elementy: {{ item.evidence.child_tags|join(', ') or '—' }} ({{ item.evidence.child_count }}) · atrybuty: {{ item.evidence.attribute_categories|join(', ') or '—' }} · komórki wiersza: {{ item.evidence.row_cell_count }}{% endif %}
 </small>{% endif %}</td><td>{{ item.started_count }} / {{ item.completed_count }}</td></tr>{% endfor %}</tbody></table></details>{% endif %}
 {% if notice %}<p class="notice" role="status">{{ {'sync':'Zlecono sprawdzenie nowych wiadomości.', 'writes':'Zmieniono ustawienie zapisu do kalendarza.', 'resolved':'Zapisano Twoją decyzję. Zmiany w kalendarzu wykona najbliższe sprawdzenie.'}.get(notice, '') }}</p>{% endif %}
-{% if status.agenda and status.agenda.latest_plan and status.agenda.latest_plan.error_code %}<p class="error" role="alert">Planowanie agendy nie powiodło się: {{ status.agenda.latest_plan.error_code }}</p>{% endif %}
+{% if status.agenda and status.agenda.latest_plan and status.agenda.latest_plan.error_code %}<p class="error" role="alert">Planowanie agendy nie powiodło się: {{ status.agenda.latest_plan.error_code }}
+{% set failure = status.agenda.latest_plan %}{% if failure.error_code == 'agenda_context_overflow' and failure.metadata is mapping %}{% set sizes = failure.metadata %}
+{% if sizes.input_bytes is integer and 0 <= sizes.input_bytes < 9223372036854775808 and sizes.input_limit_bytes is integer and 0 <= sizes.input_limit_bytes < 9223372036854775808 %}<small>Wejście / limit: {{ sizes.input_bytes }} / {{ sizes.input_limit_bytes }} B</small>{% endif %}
+{% if sizes.section_bytes is mapping %}<small>{% for section in ('sources', 'source_catalog', 'agenda', 'offer_groups', 'preferences', 'unsettled_operations', 'envelope') %}{% set amount = sizes.section_bytes.get(section) %}{% if amount is integer and 0 <= amount < 9223372036854775808 %}{{ section }}: {{ amount }} B · {% endif %}{% endfor %}</small>{% endif %}
+<small>{% for field in ('source_count', 'catalog_count', 'agenda_count') %}{% set amount = sizes.get(field) %}{% if amount is integer and 0 <= amount <= 5000 %}{{ field }}: {{ amount }} · {% endif %}{% endfor %}</small>
+{% endif %}</p>{% endif %}
 {% if status.last_error %}<p class="error" role="alert">Ostatnie sprawdzenie nie powiodło się. {{ status.last_error }}</p>{% endif %}
 {% if status.operations_unknown %}<p class="error">{{ status.operations_unknown }} operacji wymaga sprawdzenia wyniku w kalendarzu. Nie zostaną powtórzone automatycznie.</p>{% endif %}
 {% if section in ('sources', 'preview') %}{% include 'sources.html' %}{% elif section == 'messages' %}
