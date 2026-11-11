@@ -26,6 +26,85 @@ def diagnostic(**changes):
 
 
 class FormDiagnosticsTests(unittest.TestCase):
+    def form_evidence(self, html):
+        with self.assertRaises(SourceCollectionError) as caught:
+            _calendar_form(Document(html))
+        self.assertEqual(caught.exception.code, 'calendar_form_invalid')
+        self.assertEqual(caught.exception.diagnostic_code, 'calendar_form_count')
+        evidence = failure_diagnostic(caught.exception)['evidence']
+        self.assertIn('forms', evidence)
+        return evidence
+
+    def test_duplicate_forms_describe_calendar_and_unknown_without_private_content(self):
+        extra = ('<div id="PRIVATE-location"><form id="PRIVATE-id" action="/PRIVATE-route?secret=PRIVATE-query" '
+                 'method="get"><input name="PRIVATE-name" value="PRIVATE-value">'
+                 '<input type="password" name="PRIVATE-password"><input type="hidden" name="PRIVATE-token" '
+                 'value="PRIVATE-secret"><select name="PRIVATE-choice"><option>PRIVATE-person</option></select>'
+                 '<button>PRIVATE-text</button><textarea>PRIVATE-body</textarea></form></div>')
+        evidence = self.form_evidence(calendar_page().replace('</body>', extra + '</body>'))
+        self.assertEqual(evidence['form_count'], 2)
+        self.assertEqual(evidence['omitted_form_count'], 0)
+        first, second = evidence['forms']
+        self.assertEqual(first, dict(position=1, identity_category='expected_calendar_id',
+            action_category='calendar', method='post', tag_path=['html', 'body', 'form'],
+            control_count=3, control_types={'input_hidden': 1, 'select': 2},
+            field_categories={'request_token': 1, 'month': 1, 'year': 1}))
+        self.assertEqual(second, dict(position=2, identity_category='other_id',
+            action_category='same_origin_other', method='get', tag_path=['html', 'body', 'div', 'form'],
+            control_count=6, control_types={'input_text': 1, 'input_password': 1, 'input_hidden': 1,
+                                          'select': 1, 'button': 1, 'textarea': 1},
+            field_categories={'other': 6}))
+        self.assertNotIn('PRIVATE', json.dumps(evidence))
+        self.assertNotIn('synthetic-form-key', json.dumps(evidence))
+        self.assertNotIn('scheduleForm', json.dumps(evidence))
+        self.assertNotIn('https:', json.dumps(evidence))
+        sync_diagnostics({'invocations': [diagnostic(evidence=evidence)], 'omitted_count': 0})
+
+    def test_form_descriptors_classify_only_observed_routes_fields_and_types(self):
+        extras = [
+            ('<form action="/ogloszenia" method="POST"><select id="language" name="Język"></select></form>',
+             'known_source', 'post', {'language': 1}),
+            ('<form action="https://external.example/PRIVATE" method="PRIVATE"><input type="PRIVATE"></form>',
+             'untrusted', 'other', {'other': 1}),
+            ('<form action="https://[PRIVATE" method="dialog"></form>', 'invalid', 'dialog', {}),
+            ('<form action="/terminarz?PRIVATE"><input type="text" name="requestkey"></form>',
+             'same_origin_other', 'get', {'other': 1}),
+            ('<form><select name="miesiac"></select><select name="rok"></select></form>',
+             'calendar', 'get', {'month': 1, 'year': 1}),
+        ]
+        for extra, action, method, fields in extras:
+            with self.subTest(action=action):
+                evidence = self.form_evidence(calendar_page().replace('</body>', extra + '</body>'))
+                descriptor = evidence['forms'][1]
+                self.assertEqual(descriptor['identity_category'], 'missing_id')
+                self.assertEqual(descriptor['action_category'], action)
+                self.assertEqual(descriptor['method'], method)
+                self.assertEqual(descriptor['field_categories'], fields)
+                self.assertNotIn('PRIVATE', json.dumps(evidence))
+        self.assertEqual(descriptor['control_types'], {'select': 2})
+
+    def test_form_evidence_has_explicit_bounds_and_nearest_form_control_ownership(self):
+        html = calendar_page().replace('</body>', '<div>' * 12 + '<form><input><form><textarea></textarea></form>'
+                                       '</form>' + '</div>' * 12 + '<form></form>' * 20 + '</body>')
+        evidence = self.form_evidence(html)
+        self.assertEqual(evidence['form_count'], 23)
+        self.assertEqual(len(evidence['forms']), 16)
+        self.assertEqual(evidence['omitted_form_count'], 7)
+        outer, nested = evidence['forms'][1:3]
+        self.assertEqual(outer['control_count'], 1)
+        self.assertEqual(nested['control_count'], 1)
+        self.assertEqual(outer['tag_path'], ['div'] * 7 + ['form'])
+        self.assertEqual(nested['tag_path'], ['div'] * 6 + ['form', 'form'])
+
+    def test_valueless_attributes_cannot_replace_form_count_failure(self):
+        extra = '<form id action method><input type name value><select name></select></form>'
+        evidence = self.form_evidence(calendar_page().replace('</body>', extra + '</body>'))
+        second = evidence['forms'][1]
+        self.assertEqual(second['method'], 'other')
+        self.assertEqual(second['action_category'], 'invalid')
+        self.assertEqual(second['control_types'], {'input_other': 1, 'select': 1})
+        self.assertEqual(second['field_categories'], {'other': 2})
+
     def test_form_count_records_actual_count(self):
         for count in (0, 2, 3):
             html = calendar_page()
@@ -35,7 +114,10 @@ class FormDiagnosticsTests(unittest.TestCase):
                 html = html.replace('</body>', '<form></form>' * (count - 1) + '</body>')
             with self.subTest(count=count), self.assertRaises(SourceCollectionError) as caught:
                 _calendar_form(Document(html))
-            self.assertEqual(failure_diagnostic(caught.exception)['evidence'], {'form_count': count})
+            evidence = failure_diagnostic(caught.exception)['evidence']
+            self.assertEqual(evidence['form_count'], count)
+            self.assertEqual(len(evidence['forms']), count)
+            self.assertEqual(evidence['omitted_form_count'], 0)
 
     def test_cell_structure_is_safe_and_primary_survives_restore_failure(self):
         for failure_step in ('calendar_initial', 'calendar_select', 'both'):
@@ -76,7 +158,8 @@ class FormDiagnosticsTests(unittest.TestCase):
                 self.assertEqual(batch['errors'], ['calendar_identity_unverified'])
                 if failure_step == 'both':
                     self.assertEqual(failures[-1]['collection_step'], 'calendar_restore')
-                    self.assertEqual(failures[-1]['evidence'], {'form_count': 2})
+                    self.assertEqual(failures[-1]['evidence']['form_count'], 2)
+                    self.assertEqual(len(failures[-1]['evidence']['forms']), 2)
                 for private in ('PRIVATE', 'private-tag', 'private-attribute', 'color', 'Example Teacher'):
                     self.assertNotIn(private, json.dumps(records))
 
@@ -97,7 +180,8 @@ class FormDiagnosticsTests(unittest.TestCase):
         failure, = [entry for entry in records if entry['state'] == 'failed']
         self.assertEqual(failure['collection_step'], 'calendar_restore')
         self.assertEqual(failure['error_code'], 'calendar_form_count')
-        self.assertEqual(failure['evidence'], {'form_count': 2})
+        self.assertEqual(failure['evidence']['form_count'], 2)
+        self.assertEqual(len(failure['evidence']['forms']), 2)
 
     def test_restore_http_status_survives_wrapping_and_primary_failure_wins(self):
         for primary_failure in (False, True):
@@ -209,7 +293,8 @@ class MessageDiagnosticsTests(unittest.TestCase):
                 SyncController(store, client, FakeRuntime(propose=False)).run(current=NOW)
                 saved = store.status()['sync_diagnostics']
                 failure, = [item for item in saved['invocations'] if item.get('error_code') == 'calendar_form_count']
-                self.assertEqual(failure['evidence'], {'form_count': 2})
+                self.assertEqual(failure['evidence']['form_count'], 2)
+                self.assertEqual(len(failure['evidence']['forms']), 2)
                 self.assertIsNone(getattr(client, 'collection_diagnostic_sink', None))
                 store.ingest_sources(collect_sources(SchoolClient(), current=CURRENT), NOW)
                 self.assertEqual(store.source_status()['health']['school_event']['last_result'], 'ok')
@@ -318,6 +403,40 @@ class ProcessDiagnosticsTests(unittest.TestCase):
 
 
 class DiagnosticStorageTests(unittest.TestCase):
+    def test_form_evidence_sanitizer_checks_nested_enums_counts_and_consistency(self):
+        form = dict(position=1, identity_category='expected_calendar_id', action_category='calendar',
+                    method='post', tag_path=['html', 'body', 'form'], control_count=3,
+                    control_types={'input_hidden': 1, 'select': 2},
+                    field_categories={'request_token': 1, 'month': 1, 'year': 1})
+        valid = dict(form_count=2, forms=[form, dict(form, position=2)], omitted_form_count=0)
+        def validate(evidence):
+            return sync_diagnostics({'invocations': [diagnostic(evidence=evidence)], 'omitted_count': 0})
+        self.assertEqual(validate(valid)['invocations'][0]['evidence'], valid)
+        # Legacy count-only records remain readable.
+        self.assertEqual(validate({'form_count': 2})['invocations'][0]['evidence'], {'form_count': 2})
+        bad_forms = [dict(form, raw='PRIVATE'), dict(form, identity_category='PRIVATE'),
+            dict(form, identity_category=[]), dict(form, action_category='PRIVATE'),
+            dict(form, method='PRIVATE'), dict(form, method={}), dict(form, tag_path=['PRIVATE']),
+            dict(form, tag_path=[]), dict(form, tag_path=['div'] * 8 + ['form']),
+            dict(form, tag_path=['html', 'body']), dict(form, position=True), dict(form, position=2),
+            dict(form, control_count=True), dict(form, control_count=1000001),
+            dict(form, control_types={'PRIVATE': 3}), dict(form, control_types={'input_text': True}),
+            dict(form, control_types={'input_text': 0}), dict(form, control_types={'input_text': 2}),
+            dict(form, control_types=[]), dict(form, field_categories={'PRIVATE': 3}),
+            dict(form, field_categories={'month': -1}), dict(form, field_categories={'month': 2}),
+            dict(form, field_categories={'month': 1000001}), dict(form, field_categories='PRIVATE')]
+        bad = [dict(valid, forms=[entry, dict(form, position=2)]) for entry in bad_forms]
+        bad += [dict(valid, raw='PRIVATE'), dict(valid, forms={}), dict(valid, forms=[None]),
+                dict(valid, omitted_form_count=True), dict(valid, omitted_form_count=-1),
+                dict(valid, omitted_form_count=1000001), dict(valid, omitted_form_count=1),
+                dict(valid, forms=[dict(form, position=i+1) for i in range(17)], form_count=17),
+                dict(valid, forms=[form], form_count=2, omitted_form_count=1)]
+        for evidence in bad:
+            with self.subTest(evidence=evidence), self.assertRaises(ValueError):
+                validate(evidence)
+            error = SourceCollectionError('calendar_form_invalid', evidence=evidence)
+            self.assertNotIn('evidence', failure_diagnostic(error))
+
     def test_structure_evidence_is_closed_bounded_and_rejects_private_injection(self):
         valid = {'tag_path': ['div', 'table', 'tr', 'td'], 'child_tags': ['br', 'other'],
                  'attribute_categories': ['style', 'other'], 'provider_type': 'cancelled_lessons',

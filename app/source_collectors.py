@@ -6,7 +6,8 @@ secrets or session URLs leave this module. Unknown markup is a failed collection
 not evidence that a source disappeared.
 """
 from calendar import monthrange
-from .health_state import collection_attempt, failure_diagnostic, STRUCTURE_TAGS, STRUCTURE_ATTRIBUTES
+from .health_state import (collection_attempt, failure_diagnostic, STRUCTURE_TAGS, STRUCTURE_ATTRIBUTES,
+                           MAX_FORM_DESCRIPTORS, FORM_CONTROL_TYPES, FORM_METHODS)
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 from html import escape
@@ -256,11 +257,68 @@ def parse_learner_context(html):
             'selected_only': True}
 
 
+def _form_action_category(form):
+    # The same strict origin/route rules as collection; never expose the URL.
+    try:
+        action = form.attrs.get('action', '')
+        if not isinstance(action, str):
+            return 'invalid'
+        target = urlsplit(urljoin(ORIGIN + '/terminarz', action))
+        if _trusted_view_url(target.geturl(), '/terminarz'):
+            return 'calendar'
+        if any(_trusted_view_url(target.geturl(), path) for path in ('/ogloszenia', '/informacja', '/rodzic/index')):
+            return 'known_source'
+        if (target.scheme == 'https' and target.hostname == 'synergia.librus.pl'
+                and target.port in (None, 443) and target.username is None and target.password is None):
+            return 'same_origin_other'
+        return 'untrusted'
+    except (ValueError, TypeError):
+        return 'invalid'
+
+
+def _calendar_forms_evidence(forms):
+    """Inert, bounded form signatures; recognition never authorizes a form."""
+    descriptors = []
+    for position, form in enumerate(forms[:MAX_FORM_DESCRIPTORS], 1):
+        path, current = [], form
+        while current is not None and current.tag and len(path) < 8:
+            path.append(current.tag if current.tag in STRUCTURE_TAGS else 'other')
+            current = current.parent
+        control_types, fields = {}, {}
+        for node in form.walk():
+            if node.tag not in {'input', 'select', 'button', 'textarea'} or node.ancestor('form') is not form:
+                continue
+            control_type = node.tag
+            if node.tag == 'input':
+                input_type = node.attrs.get('type', 'text')
+                control_type = 'input_' + input_type.casefold() if isinstance(input_type, str) else 'input_other'
+                if control_type not in FORM_CONTROL_TYPES:
+                    control_type = 'input_other'
+            control_types[control_type] = control_types.get(control_type, 0) + 1
+            field = 'other'
+            if node.tag == 'select':
+                field = {'miesiac': 'month', 'rok': 'year'}.get(node.attrs.get('name'), 'other')
+                if node.attrs.get('id') == 'language' and node.attrs.get('name') == 'Język':
+                    field = 'language'
+            elif control_type == 'input_hidden' and node.attrs.get('name') == 'requestkey':
+                field = 'request_token'
+            fields[field] = fields.get(field, 0) + 1
+        raw_method = form.attrs.get('method', 'get')
+        method = raw_method.lower() if isinstance(raw_method, str) else 'other'
+        descriptors.append(dict(position=position,
+            identity_category='expected_calendar_id' if form.attrs.get('id') == 'scheduleForm'
+                else ('other_id' if form.attrs.get('id') else 'missing_id'),
+            action_category=_form_action_category(form), method=method if method in FORM_METHODS else 'other',
+            tag_path=list(reversed(path)), control_count=sum(control_types.values()),
+            control_types=control_types, field_categories=fields))
+    return dict(form_count=len(forms), forms=descriptors, omitted_form_count=len(forms) - len(descriptors))
+
+
 def _calendar_form(doc):
     forms = list(doc.root.walk('form'))
     if len(forms) != 1:
         raise SourceCollectionError('calendar_form_invalid', diagnostic_code='calendar_form_count',
-                                    evidence={'form_count': len(forms)})
+                                    evidence=_calendar_forms_evidence(forms))
     if forms[0].attrs.get('id')!='scheduleForm':
         raise SourceCollectionError('calendar_form_invalid', diagnostic_code='calendar_form_id')
     form = forms[0]

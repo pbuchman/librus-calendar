@@ -45,6 +45,16 @@ STRUCTURE_TAGS = frozenset(('html', 'body', 'div', 'table', 'tbody', 'thead', 't
 STRUCTURE_ATTRIBUTES = frozenset(('class', 'style', 'title', 'onclick', 'href', 'id', 'form', 'other'))
 CELL_EVIDENCE_FIELDS = frozenset(('tag_path', 'child_tags', 'attribute_categories',
     'provider_type', 'child_count', 'row_cell_count'))
+MAX_FORM_DESCRIPTORS = 16
+FORM_EVIDENCE_FIELDS = frozenset(('form_count', 'forms', 'omitted_form_count'))
+FORM_DESCRIPTOR_FIELDS = frozenset(('position', 'identity_category', 'action_category', 'method',
+    'tag_path', 'control_count', 'control_types', 'field_categories'))
+FORM_IDENTITIES = frozenset(('expected_calendar_id', 'missing_id', 'other_id'))
+FORM_ACTIONS = frozenset(('calendar', 'known_source', 'same_origin_other', 'untrusted', 'invalid'))
+FORM_METHODS = frozenset(('get', 'post', 'dialog', 'other'))
+FORM_CONTROL_TYPES = frozenset(('input_hidden', 'input_text', 'input_password', 'input_search',
+    'input_checkbox', 'input_radio', 'input_submit', 'input_button', 'input_other', 'select', 'button', 'textarea'))
+FORM_FIELD_CATEGORIES = frozenset(('month', 'year', 'request_token', 'language', 'other'))
 FORM_DIAGNOSTIC_CODES = frozenset('calendar_form_' + suffix for suffix in (
     'count', 'id', 'target', 'method', 'button', 'textarea', 'external_control', 'external_form',
     'language_id', 'language_name', 'language_duplicate', 'language_empty', 'language_limit',
@@ -57,11 +67,49 @@ COLLECTION_STEPS = frozenset(('learner', 'learner_check', 'announcement', 'calen
     'calendar_collect', 'calendar_select', 'calendar_restore', 'message_list', 'message_body', 'message_observation'))
 
 
+def _form_evidence(value):
+    """Validate every nested field before evidence reaches storage or the panel."""
+    if any(type(value[key]) is not int or not 0 <= value[key] <= 1000000
+           for key in ('form_count', 'omitted_form_count')):
+        raise ValueError('Invalid form evidence count.')
+    forms = value['forms']
+    if (not isinstance(forms, list) or len(forms) != min(value['form_count'], MAX_FORM_DESCRIPTORS)
+            or value['omitted_form_count'] != value['form_count'] - len(forms)):
+        raise ValueError('Invalid form evidence bounds.')
+    result = []
+    for position, form in enumerate(forms, 1):
+        if not isinstance(form, dict) or set(form) != FORM_DESCRIPTOR_FIELDS:
+            raise ValueError('Invalid form evidence fields.')
+        if type(form['position']) is not int or form['position'] != position:
+            raise ValueError('Invalid form evidence position.')
+        for key, allowed in (('identity_category', FORM_IDENTITIES), ('action_category', FORM_ACTIONS),
+                             ('method', FORM_METHODS)):
+            if not isinstance(form[key], str) or form[key] not in allowed:
+                raise ValueError('Invalid form evidence enum.')
+        path = form['tag_path']
+        if (not isinstance(path, list) or not 1 <= len(path) <= 8 or path[-1] != 'form'
+                or any(not isinstance(tag, str) or tag not in STRUCTURE_TAGS for tag in path)):
+            raise ValueError('Invalid form evidence path.')
+        if type(form['control_count']) is not int or not 0 <= form['control_count'] <= 1000000:
+            raise ValueError('Invalid form evidence control count.')
+        for key, allowed in (('control_types', FORM_CONTROL_TYPES), ('field_categories', FORM_FIELD_CATEGORIES)):
+            counts = form[key]
+            if (not isinstance(counts, dict) or set(counts) - allowed
+                    or any(type(count) is not int or not 1 <= count <= 1000000 for count in counts.values())
+                    or sum(counts.values()) != form['control_count']):
+                raise ValueError('Invalid form evidence control categories.')
+        result.append(dict(form, tag_path=list(path), control_types=dict(form['control_types']),
+                           field_categories=dict(form['field_categories'])))
+    return dict(form_count=value['form_count'], forms=result, omitted_form_count=value['omitted_form_count'])
+
+
 def structural_evidence(value):
     """Closed structural outline only; names/values/text from HTML never pass."""
     if not isinstance(value, dict):
         raise ValueError('Invalid structural evidence.')
-    if set(value) == {'form_count'}:
+    if set(value) == FORM_EVIDENCE_FIELDS:
+        return _form_evidence(value)
+    elif set(value) == {'form_count'}:
         counts = ('form_count',)
     elif set(value) == CELL_EVIDENCE_FIELDS:
         counts = ('child_count', 'row_cell_count')
