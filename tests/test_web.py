@@ -71,6 +71,22 @@ class WebTests(unittest.TestCase):
                     self.assertIn('message_body',response.text)
                     self.assertIn('HTTP 503',response.text)
 
+    def test_batch_retry_attempts_and_recovery_render_in_existing_diagnostics(self):
+        original=self.store.status
+        base=dict(phase='reconcile',requested_count=1,received_count=0,duration_seconds=1.0,
+                  process_code=0,started_count=0,completed_count=0,batch_index=2,
+                  parse_error_count=0,unknown_event_count=0,incomplete_count=0,
+                  turn_completed=True,final_answer_classification='exact_ok_true')
+        diagnostics={'invocations':[
+            dict(base,state='failed',attempt_number=1,retry_decision='retry',recovered=False,error_code='unexpected_tool_count'),
+            dict(base,state='completed',attempt_number=2,retry_decision='not_needed',recovered=True,received_count=1,completed_count=1)],'omitted_count':0}
+        self.store.status=lambda:dict(original(),sync_diagnostics=diagnostics)
+        self.assertEqual(self.client.get('/api/status').json()['sync_diagnostics'],diagnostics)
+        text=self.client.get('/').text
+        for expected in ('Partia 2 · próba 1','Partia 2 · próba 2','Odzyskano po ponowieniu',
+                         'retry','not_needed','exact_ok_true','Parser: 0 / 0 / 0','Tura zakończona: tak'):
+            self.assertIn(expected,text)
+
     def test_structural_diagnostics_render_in_existing_table(self):
         original = self.store.status
         evidence = {'tag_path': ['div', 'table', 'tr', 'td'], 'child_tags': ['br', 'other'],

@@ -52,7 +52,7 @@ Real synchronization requires your Librus account, a supported authenticated Cod
 
 Writes start paused. An initial `sync --dry-run` can still read Librus and invoke AI/calendar read tools; it is not the offline demo. Check the recognized actions and runtime probe before enabling writes.
 
-Analysis and calendar tools default to `gpt-6.1-sol` with `high` reasoning. Only the initial calendar-list probe may retry once after five seconds for a verified unexpected completed tool-call count (zero or multiple). Calendar writes are never retried by this probe policy; uncertain writes require read-only reconciliation. See [probe behavior and diagnostics](docs/setup.md#calendar-probe-and-safe-diagnostics).
+Analysis and calendar tools default to `gpt-6.1-sol` with `high` reasoning. The initial calendar-list probe may retry once after five seconds for a verified unexpected completed tool-call count (zero or multiple). Batch reads have a separate budget of one additional invocation per entire sync run, only for a clean zero-call failure; both attempts and validated recovery appear in local diagnostics. Calendar writes are never retried by these policies; uncertain writes require read-only reconciliation. See [probe behavior and diagnostics](docs/setup.md#calendar-probe-and-safe-diagnostics).
 
 ## Privacy and limitations
 

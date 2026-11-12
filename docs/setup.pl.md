@@ -49,7 +49,7 @@ Panel pokazuje wynik próby ostatniego przebiegu synchronizacji (`running`, `ok`
 
 Historia prób przechowuje wyłącznie techniczne metadane: identyfikator przebiegu/próby, czasy, skonfigurowany model/poziom, zweryfikowaną wersję CLI, wynik, kod procesu/dozwolony kod błędu, liczniki wywołań/protokołu i flagi zgodności oczekiwanego wywołania. Nie zawiera ID kalendarzy, argumentów/wyników narzędzi, wiadomości, promptów, tokenów ani surowych błędów i wygasa po 90 dniach. Monitoring eksportuje tylko pięć pól zbiorczych. Zacznij od lokalnego statusu zainstalowanego CLI, panelu, stanu usług i oczyszczonych metadanych. Udostępniaj tylko kategorie wyniku/błędu i liczniki; nie publikuj zrzutu bazy ani transkryptów Codex. Samodzielna próba konfiguracji czyta kalendarz, ale nie tworzy dowodów przebiegu synchronizacji.
 
-Zasada ponowienia dotyczy tylko tego początkowego odczytu. Nie ponawia bezpośrednio tworzenia, aktualizacji ani usuwania. Niepewny zapis wymaga zachowania dziennika i sprawdzenia wyniku odczytem przed późniejszą decyzją o wykonaniu pracy.
+Początkowy odczyt zachowuje własną zasadę ponowienia. Odczyt partii dopuszcza też jedno dodatkowe wywołanie na cały przebieg synchronizacji, wyłącznie przy poprawnym zakończeniu procesu bez żadnego wywołania narzędzia; dotychczasowy panel diagnostyczny i API pokazują obie próby oraz odzyskanie po walidacji. Ponowienia partii korzystają z dotychczasowego limitu czasu przebiegu i nie powtarzają udanych partii ani pojedynczych odczytów. Żadna z tych zasad nie ponawia bezpośrednio tworzenia, aktualizacji ani usuwania. Niepewny zapis wymaga zachowania dziennika i sprawdzenia wyniku odczytem przed późniejszą decyzją o wykonaniu pracy.
 
 ## Obsługa jednej agendy
 

@@ -39,7 +39,9 @@ PROBE_FIELDS = ('attempt_number', 'model', 'effort', 'cli_version', 'started_at'
 
 DIAGNOSTIC_FIELDS = frozenset({'phase', 'state', 'requested_count', 'received_count',
     'duration_seconds', 'process_code', 'started_count', 'completed_count'})
-DIAGNOSTIC_OPTIONAL_FIELDS = frozenset({'error_code', 'source_kind', 'collection_step', 'http_status', 'evidence'})
+DIAGNOSTIC_OPTIONAL_FIELDS = frozenset({'error_code', 'source_kind', 'collection_step', 'http_status', 'evidence',
+    'batch_index', 'attempt_number', 'retry_decision', 'recovered', 'parse_error_count',
+    'unknown_event_count', 'incomplete_count', 'turn_completed', 'final_answer_classification'})
 STRUCTURE_TAGS = frozenset(('html', 'body', 'div', 'table', 'tbody', 'thead', 'tfoot', 'tr',
     'td', 'th', 'br', 'a', 'span', 'p', 'b', 'strong', 'script', 'form', 'input', 'select', 'other'))
 STRUCTURE_ATTRIBUTES = frozenset(('class', 'style', 'title', 'onclick', 'href', 'id', 'form', 'other'))
@@ -149,6 +151,18 @@ def sync_diagnostics(value):
                 or 'collection_step' in item and (not isinstance(item['collection_step'], str) or item['collection_step'] not in COLLECTION_STEPS)
                 or 'http_status' in item and (type(item['http_status']) is not int or not 100 <= item['http_status'] <= 599)):
             raise ValueError('Invalid sync diagnostic detail.')
+        for key in ('batch_index', 'parse_error_count', 'unknown_event_count', 'incomplete_count'):
+            if key in item and (type(item[key]) is not int or not (1 if key == 'batch_index' else 0) <= item[key] <= 1000000):
+                raise ValueError('Invalid sync diagnostic parser count.')
+        if 'attempt_number' in item and (type(item['attempt_number']) is not int or item['attempt_number'] not in (1, 2)):
+            raise ValueError('Invalid sync diagnostic attempt.')
+        for key in ('turn_completed', 'recovered'):
+            if key in item and type(item[key]) is not bool:
+                raise ValueError('Invalid sync diagnostic flag.')
+        for key, allowed in (('retry_decision', {'pending', 'retry', 'exhausted', 'not_eligible', 'not_needed'}),
+                             ('final_answer_classification', {'missing', 'exact_ok_true', 'exact_ok_false', 'other', 'multiple'})):
+            if key in item and (not isinstance(item[key], str) or item[key] not in allowed):
+                raise ValueError('Invalid sync diagnostic classification.')
         if 'evidence' in item:
             structural_evidence(item['evidence'])
         for key in ('requested_count','received_count','started_count','completed_count'):

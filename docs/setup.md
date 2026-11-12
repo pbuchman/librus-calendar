@@ -122,7 +122,7 @@ The panel reports the latest sync run's probe result (`running`, `ok`, `failed` 
 
 Probe audit rows contain technical metadata only: sync run/attempt identity, timestamps, configured model/effort, validated CLI version, result, process/error codes, tool-call/protocol counts and expected-call validation flags. They contain no calendar IDs, tool arguments/results, messages, prompts, tokens or raw errors, and expire after 90 days. Monitoring exports only the five aggregate fields, never those rows. Check private installed CLI status, the panel, service state and sanitized aggregates first. Share only technical result/error categories and counts; do not dump the database or Codex transcripts into an issue. A standalone setup probe performs a calendar read but does not create sync-run audit evidence.
 
-The retry policy covers this initial read probe only. It does not directly retry create/update/delete calls. When a write outcome is uncertain, retain the journal and use read-only reconciliation before any later decision to execute work.
+This initial probe retains its own retry policy. Batch reads also allow one additional invocation per complete sync run for a clean zero-call failure only; the existing diagnostics panel/API show both attempts and validated recovery. Batch retries share the existing whole-sync deadline and never repeat successful batches or individual reads. Neither policy directly retries create/update/delete calls. When a write outcome is uncertain, retain the journal and use read-only reconciliation before any later decision to execute work.
 
 ### Reproducing a rejected school-calendar row
 

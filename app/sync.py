@@ -162,6 +162,9 @@ class SyncController:
                     if self.runtime_factory is not None:
                         self._stage('runtime')
                         self.runtime = self.runtime_factory()
+                    reset_batch_retry = getattr(self.runtime, 'reset_batch_retry_budget', None)
+                    if reset_batch_retry is not None:
+                        reset_batch_retry(deadline=self._run_deadline)
                     self.runtime.invocation_sink = lambda item: self.store.record_sync_diagnostic(self.run_id, dict(item, phase=self.stage))
                     self._stage('calendar_probe')
                     self.runtime.probe_attempt_sink = lambda attempt: self.store.record_probe_attempt(self.run_id, attempt)

@@ -244,14 +244,32 @@ sibling in its requested position. Mixed reordered/error batches and authenticat
 errors fail closed. Both batch and individual reads use the same existing
 all-day midnight normalization, including DST boundaries. Individual `read_event`
 remains the prewrite/write-verification mechanism. Full fresh planning and
-pre/post-application state reads remain in place; batch reads introduce no retry.
+pre/post-application state reads remain in place. A sync run permits one additional
+`batch_read_event` invocation across all batches and all `read_events` calls, after
+five seconds within the existing whole-sync deadline. Only `unexpected_tool_count`
+with process exit 0, zero started/completed calls and zero parse/unknown/incomplete
+records qualifies. Protocol/process failures, observed calls, malformed results,
+individual reads and writes never qualify. The failed batch alone runs again in a
+fresh ephemeral session with the same request. A failed retry or another eligible
+failure after that run's budget is spent raises normally. Standalone runtime use
+keeps the same one-retry budget until `reset_batch_retry_budget()` is called.
+The initial Calendar access probe retains its separate existing retry policy.
 
 `sync_runs.diagnostics` is an additive nullable JSON column. Legacy rows remain
 null. The local authenticated `/api/status` and synchronization panel expose
 only bounded technical invocation records: phase, lifecycle state, requested and
 received counts, duration, process exit code, tool started/completed counts.
 Optional closed fields add a safe error code, source kind, collection step and
-numeric HTTP status (100–599). Older records without these fields remain valid.
+numeric HTTP status (100–599). Calendar invocations may also record parser counts,
+completed-turn presence and a structural final-answer category: `missing`,
+`exact_ok_true`, `exact_ok_false`, `other` or `multiple`. Exact means a single-key
+JSON object with a boolean `ok`; duplicate keys, other types/keys, invalid JSON and
+answers over 4096 characters are `other`. No answer text is retained or classified
+by meaning. A model answer of `{"ok":true}` never substitutes for an actual tool
+result. Batch records add a run-local batch index, attempt 1/2, retry decision
+(`pending`, `retry`, `exhausted`, `not_eligible`, `not_needed`) and a recovery flag.
+Recovery requires complete validated batch coverage and event normalization.
+Older records without these fields remain valid.
 Form invariant failures retain the compatibility code `calendar_form_invalid`
 in source health; local diagnostics distinguish each form rule and initial load,
 month selection and restoration. A restoration failure cannot replace a prior
@@ -262,7 +280,11 @@ from exception types or structured metadata, never exception text. Process failu
 classification is shared by planner and Calendar calls and uses only stderr and
 protocol error fields, excluding model messages and tool result bodies.
 Each start is saved before launching the process and its end is saved on success,
-failure or interruption. Abandoned running records close as interrupted on the
+failure or interruption. Each retry has its own durable start/end record; a sink
+failure blocks further dispatch. Only the full sync result updates last-success
+and consecutive-failure state; recovery followed by a later failure is not a
+successful synchronization. Both attempts are visible in the same panel/API.
+Abandoned running records close as interrupted on the
 next locked run. Source/message collection stages follow the same durable start/end
 contract: their requested/received counts describe one stage attempt/result, and
 tool counts are zero because these stages do not invoke Codex tools. A stage result

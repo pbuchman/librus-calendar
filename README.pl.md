@@ -52,7 +52,7 @@ Rzeczywista synchronizacja wymaga konta Librus, obsługiwanego i zalogowanego ś
 
 Zapisy są początkowo wstrzymane. Pierwsze `sync --dry-run` może nadal czytać Librusa i wywoływać AI oraz narzędzia odczytu kalendarza; nie jest to demo offline. Sprawdź rozpoznane działania i wynik testu środowiska przed włączeniem zapisów.
 
-Analiza i narzędzia kalendarza domyślnie używają `gpt-6.1-sol` z rozumowaniem `high`. Wyłącznie początkowe odczytowe sprawdzenie listy kalendarzy może być ponowione raz po pięciu sekundach przy zweryfikowanej nieoczekiwanej liczbie zakończonych wywołań narzędzia (zero lub wiele). Ta zasada nie ponawia zapisów; niepewny zapis wymaga sprawdzenia wyniku w trybie odczytu. Zobacz [sprawdzanie kalendarza i bezpieczną diagnostykę](docs/setup.pl.md#sprawdzanie-kalendarza-i-bezpieczna-diagnostyka).
+Analiza i narzędzia kalendarza domyślnie używają `gpt-6.1-sol` z rozumowaniem `high`. Początkowe odczytowe sprawdzenie listy kalendarzy może być ponowione raz po pięciu sekundach przy zweryfikowanej nieoczekiwanej liczbie zakończonych wywołań narzędzia (zero lub wiele). Odczyt partii ma osobny limit jednego dodatkowego wywołania na cały przebieg synchronizacji, tylko przy poprawnym zakończeniu procesu bez wywołania narzędzia; obie próby i odzyskanie po walidacji są widoczne w lokalnej diagnostyce. Te zasady nie ponawiają zapisów; niepewny zapis wymaga sprawdzenia wyniku w trybie odczytu. Zobacz [sprawdzanie kalendarza i bezpieczną diagnostykę](docs/setup.pl.md#sprawdzanie-kalendarza-i-bezpieczna-diagnostyka).
 
 ## Prywatność i ograniczenia
 
