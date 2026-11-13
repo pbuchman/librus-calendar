@@ -39,8 +39,9 @@ current=..., owner_email=...)` is a pure read helper. It accepts an existing SQL
 read-only connection; never instantiate AppStore for a production planning POC.
 Supply a fresh managed Calendar map; failed reads must abort instead of becoming
 `None`. It returns `(snapshot, contract)`. The snapshot is the model input; the
-contract stays local. Use `agenda_prompt(snapshot)` and the unchanged 160000-byte
-cap. Nothing truncates or pages whole agenda state. `enforce_budget=False` is only
+contract stays local. Use `agenda_prompt(snapshot)` and the 320000-byte operational
+cap on the complete UTF-8 request. This byte cap is not a provider token-capacity
+estimate. Nothing truncates or pages whole agenda state. `enforce_budget=False` is only
 for inspection, never for invoking a provider.
 
 `contract.local_state_hash` is a CAS digest of complete local source content,

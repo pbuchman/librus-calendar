@@ -46,6 +46,21 @@ def decode_wire(wire):
 
 
 class AgendaWireTests(unittest.TestCase):
+    def test_complete_utf8_request_accepts_previous_failure_and_exact_new_limit(self):
+        from unittest.mock import patch
+        for target_bytes in (161040, 320000):
+            with self.subTest(input_bytes=target_bytes):
+                snapshot = fictional_snapshot()
+                snapshot['sources'][0]['text'] = 'Pełny tekst żółwia. '
+                with patch('app.agenda.MAX_INPUT_BYTES', 1000000):
+                    initial_bytes = len(agenda_prompt(snapshot).encode('utf-8'))
+                snapshot['sources'][0]['text'] += 'x' * (target_bytes - initial_bytes)
+                original = copy.deepcopy(snapshot)
+                prompt = agenda_prompt(snapshot)
+                self.assertEqual(len(prompt.encode('utf-8')), target_bytes)
+                self.assertEqual(decode_wire(wire_data(prompt)), original)
+                self.assertEqual(snapshot, original)
+
     def test_near_cap_full_dictionary_input_fits_losslessly_on_wire(self):
         snapshot = fictional_snapshot()
         snapshot['sources'][0]['text'] += 'x' * (MAX_INPUT_BYTES + 2000 - json_bytes(snapshot))
@@ -111,7 +126,7 @@ class AgendaWireTests(unittest.TestCase):
         with patch('app.agenda.MAX_INPUT_BYTES', 1000000):
             prompt = agenda_prompt(snapshot)
         self.assertEqual(error.input_bytes, len(prompt.encode()))
-        self.assertEqual(error.input_limit_bytes, 160000)
+        self.assertEqual(error.input_limit_bytes, 320000)
         self.assertEqual(set(error.section_bytes), {'sources', 'source_catalog', 'agenda', 'offer_groups',
                                                   'preferences', 'unsettled_operations', 'envelope'})
         self.assertEqual(sum(error.section_bytes.values()), error.input_bytes)

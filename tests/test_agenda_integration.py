@@ -8,7 +8,7 @@ from datetime import timedelta
 from unittest.mock import patch
 
 from test_agenda import AgendaTests, NOW, action, item, plan
-from app.agenda import AgendaPlanner, assemble_agenda_snapshot, materialize_plan, agenda_prompt
+from app.agenda import AgendaPlanner, assemble_agenda_snapshot, materialize_plan, agenda_prompt, MAX_INPUT_BYTES
 from app.codex_runtime import event_fingerprint, RuntimeFailure
 from app.sync import SyncController
 from test_support import TEST_CONFIG
@@ -710,7 +710,7 @@ class AgendaIntegrationTests(AgendaTests):
         with self.store.db:
             for index in range(32):
                 raw = dict(action(), title='Fikcyjny istniejący obowiązek %d' % index,
-                           description='Opis zachowany. ' * 35, user_approved=True, source_quote='Historyczny cytat. ' * 20)
+                           description='Opis zachowany. ' * 350, user_approved=True, source_quote='Historyczny cytat. ' * 20)
                 self.store.db.execute('INSERT INTO canonical_actions VALUES (?,?,?,?,?)',
                     ('legacy-%d' % index, 'legacy-proposal-%d' % index, json.dumps(raw), 'applied', NOW.isoformat()))
             row = self.store.db.execute("SELECT id,payload FROM sources WHERE kind='announcement'").fetchone()
@@ -718,10 +718,10 @@ class AgendaIntegrationTests(AgendaTests):
             payload['text'] = 'Pełny fikcyjny tekst. ' * 3000
             self.store.db.execute('UPDATE sources SET payload=? WHERE id=?', (json.dumps(payload), row['id']))
         self.ready()
-        # Match the measured private input size using fictional padding, then
-        # exercise the same two-create/seven-review growth without dropping text.
+        # Leave 12 kB below the operational cap using fictional padding, then
+        # exercise two-create/seven-review growth without dropping text.
         current_size = len(agenda_prompt(self.snapshot()).encode())
-        payload['text'] += 'x' * (148000 - current_size)
+        payload['text'] += 'x' * (308000 - current_size)
         with self.store.db:
             if len(payload['text']) > 90000:
                 other = self.store.db.execute("SELECT id,payload FROM sources WHERE kind='school_event'").fetchone()
@@ -735,15 +735,15 @@ class AgendaIntegrationTests(AgendaTests):
             item(snapshot, 'review', review_change='create', action=dict(action(), title='Do decyzji %d' % index)) for index in range(9)])
         after = len(agenda_prompt(self.snapshot()).encode())
         self.assertGreater(after, before)
-        self.assertGreaterEqual(before, 148000)
-        self.assertLess(after, 160000)
+        self.assertGreaterEqual(before, 308000)
+        self.assertLess(after, MAX_INPUT_BYTES)
         self.store.set_writes_paused(False)
         self.assertEqual(len(self.execute_pending(runtime, planner)), 2)
-        self.assertLess(len(agenda_prompt(self.snapshot(runtime.events)).encode()), 160000)
+        self.assertLess(len(agenda_prompt(self.snapshot(runtime.events)).encode()), MAX_INPUT_BYTES)
         self.assertEqual(planner.run(NOW)['model_calls'], 0)
         with self.store.db:
             self.store.db.execute("UPDATE sources SET content_hash='next-version' WHERE kind='announcement'")
-        self.assertLess(len(agenda_prompt(self.snapshot(runtime.events)).encode()), 160000)
+        self.assertLess(len(agenda_prompt(self.snapshot(runtime.events)).encode()), MAX_INPUT_BYTES)
         self.assertEqual(len(self.store.list_actions()), 41)
         # One additional ordinary full source can exceed this deliberately tight
         # fixture. Fail visibly before another model call or local/Calendar write.
@@ -775,9 +775,47 @@ class AgendaIntegrationTests(AgendaTests):
         sections['envelope'] = full_input_bytes - sum(sections.values())
         self.assertEqual(failed['metadata'], {
             'input_bytes': full_input_bytes,
-            'input_limit_bytes': 160000,
+            'input_limit_bytes': 320000,
             'section_bytes': sections, 'source_count': len(oversized['sources']),
             'catalog_count': len(oversized['source_catalog']), 'agenda_count': len(oversized['agenda'])})
+
+    def test_one_byte_over_limit_preserves_agenda_ledger_and_decisions_before_model_call(self):
+        from app.agenda_incremental import assemble_incremental_snapshot
+        event = self.inventory()
+        with self.store.db:
+            self.store.db.execute('INSERT INTO canonical_decisions VALUES (?,?,?)',
+                ('existing-action', json.dumps({'proposal': dict(action(), user_rejected=True)}), NOW.isoformat()))
+            # Multibyte text keeps every individual source below its character
+            # limit while testing the exact complete-request UTF-8 byte cap.
+            for source in self.store.db.execute('SELECT id,kind,payload FROM sources').fetchall():
+                source_payload = json.loads(source['payload'])
+                source_payload['text'] = 'ż' * 50000
+                self.store.db.execute('UPDATE sources SET payload=? WHERE id=?', (json.dumps(source_payload), source['id']))
+                if source['kind'] == 'announcement':
+                    row, payload = source, source_payload
+        self.ready()
+        calendar = {event['id']: event}
+        with patch('app.agenda.MAX_INPUT_BYTES', 1000000):
+            snapshot = assemble_incremental_snapshot(self.store, calendar, current=NOW, enforce_budget=False)[0]
+            initial_bytes = len(agenda_prompt(snapshot).encode('utf-8'))
+        payload['text'] += 'x' * (320001 - initial_bytes)
+        with self.store.db:
+            self.store.db.execute('UPDATE sources SET payload=? WHERE id=?', (json.dumps(payload), row['id']))
+        tables = ('sources', 'agenda_processed_sources', 'canonical_actions', 'proposals', 'events',
+                  'action_sources', 'canonical_decisions', 'decision_intents', 'operations')
+        before = {table: [tuple(row) for row in self.store.db.execute('SELECT * FROM ' + table + ' ORDER BY 1')]
+                  for table in tables}
+        runtime = Calendar(lambda snapshot: [item(snapshot)])
+        runtime.events = calendar
+        with self.assertRaisesRegex(RuntimeFailure, 'agenda_context_overflow') as caught:
+            AgendaPlanner(self.store, runtime).run(NOW)
+        self.assertEqual((caught.exception.input_bytes, caught.exception.input_limit_bytes), (320001, 320000))
+        self.assertEqual(sum(caught.exception.section_bytes.values()), 320001)
+        self.assertEqual(runtime.calls, 0)
+        self.assertEqual(runtime.writes, [])
+        self.assertEqual({table: [tuple(row) for row in self.store.db.execute('SELECT * FROM ' + table + ' ORDER BY 1')]
+                          for table in tables}, before)
+        self.assertEqual(self.store.latest_agenda_plan()['metadata']['input_limit_bytes'], 320000)
 
     def test_exact_duplicate_create_plan_fails_before_persistence_or_queue(self):
         self.ready()

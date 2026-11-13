@@ -116,7 +116,7 @@ class IncrementalSelectionTests(AgendaTests):
         with self.assertRaisesRegex(RuntimeFailure, 'agenda_source_body_required'):
             validate_agenda_plan(plan(snapshot, [item(snapshot, sources=refs)]), snapshot)
 
-    def test_growth_86_sources_46_agenda_keep_all_state_under_unchanged_cap(self):
+    def test_growth_86_sources_46_agenda_keep_all_state_under_operational_cap(self):
         with self.store.db:
             source = dict(self.store.db.execute('SELECT * FROM sources LIMIT 1').fetchone())
             for index in range(83):
@@ -137,7 +137,8 @@ class IncrementalSelectionTests(AgendaTests):
         self.assertEqual(len(contract['bootstrap_versions']), 78)
         # Agenda itself may overflow: selection never truncates it to fit.
         with self.store.db:
-            self.store.db.execute("UPDATE canonical_actions SET payload=json_set(payload,'$.description',?)", ('x' * 5000,))
+            self.store.db.execute("UPDATE canonical_actions SET payload=json_set(payload,'$.description',?)",
+                ('x' * (MAX_INPUT_BYTES // len(snapshot['agenda']) + 1),))
         with self.assertRaisesRegex(RuntimeFailure, 'agenda_context_overflow'):
             self.incremental()
 

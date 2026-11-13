@@ -146,13 +146,40 @@ The helper already supplies the day container and its direct table. Pass only th
 
 Replace all narrative content with fictional text and use arbitrary presentation values. An `other` category deliberately cannot reconstruct the original name/value; investigate an unknown shape through an authorized private read before extending recognition. The accepted cancellation notice requires the exact leading `Odwołane zajęcia` heading separated by `br`, a direct single-cell day-table row, and inert text only. It is retained as an ambiguously identified informational substitution. It does not authorize personal Calendar creation or cancellation.
 
+### Private form captures
+
+Calendar form failures also attempt a private technical capture from the exact
+parsed response that failed validation, including initial, selection and restore
+responses. During normal application sync the capture directory is
+`calendar-form-diagnostics` beside the SQLite state file. It is owner-only (`0700`),
+with owner-only files (`0600`) named `form-<opaque-id>.json`; at most the latest 100
+owned matching captures are retained, each bounded to 128 KiB. Unsafe ownership,
+permissions or symlinked paths fail capture without replacing the original
+collection error. The normal diagnostic panel and status contain only
+`private_capture_status` (`written`, `capture_failed`, `not_configured`) and an
+opaque `private_capture_id` when written. Resolve that ID locally in the private
+directory; technical names and routes are never copied into normal diagnostics.
+
+Private captures contain bounded form/control identifiers, static route segments,
+ancestry and boolean visibility/handler hints. They exclude field values, query
+strings, fragments, hosts, URL credentials, text, options, raw HTML, scripts,
+styles and handler contents by construction. Identifier filtering heuristically
+redacts numeric, encoded, email-like, long and token-like names and reports
+redaction/omission counts. Identifiers matching field or decoded action-query/fragment
+values in that response are also suppressed using temporary in-memory comparisons.
+Arbitrary unknown attribute values cannot be proved nonsensitive by this filter.
+Short static-looking names can still have ambiguous meaning: a capture supplies
+technical clues, not proof of a form's purpose. Keep these artifacts private.
+Unknown/extra forms remain collection failures and are never submitted.
+
+
 ## Single-agenda operation
 
 Normal `sync` collects all required source kinds and reads current owned Calendar state before planning. Collection failure is not an empty successful source list. The selected learner/class must stay verified. The configured planner is `gpt-6.1-sol/high`; no per-source extractor/matcher/verifier chain or activation receipt is used.
 
-The complete model request retains the 160,000-byte UTF-8 input limit and existing output/instruction reserves. Only repeated field names are encoded once: `source_catalog` uses `columns`/`rows` with columns `id, kind, content_hash, deleted, retained, body_available`; agenda `links` use rows with the shared root header `agenda_link_columns` (`source_id, source_hash, source_quote, relation`). Row values and order, full selected source bodies, quotes, decisions, actions, Calendar state and offers are unchanged. Missing/extra row fields fail explicitly; absent fields are never replaced with null. Internal snapshots, validation, source ledger and materialization retain dictionaries. The policy hash changes the request/cache identity without reselecting processed source history.
+The complete model request has a 320,000-byte UTF-8 operational input limit, measured before calling the model. This byte cap is not a provider token-capacity estimate. Only repeated field names are encoded once: `source_catalog` uses `columns`/`rows` with columns `id, kind, content_hash, deleted, retained, body_available`; agenda `links` use rows with the shared root header `agenda_link_columns` (`source_id, source_hash, source_quote, relation`). Row values and order, full selected source bodies, quotes, decisions, actions, Calendar state and offers are unchanged. Missing/extra row fields fail explicitly; absent fields are never replaced with null. Internal snapshots, validation, source ledger and materialization retain dictionaries. The policy hash changes the request/cache identity without reselecting processed source history. Overflow fails visibly without truncation or paging, retaining the measured byte count, limit and section breakdown in technical diagnostics.
 
-If the final encoded request still exceeds the limit, planning fails before a model call or source-ledger progress. The failed plan metadata and authenticated panel show total/limit bytes, source/catalog/agenda counts, and byte sizes for the fixed sections `sources`, `source_catalog`, `agenda`, `offer_groups`, `preferences`, `unsettled_operations`, `envelope`. Section sizes measure the encoded JSON values; `envelope` is the remaining field names, separators, headers and explanatory prompt text, so all sections sum to the measured total. Only numbers and fixed section names are recorded, never input text or IDs. Legacy failures without a breakdown remain readable. Reproduce a future overflow with fictional padding in the measured dominant section; do not drop bodies, quotes or history, raise the limit, or replay processed sources to make it fit.
+If the final encoded request still exceeds the limit, planning fails before a model call or source-ledger progress. The failed plan metadata and authenticated panel show total/limit bytes, source/catalog/agenda counts, and byte sizes for the fixed sections `sources`, `source_catalog`, `agenda`, `offer_groups`, `preferences`, `unsettled_operations`, `envelope`. Section sizes measure the encoded JSON values; `envelope` is the remaining field names, separators, headers and explanatory prompt text, so all sections sum to the measured total. Only numbers and fixed section names are recorded, never input text or IDs. Legacy failures without a breakdown remain readable. Reproduce a future overflow with fictional padding in the measured dominant section; do not drop bodies, quotes or history, automatically raise the limit, or replay processed sources to make it fit. A cap change requires a deliberate, explicitly authorized decision and boundary validation; it does not establish provider token capacity.
 
 ```sh
 release_python="$HOME/.local/lib/librus-calendar/current/.venv/bin/python"

@@ -19,12 +19,9 @@ from .core import WARSAW, digest, normalize_proposal, utcnow
 AGENDA_VERSION = 'simple-agenda-v9-school-reconfirmation'
 AGENDA_MODEL = 'gpt-6.1-sol'
 AGENDA_EFFORT = 'high'
-# UTF-8 bytes are a conservative upper bound on text tokens. Reserve space for
-# output, schema/protocol overhead and instructions; never silently trim input.
-CONTEXT_TOKENS = 200_000
-OUTPUT_RESERVE_TOKENS = 32_000
-OVERHEAD_RESERVE_TOKENS = 8_000
-MAX_INPUT_BYTES = CONTEXT_TOKENS - OUTPUT_RESERVE_TOKENS - OVERHEAD_RESERVE_TOKENS
+# Operational limit for the complete UTF-8 request, not a provider token estimate.
+# Measure the exact serialized input before calling; never silently trim it.
+MAX_INPUT_BYTES = 320_000
 MAX_ROWS = 5_000
 CATALOG_COLUMNS = ('id', 'kind', 'content_hash', 'deleted', 'retained', 'body_available')
 AGENDA_LINK_COLUMNS = ('source_id', 'source_hash', 'source_quote', 'relation')

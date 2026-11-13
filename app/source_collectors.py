@@ -1,8 +1,9 @@
 """Bounded, inert Synergia announcement/calendar reads for the active learner.
 
 Only the four known source routes and observed calendar detail routes are read.
-Links, images, attachments and scripts are never followed. No raw HTML, form
-secrets or session URLs leave this module. Unknown markup is a failed collection,
+Links, images, attachments and scripts are never followed. An optional private
+sink inspects the parsed document in process; persisted technical descriptors
+exclude raw HTML, field values and session URLs. Unknown markup is a failed collection,
 not evidence that a source disappeared.
 """
 from calendar import monthrange
@@ -32,11 +33,14 @@ class SourceCollectionError(PocError):
     """An allowlisted category, containing no provider content or request data."""
     code = 'source_collection_failed'
 
-    def __init__(self, code='source_collection_failed', *, diagnostic_code=None, http_status=None, evidence=None):
+    def __init__(self, code='source_collection_failed', *, diagnostic_code=None, http_status=None, evidence=None,
+                 private_capture_status=None, private_capture_id=None):
         self.code = code
         self.diagnostic_code = diagnostic_code or code
         self.http_status = http_status
         self.evidence = evidence
+        self.private_capture_status = private_capture_status
+        self.private_capture_id = private_capture_id
         super().__init__(code)
 
 
@@ -314,7 +318,25 @@ def _calendar_forms_evidence(forms):
     return dict(form_count=len(forms), forms=descriptors, omitted_form_count=len(forms) - len(descriptors))
 
 
-def _calendar_form(doc):
+def _calendar_form(doc, private_form_sink=None):
+    try:
+        return _validated_calendar_form(doc)
+    except SourceCollectionError as error:
+        if error.diagnostic_code.startswith('calendar_form_'):
+            error.private_capture_status = 'not_configured'
+            if private_form_sink is not None:
+                try:
+                    artifact_id = private_form_sink(doc, error.diagnostic_code)
+                    if not isinstance(artifact_id, str) or not re.fullmatch(r'[a-f0-9]{32}', artifact_id):
+                        raise ValueError('Invalid private capture reference.')
+                    error.private_capture_status = 'written'
+                    error.private_capture_id = artifact_id
+                except Exception:
+                    error.private_capture_status = 'capture_failed'
+        raise
+
+
+def _validated_calendar_form(doc):
     forms = list(doc.root.walk('form'))
     if len(forms) != 1:
         raise SourceCollectionError('calendar_form_invalid', diagnostic_code='calendar_form_count',
@@ -441,9 +463,9 @@ def _calendar_cell_evidence(cell, day):
             'row_cell_count': sum(isinstance(node, Node) and node.tag in {'td', 'th'} for node in row.children) if row and row.tag == 'tr' else 0}
 
 
-def parse_calendar_month(html, *, start, end):
+def parse_calendar_month(html, *, start, end, private_form_sink=None):
     doc = Document(html)
-    form = _calendar_form(doc)
+    form = _calendar_form(doc, private_form_sink)
     tables = [node for node in doc.root.walk('table') if node.has_class('kalendarz')]
     if len(tables) != 1:
         raise SourceCollectionError('calendar_markup_invalid')
@@ -546,7 +568,7 @@ def _select_month(client, form, year, month):
         response = client.request('POST', ORIGIN + '/terminarz', data=data)
         html=_checked_response(response,'/terminarz')
         # A successful POST is not proof that the view changed. Parse and verify it.
-        selected = _calendar_form(Document(html))
+        selected = _calendar_form(Document(html), getattr(client, 'private_form_diagnostic_sink', None))
         if (selected['year'], selected['month']) != (year, month):
             raise SourceCollectionError('calendar_selection_failed')
         return html, selected
@@ -584,9 +606,10 @@ def _set_holiday_dates(source, dates, detail_text):
 
 def collect_calendar(client, *, learner_id, fetched_at, start, end, learner=None):
     sink = getattr(client, 'collection_diagnostic_sink', None)
+    private_sink = getattr(client, 'private_form_diagnostic_sink', None)
     with collection_attempt(sink, collection_step='calendar_initial'):
         html = _read(client, '/terminarz')
-        form, unused = parse_calendar_month(html, start=start, end=end)
+        form, unused = parse_calendar_month(html, start=start, end=end, private_form_sink=private_sink)
     original = (form['year'], form['month'])
     moved = False
     result, seen, holidays = [], set(), {}
@@ -602,7 +625,7 @@ def collect_calendar(client, *, learner_id, fetched_at, start, end, learner=None
                     html, form = _select_month(client, form, year, month)
                     selected = True
                 try:
-                    form, entries = parse_calendar_month(html, start=start, end=end)
+                    form, entries = parse_calendar_month(html, start=start, end=end, private_form_sink=private_sink)
                 except SourceCollectionError as error:
                     if selected:
                         error.collection_step = 'calendar_select'
@@ -656,7 +679,7 @@ def collect_calendar(client, *, learner_id, fetched_at, start, end, learner=None
                     # Obtain fresh form state after a failed request; never replay an
                     # earlier requestkey. Restore only this temporary session's view.
                     latest_html = _read(client, '/terminarz')
-                    latest = _calendar_form(Document(latest_html))
+                    latest = _calendar_form(Document(latest_html), private_sink)
                     if (latest['year'], latest['month']) != original:
                         try:
                             _select_month(client, latest, *original)
@@ -664,7 +687,9 @@ def collect_calendar(client, *, learner_id, fetched_at, start, end, learner=None
                             raise SourceCollectionError('calendar_restore_failed',
                                 diagnostic_code=getattr(error, 'diagnostic_code', 'calendar_restore_failed'),
                                 http_status=failure_diagnostic(error).get('http_status'),
-                                evidence=failure_diagnostic(error).get('evidence')) from None
+                                evidence=failure_diagnostic(error).get('evidence'),
+                                private_capture_status=getattr(error, 'private_capture_status', None),
+                                private_capture_id=getattr(error, 'private_capture_id', None)) from None
                     if learner is not None and parse_learner_context(_read(client,'/informacja'))!=learner:
                         raise SourceCollectionError('learner_context_changed')
             except Exception:

@@ -54,6 +54,8 @@ Writes start paused. An initial `sync --dry-run` can still read Librus and invok
 
 Analysis and calendar tools default to `gpt-6.1-sol` with `high` reasoning. The initial calendar-list probe may retry once after five seconds for a verified unexpected completed tool-call count (zero or multiple). Batch reads have a separate budget of one additional invocation per entire sync run, only for a clean zero-call failure; both attempts and validated recovery appear in local diagnostics. Calendar writes are never retried by these policies; uncertain writes require read-only reconciliation. See [probe behavior and diagnostics](docs/setup.md#calendar-probe-and-safe-diagnostics).
 
+The planner measures the complete UTF-8 request against a 320,000-byte operational input limit before calling the model. Overflow fails visibly with the measured size, limit and section breakdown; input is never silently truncated or paged. The byte cap is not a provider token-capacity estimate.
+
 ## Privacy and limitations
 
 This is an **unofficial**, independently maintained integration, unaffiliated with Librus, Google or OpenAI. It uses undocumented Librus authentication/message interfaces, which can change. It supports messages, announcements, school-calendar entries and informational substitutions, subject to the capabilities available to the authenticated learner. It does not import the full timetable, grades or every school feature. Attachment contents, images, OCR and PDFs are not analyzed or sent to external services.

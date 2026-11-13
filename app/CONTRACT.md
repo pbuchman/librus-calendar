@@ -45,7 +45,7 @@ The additive proposal column requires forward recovery after migration: earlier 
 
 `CodexRuntime.plan_agenda(snapshot)` receives one coherent bounded snapshot of relevant message, announcement and school-calendar text, existing agenda, current owned Calendar state, verified learner context and saved decisions. It runs one tool-free configured `gpt-6.1-sol/high` task and returns `{snapshot_hash,decision_reason,items}`. Items use `operation=create|link|update|review|ignore`, nullable existing `action_id`/`proposal_id`, exact `sources:[{source_id,source_hash}]`, reason, nullable normalized action/review change and offer references. Application validation checks existing references, learner scope, conflicts, ownership, saved decisions and dates. Application code assigns stable IDs and persists the plan and active materialization transactionally before queueing.
 
-The actual incremental request is measured before invocation (160000 UTF-8 bytes); overflow fails visibly, without truncation or per-candidate calls. Hash reuse includes relevant source versions, agenda/Calendar, decisions, learner, policy/planner and model settings. Collection timestamps and a new day alone do not invalidate it. Full local state still participates in CAS without a prompt byte budget. The exact serialized request has a separate SHA-256 hash. Successful own writes advance content and authority baselines; external changes invalidate it. Unchanged runs still reconcile and check health. Review blocks affected work, independent clear school obligations may proceed, dependent offer choices remain atomic. Missing sources/items do not authorize deletion. Human-approved hours/edits/rejections and one-choice offers remain authoritative; material changes and cancellations require explicit review.
+The actual incremental request is measured before invocation against a 320000-byte operational limit on the complete UTF-8 request; this is not a provider token-capacity estimate. Overflow fails visibly, without truncation or per-candidate calls. Hash reuse includes relevant source versions, agenda/Calendar, decisions, learner, policy/planner and model settings. Collection timestamps and a new day alone do not invalidate it. Full local state still participates in CAS without a prompt byte budget. The exact serialized request has a separate SHA-256 hash. Successful own writes advance content and authority baselines; external changes invalidate it. Unchanged runs still reconcile and check health. Review blocks affected work, independent clear school obligations may proceed, dependent offer choices remain atomic. Missing sources/items do not authorize deletion. Human-approved hours/edits/rejections and one-choice offers remain authoritative; material changes and cancellations require explicit review.
 
 `latest_agenda_plan(preview=False)` separates active statuses from `preview`/`preview_failed` and returns `{id,input_hash,status,created_at,error_code,metadata,payload}`. `agenda_status()` returns `{engine:'simple-agenda',latest_plan,latest_preview}` summaries without payload. Metadata is a safe whitelist including selected `source_count`, whole `catalog_count`, actual `input_bytes` and `request_hash`; narrative reasons stay private payloads. `agenda-preview` and `sync --dry-run` read the last complete stored collection plus fresh Calendar, and save only isolated preview rows; no Librus refresh, active proposals, decisions, groups, operations or Calendar writes. Preview records `source_collection_at` and `sources_refreshed_by_preview=false`. Exact previews may be reused only after a fresh unchanged-state check. Normal CLI output is aggregate-only.
 
@@ -304,3 +304,19 @@ A private read-only POC against the actual connector and current school snapshot
 must establish collection completeness, batch coverage, identity/decision
 preservation, observed-date planning, unchanged replay and uncertain-write
 reconciliation before deployment. Live writes are not part of that read-only POC.
+
+Calendar-form validation failures may invoke an optional in-process private sink
+with the same parsed response; they never refetch a response solely for diagnosis.
+The normal sync configures and restores that sink around source collection using
+the state DB location. The private artifact writer selects only bounded technical
+identifiers, sanitized route paths, form/control associations and ancestry hints;
+values, text, raw HTML, scripts/styles/handlers and URL queries/fragments/hosts are
+excluded. Static-looking identifiers remain private and do not establish semantic
+purpose. Values/query components are omitted by construction; token-like
+identifier redaction is heuristic, with additional temporary suppression of names
+matching known field/query/fragment values. Arbitrary unknown attribute values
+cannot be proved nonsensitive by lexical checks. Owner-only files outside the repository use opaque names, secure
+nonsymlink/exclusive opens, a measured 128 KiB bound and 100-file owned-artifact
+retention. Storage failures preserve the original collection error. Only the
+closed capture status and, for a successful write, opaque artifact ID may enter
+ordinary diagnostics/status/panel; strict form acceptance remains unchanged.

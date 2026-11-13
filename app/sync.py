@@ -105,7 +105,10 @@ class SyncController:
         """Collect only; all three channels feed the one agenda task."""
         batch = None
         previous_sink = getattr(self.client, 'collection_diagnostic_sink', None)
+        previous_private_sink = getattr(self.client, 'private_form_diagnostic_sink', None)
         try:
+            from .calendar_form_diagnostics import PrivateFormCapture
+            self.client.private_form_diagnostic_sink = PrivateFormCapture(self.store.path)
             self.client.collection_diagnostic_sink = self._collection_diagnostic if getattr(self, 'run_id', None) else previous_sink
             batch = self.client.collect_sources(current=current, past_days=30, future_days=60)
             return self.store.ingest_sources(batch, current)
@@ -127,6 +130,7 @@ class SyncController:
             return {'status': 'partial', 'failures': 1}
         finally:
             self.client.collection_diagnostic_sink = previous_sink
+            self.client.private_form_diagnostic_sink = previous_private_sink
 
     def reanalyze(self, message_ids, *, apply=False, current=None):
         return self._reanalyze_locked(message_ids, apply=apply, current=current)

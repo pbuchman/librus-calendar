@@ -131,6 +131,21 @@ class WebTests(unittest.TestCase):
             self.assertIn(text, response.text)
         self.assertEqual(self.client.get('/api/status').json()['sync_diagnostics']['invocations'][0]['evidence'], outline)
 
+    def test_private_form_capture_displays_only_closed_status_and_opaque_reference(self):
+        original = self.store.status
+        item = dict(phase='fetch', state='failed', requested_count=1, received_count=0,
+                    duration_seconds=0.1, process_code=None, started_count=0, completed_count=0,
+                    error_code='calendar_form_count', private_capture_status='written', private_capture_id='a'*32)
+        for status in ('written', 'capture_failed', 'not_configured'):
+            diagnostic = dict(item, private_capture_status=status)
+            if status != 'written': diagnostic.pop('private_capture_id')
+            self.store.status = lambda: dict(original(), sync_diagnostics={'invocations': [diagnostic], 'omitted_count': 0})
+            response = self.client.get('/')
+            self.assertEqual(response.status_code, 200)
+            self.assertIn('Prywatny zapis formularzy: '+status, response.text)
+            self.assertEqual('a'*32 in response.text, status == 'written')
+            self.assertEqual(self.client.get('/api/status').json()['sync_diagnostics']['invocations'][0], diagnostic)
+
     def test_overflow_panel_renders_only_fixed_numeric_size_evidence(self):
         original = self.store.status
         sections = dict(sources=12000, source_catalog=10000, agenda=140000, offer_groups=200,
