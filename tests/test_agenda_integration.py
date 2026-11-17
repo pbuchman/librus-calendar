@@ -527,6 +527,79 @@ class AgendaIntegrationTests(AgendaTests):
         self.assertEqual(len(self.store.list_actions()), 1)
         self.assertEqual(runtime.writes, [])
 
+    def changed_approved_message(self):
+        result, runtime, planner = self.apply(lambda snapshot: [item(snapshot, 'review', review_change='create',
+            action=dict(action(), temporal_kind='event', activity_scope='extracurricular'),
+            sources=[{'source_id': source['id'], 'source_hash': source['content_hash']}
+                     for source in sorted(snapshot['sources'], key=lambda source: source['kind'] != 'message')])])
+        original = result['items'][0]
+        approved = self.store.resolve_proposal(original['proposal_id'], 'approve', {'title': 'Tytuł rodzica'})
+        self.store.set_writes_paused(False)
+        operation, = self.store.queue_operations(NOW)
+        message = self.store.get_message('fictional-message')
+        self.store.save_message({**message, 'text': message['text'] + ' Dziękujemy!'})
+        return original, approved, operation, runtime, planner
+
+    def test_changed_message_waits_for_its_exact_link_then_executes_the_same_approval(self):
+        original, approved, operation, runtime, planner = self.changed_approved_message()
+        self.assertFalse(self.store.claim_operation(operation['operation_id'], expected_operation=operation))
+        self.assertEqual(self.store.queue_operations(NOW), [])
+        self.assertEqual(self.store.pending_operations(), [])
+        pending, = self.store.list_proposals()
+        self.assertEqual(pending['status'], 'pending')
+        self.assertTrue(pending['user_approved'])
+
+        runtime.select = lambda snapshot: [item(snapshot, 'link', action=None, action_id=original['action_id'],
+            sources=[{'source_id': source['id'], 'source_hash': source['content_hash']}
+                     for source in snapshot['source_catalog'] if source['kind'] != 'message']),
+            item(snapshot, 'ignore', action=None,
+                 sources=[{'source_id': source['id'], 'source_hash': source['content_hash']}
+                          for source in snapshot['sources'] if source['kind'] == 'message'])]
+        planner.run(NOW)
+        self.execute_pending(runtime, planner)
+        self.assertEqual(runtime.writes, [])
+        self.assertEqual(self.store.list_proposals()[0]['agenda_sources'], approved['agenda_sources'])
+
+        message = self.store.get_message('fictional-message')
+        self.store.save_message({**message, 'text': message['text'] + ' Pozdrawiamy!'})
+        runtime.select = lambda snapshot: [item(snapshot, 'link', action=None, action_id=original['action_id'])]
+        linked, = planner.run(NOW)['items']
+        self.assertEqual(linked['proposal_id'], approved['id'])
+        self.execute_pending(runtime, planner)
+        applied, = self.store.list_proposals()
+        self.assertEqual((applied['id'], applied['status'], applied['title']), (approved['id'], 'applied', approved['title']))
+        self.assertTrue(applied['user_approved'])
+        self.assertEqual([write['operation_id'] for write in runtime.writes], [operation['operation_id']])
+        self.assertEqual(planner.run(NOW)['status'], 'unchanged')
+
+    def test_changed_message_with_moved_action_requires_new_approval(self):
+        original, approved, operation, runtime, planner = self.changed_approved_message()
+        runtime.select = lambda snapshot: [item(snapshot, 'update', action_id=original['action_id'],
+            action=dict(action(), temporal_kind='event', activity_scope='extracurricular', start='2030-03-19'))]
+        revision, = planner.run(NOW)['items']
+        self.assertEqual((revision['operation'], revision['action_id']), ('review', original['action_id']))
+        previous = next(proposal for proposal in self.store.list_proposals() if proposal['id'] == approved['id'])
+        self.assertEqual(previous['status'], 'superseded')
+        self.assertTrue(previous['user_approved'])
+        current, = self.store.list_proposals('review')
+        self.assertFalse(current['user_approved'])
+        self.assertEqual(current['start'], '2030-03-19')
+        self.assertFalse(self.store.claim_operation(operation['operation_id'], expected_operation=operation))
+        self.execute_pending(runtime, planner)
+        self.assertEqual(runtime.writes, [])
+
+    def test_changed_message_link_preserves_a_rejection(self):
+        original, approved, operation, runtime, planner = self.changed_approved_message()
+        self.store.resolve_proposal(approved['id'], 'ignore')
+        runtime.select = lambda snapshot: [item(snapshot, 'link', action=None, action_id=original['action_id'])]
+        planner.run(NOW)
+        rejected, = self.store.list_proposals()
+        self.assertEqual((rejected['id'], rejected['status']), (approved['id'], 'ignored'))
+        self.assertTrue(rejected['user_rejected'])
+        self.assertFalse(self.store.claim_operation(operation['operation_id'], expected_operation=operation))
+        self.execute_pending(runtime, planner)
+        self.assertEqual(runtime.writes, [])
+
     def test_preview_isolated_and_failed_plan_has_safe_separate_status(self):
         self.ready()
         tables = ('proposals', 'canonical_actions', 'decision_intents', 'operations', 'proposal_groups', 'action_sources')

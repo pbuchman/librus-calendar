@@ -642,6 +642,8 @@ def materialize_plan(store, snapshot, plan, calendar, *, current, preview=False,
         store.db.execute('INSERT INTO agenda_plans VALUES (?,?,?,?,?,?,NULL)',
                          (pid, snapshot['snapshot_hash'], json.dumps(payload, ensure_ascii=False), json.dumps(metadata or {}), 'applied', stamp))
         groups = {}
+        body_versions = {(source['id'], source['content_hash']) for source in snapshot['sources']
+                         if source.get('text') and not source.get('deleted') and source.get('status') != 'retained'}
         for item, proposal in prepared:
             aid = item['action_id']
             if item['operation'] == 'ignore':
@@ -650,7 +652,10 @@ def materialize_plan(store, snapshot, plan, calendar, *, current, preview=False,
                 row = store.db.execute('SELECT p.* FROM proposals p JOIN canonical_actions a ON a.proposal_id=p.id WHERE a.id=?', (aid,)).fetchone()
                 attempted = store.db.execute("SELECT 1 FROM operations o JOIN proposals p ON p.id=o.proposal_id WHERE (p.id=? OR json_extract(p.payload,'$.canonical_action_id')=?) AND (o.attempts>0 OR o.status IN ('unknown','inflight','applied'))", (aid, aid)).fetchone()
                 owned = store.db.execute('SELECT 1 FROM events WHERE proposal_id=?', (item['proposal_id'],)).fetchone()
-                if row and row['status'] in ('pending', 'review') and not attempted and not owned:
+                linked_versions = {(ref['source_id'], ref['source_hash']) for ref in item['sources']}
+                changed = store.changed_approved_message_refs(store._proposal(row)) if row else set()
+                if (row and row['status'] in ('pending', 'review') and not attempted and not owned
+                        and changed <= linked_versions & body_versions):
                     # Fresh validated corroboration admits the same unwritten
                     # intent; retain consent, content, IDs and historical links.
                     admission = {'agenda_plan_id': pid, 'agenda_sources': item['sources'],

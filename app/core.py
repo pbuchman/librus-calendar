@@ -17,6 +17,7 @@ from .config import AppConfig, ConfigurationError, load_config
 PREFIX = 'librus-calendar:'
 SOURCE_LABELS = {'message': 'wiadomość', 'announcement': 'ogłoszenie',
                  'school_event': 'terminarz szkolny', 'substitution': 'zastępstwo'}
+MESSAGE_RELINK_REQUIRED = 'Source message changed; reanalysis required.'
 REVIEWED_CREATE_WITH_TARGET = """(o.status='review' AND json_extract(o.payload,'$.action')='create'
     AND COALESCE(json_extract(o.payload,'$.event_id'),json_extract(o.result,'$.event_id')) IS NOT NULL)"""
 
@@ -582,8 +583,10 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             self.db.execute('INSERT INTO messages(id,payload,payload_hash,status,sent_at,fetched_at,last_error,pending_since) VALUES (?,?,?,?,?,?,NULL,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,payload_hash=excluded.payload_hash,status=excluded.status,sent_at=excluded.sent_at,fetched_at=excluded.fetched_at,last_error=NULL,pending_since=excluded.pending_since',
                             (message_id, json.dumps(clean, ensure_ascii=False), hashed, state, clean['sent_at'], utcnow(), pending_since if state == 'analysis_pending' else None))
             if changed and row and row['payload_hash']:
-                self.db.execute("UPDATE proposals SET status='ignored',updated_at=?,pending_since=NULL WHERE message_id=? AND status IN ('pending','review')", (utcnow(), message_id))
-                self.db.execute("UPDATE operations SET status='review',last_error='Source message changed; reanalysis required.',updated_at=? WHERE proposal_id IN (SELECT id FROM proposals WHERE message_id=?) AND status='pending'", (utcnow(), message_id))
+                for proposal in self.db.execute("SELECT * FROM proposals WHERE message_id=? AND status IN ('pending','review')", (message_id,)).fetchall():
+                    if not self._can_relink_pending_approval(self._proposal(proposal)):
+                        self.db.execute("UPDATE proposals SET status='ignored',updated_at=?,pending_since=NULL WHERE id=?", (utcnow(), proposal['id']))
+                self.db.execute("UPDATE operations SET status='review',last_error=?,updated_at=? WHERE proposal_id IN (SELECT id FROM proposals WHERE message_id=?) AND status='pending'", (MESSAGE_RELINK_REQUIRED, utcnow(), message_id))
             self._mirror_message_source(self.db.execute('SELECT * FROM messages WHERE id=?', (message_id,)).fetchone())
         return changed
 
@@ -924,6 +927,31 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
         self.db.execute("UPDATE proposals SET payload=?,status='review',updated_at=?,pending_since=NULL WHERE id=?", (json.dumps(item, ensure_ascii=False), utcnow(), item['id']))
         self.db.execute("UPDATE operations SET status='review',last_error=?,updated_at=? WHERE proposal_id=? AND status='pending'", (reason, utcnow(), item['id']))
 
+    def _can_relink_pending_approval(self, item):
+        return (item['status'] == 'pending' and item.get('kind') in ('create', 'update')
+                and item.get('user_approved') is True and not item.get('user_rejected')
+                and bool(item.get('agenda_plan_id')) and bool(item.get('agenda_sources'))
+                and not (item.get('alternative_group') or item.get('alternative_group_id'))
+                and not self.db.execute("SELECT 1 FROM operations WHERE proposal_id=? AND (attempts>0 OR result IS NOT NULL)",
+                                        (item['id'],)).fetchone())
+
+    def changed_approved_message_refs(self, item):
+        if not self._can_relink_pending_approval(item):
+            return set()
+        changed = set()
+        for ref in item['agenda_sources']:
+            source = self.get_source(ref['source_id'])
+            if source and source['kind'] == 'message' and source['content_hash'] != ref['source_hash']:
+                changed.add((source['id'], source['content_hash']))
+        return changed
+
+    def _defer_changed_message_write(self, item):
+        if not self.changed_approved_message_refs(item):
+            return False
+        self.db.execute("UPDATE operations SET status='review',last_error=?,updated_at=? WHERE proposal_id=? AND status='pending'",
+                        (MESSAGE_RELINK_REQUIRED, utcnow(), item['id']))
+        return True
+
     def queue_operations(self, current=None):
         queued = []
         for listed in self.list_proposals('pending', 500):
@@ -937,7 +965,7 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                 if not row:
                     continue
                 item = self._proposal(row)
-                if self.source_mode_blocked(item) or self.source_write_deferred(item):
+                if self.source_mode_blocked(item) or self.source_write_deferred(item) or self._defer_changed_message_write(item):
                     continue
                 group_reason = self._source_write_reason(item) or self._group_write_reason(item['id'])
                 if group_reason:
@@ -1000,6 +1028,12 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                              'synchronization_started_at': synchronization_started_at}
                 if item['kind'] == 'cancel':
                     operation.update(prior_snapshot=event['snapshot'], prior_fingerprint=event['fingerprint'], prior_marker=event['marker'])
+                if (existing and existing['status'] == 'review' and existing['last_error'] == MESSAGE_RELINK_REQUIRED
+                        and self._can_relink_pending_approval(item)):
+                    self.db.execute("UPDATE operations SET payload=?,status='pending',last_error=NULL,updated_at=? WHERE id=?",
+                                    (json.dumps(operation, ensure_ascii=False), utcnow(), existing['id']))
+                    queued.append(operation)
+                    continue
                 if existing and json.loads(existing['payload']) != operation:
                     if existing['status'] == 'pending' and existing['attempts'] == 0 and existing['result'] is None:
                         self.db.execute('UPDATE operations SET payload=?,updated_at=? WHERE id=?', (json.dumps(operation, ensure_ascii=False), utcnow(), existing['id']))
@@ -1055,7 +1089,7 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             if not proposal_row:
                 return False
             item = self._proposal(proposal_row)
-            if self.source_mode_blocked(item) or self.source_write_deferred(item):
+            if self.source_mode_blocked(item) or self.source_write_deferred(item) or self._defer_changed_message_write(item):
                 return False
             group_reason = self._source_write_reason(item) or self._group_write_reason(item['id'])
             if group_reason:
