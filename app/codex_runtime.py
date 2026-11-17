@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import re
 import signal
+import selectors
 import subprocess
 import tempfile
 import time
@@ -178,6 +179,9 @@ class CodexRuntime:
         self.last_probe_attempts = []
         self.probe_attempt_sink = None
         self.invocation_sink = None
+        self.private_diagnostic_capture = None
+        self._observation_progress = None
+        self._process_observation = None
         self._version = None
         self._injected_runner = run_process is not None
         self._active_tool_request = None
@@ -233,28 +237,127 @@ class CodexRuntime:
         return args
 
     def _run_process(self, args, prompt, timeout):
-        # Deliberately exclude cloud credentials, Librus secrets and unrelated env.
+        from .codex_diagnostics import ProcessObservation
+        observation = ProcessObservation(capture=self.private_diagnostic_capture,
+            progress=self._observation_progress, model=getattr(self, '_invocation_model', self.config.tool_model),
+            effort=getattr(self, '_invocation_effort', self.config.tool_effort), cli_version=self._version)
+        self._process_observation = observation
+        self.last_invocation_metadata.pop('process_observation', None)
         env = {key: os.environ[key] for key in ("HOME", "USER", "LOGNAME", "PATH", "LANG", "LC_ALL", "TMPDIR") if key in os.environ}
-        process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                   text=True, env=env, start_new_session=True)
+        process = None
         try:
-            stdout, stderr = process.communicate(prompt, timeout=timeout)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-            stdout, stderr = process.communicate()
-            self._capture_interrupted_output(stdout, stderr, process.returncode)
-            raise RuntimeFailure("codex_timeout")
-        except BaseException:
-            # Whole-sync deadlines and SIGTERM must also stop the isolated child.
-            # The controller retains any inflight write as unknown for reconciliation.
+            process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       env=env, start_new_session=True)
+            observation.optional('process_started', process.pid)
+            stdout, stderr = self._pump_process(process, prompt, timeout, observation)
+        except BaseException as error:
+            if process is None:
+                observation.optional('finish', None, 'unknown')
+                self.last_invocation_metadata['process_observation'] = observation.summary()
+                raise
+            # Whole-sync deadlines and SIGTERM must also stop/reap the isolated
+            # child. Application SIGKILL is not evidence of an OOM kill.
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-            stdout, stderr = process.communicate()
-            self._capture_interrupted_output(stdout, stderr, process.returncode)
+            try:
+                stdout, stderr = process.communicate()
+            except Exception:
+                # Draining is best effort after termination. Never let its I/O
+                # failure replace the original timeout/interruption, and retain
+                # only pipe bytes that the pump actually captured.
+                stdout, stderr = b'', b''
+            finally:
+                process.wait()
+            stdout = b''.join(getattr(process, '_librus_stdout', [])) + self._output_bytes(stdout)
+            stderr = b''.join(getattr(process, '_librus_stderr', [])) + self._output_bytes(stderr)
+            observation.optional('observe', stdout, stderr)
+            cause = ('app_timeout' if isinstance(error, subprocess.TimeoutExpired)
+                else 'sync_interruption' if not isinstance(error, Exception) else 'unknown')
+            observation.optional('finish', process.returncode, cause)
+            self.last_invocation_metadata['process_observation'] = observation.summary()
+            self._capture_interrupted_output(stdout.decode('utf-8', errors='replace'),
+                stderr.decode('utf-8', errors='replace'), process.returncode)
+            if isinstance(error, subprocess.TimeoutExpired):
+                raise RuntimeFailure("codex_timeout") from None
+            if isinstance(error, (OSError, subprocess.SubprocessError)):
+                # A child already started may have dispatched its Calendar
+                # write. Preserve that uncertainty; spawn failures above still
+                # take the unavailable-before-dispatch path.
+                raise RuntimeFailure('codex_unavailable', possible_write=bool(
+                    self._active_tool_request and self._active_tool_request[2])) from None
             raise
-        return process.returncode, stdout, stderr
+        finally:
+            if process is not None:
+                for stream in (process.stdin, process.stdout, process.stderr):
+                    if stream is not None:
+                        stream.close()
+        observation.optional('finish', process.returncode, 'signal' if process.returncode < 0 else 'normal_exit')
+        self.last_invocation_metadata['process_observation'] = observation.summary()
+        # Observation can never make malformed full output acceptable.
+        try:
+            return process.returncode, stdout.decode('utf-8'), stderr.decode('utf-8')
+        except UnicodeError:
+            raise RuntimeFailure('codex_protocol_invalid', possible_write=bool(self._active_tool_request and self._active_tool_request[2])) from None
+
+    @staticmethod
+    def _output_bytes(value):
+        return value.encode('utf-8') if isinstance(value, str) else value or b''
+
+    @staticmethod
+    def _pump_process(process, prompt, timeout, observation):
+        """Drain both pipes while sending stdin once, under one total deadline.
+
+        Repeated communicate(None, timeout=...) leaves unfinished stdin
+        unregistered on Python 3.12. A nonblocking selector owns all three pipes.
+        """
+        deadline = time.monotonic() + timeout
+        pending = memoryview(prompt.encode('utf-8'))
+        offset = 0
+        output = process._librus_stdout = []
+        errors = process._librus_stderr = []
+        with selectors.DefaultSelector() as selector:
+            for stream, kind in ((process.stdout, 'stdout'), (process.stderr, 'stderr')):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, kind)
+            if pending:
+                os.set_blocking(process.stdin.fileno(), False)
+                selector.register(process.stdin, selectors.EVENT_WRITE, 'stdin')
+            else:
+                process.stdin.close()
+                process.stdin = None
+            while selector.get_map() or process.poll() is None:
+                remaining = deadline-time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(process.args, timeout)
+                for key, unused in selector.select(min(1, remaining)):
+                    stream, kind = key.fileobj, key.data
+                    if kind == 'stdin':
+                        try:
+                            offset += os.write(stream.fileno(), pending[offset:offset+4096])
+                        except BrokenPipeError:
+                            offset = len(pending)
+                        except BlockingIOError:
+                            continue
+                        if offset == len(pending):
+                            selector.unregister(stream)
+                            stream.close()
+                            process.stdin = None
+                    else:
+                        try:
+                            chunk = os.read(stream.fileno(), 65536)
+                        except BlockingIOError:
+                            continue
+                        if not chunk:
+                            selector.unregister(stream)
+                        else:
+                            (output if kind == 'stdout' else errors).append(chunk)
+                            observation.optional('feed', kind, chunk)
+                observation.optional('sample')
+                observation.optional('flush')
+        process.wait()
+        return b''.join(output), b''.join(errors)
 
     def _capture_interrupted_output(self, stdout, stderr, returncode):
         """Keep bounded technical evidence already emitted before termination."""
@@ -273,10 +376,13 @@ class CodexRuntime:
     def _tool_records(self, stdout, stderr, returncode, expected_tool, expected_args, write):
         """Fail closed on protocol ambiguity; retain only technical evidence counts."""
         calls, observed_ids, started_ids, completed_ids = [], set(), set(), set()
-        metadata = self.last_invocation_metadata = dict(started_count=0, completed_count=0,
+        metadata = dict(started_count=0, completed_count=0,
             parse_error_count=0, unknown_event_count=0, incomplete_count=0,
             expected_tool_name=True, expected_tool_arguments=True, process_code=returncode,
             turn_completed=False, final_answer_classification='missing')
+        if 'process_observation' in self.last_invocation_metadata:
+            metadata['process_observation'] = self.last_invocation_metadata['process_observation']
+        self.last_invocation_metadata = metadata
         protocol_invalid = False
         observed_write = False
         tool_failed = False
@@ -502,6 +608,13 @@ class CodexRuntime:
             self.last_invocation_metadata = {}
             if self.invocation_sink:
                 self.invocation_sink(dict(metadata))
+            def progress(summary):
+                self.last_invocation_metadata['process_observation'] = summary
+                if self.invocation_sink:
+                    self.invocation_sink(dict(metadata, duration_seconds=min(time.monotonic()-started, 7*86400),
+                                              process_observation=summary))
+            self._observation_progress = progress
+            self._process_observation = None
             state, retry = 'failed', False
             try:
                 result = self._invoke_once(prompt, schema, tools, expected_tool, expected_args)
@@ -527,7 +640,13 @@ class CodexRuntime:
                 if not retry:
                     raise
             finally:
+                self._observation_progress = None
+                if self._process_observation is not None:
+                    self._process_observation.optional('finalize', state)
+                    self.last_invocation_metadata['process_observation'] = self._process_observation.summary()
                 evidence = self.last_invocation_metadata
+                if 'process_observation' in evidence:
+                    metadata['process_observation'] = evidence['process_observation']
                 metadata.update(state=state, duration_seconds=min(time.monotonic()-started, 7*86400),
                     process_code=evidence.get('process_code'), started_count=evidence.get('started_count', 0),
                     completed_count=evidence.get('completed_count', 0))
@@ -535,7 +654,15 @@ class CodexRuntime:
                     metadata.update({key: evidence[key] for key in ('parse_error_count', 'unknown_event_count',
                         'incomplete_count', 'turn_completed', 'final_answer_classification') if key in evidence})
                 if self.invocation_sink:
-                    self.invocation_sink(dict(metadata))
+                    try:
+                        self.invocation_sink(dict(metadata))
+                    except BaseException:
+                        # Mandatory final audit durability still fails the call;
+                        # retain/recreate its private evidence when possible.
+                        if self._process_observation is not None:
+                            self._process_observation.optional('finalize', 'audit_failed')
+                            self.last_invocation_metadata['process_observation'] = self._process_observation.summary()
+                        raise
             # A failed durable completion raises above and cannot reach this wait.
             self._wait_batch_retry()
 
@@ -544,6 +671,8 @@ class CodexRuntime:
             os.chmod(directory, 0o700)
             args = self._args(directory, schema, tools)
             write = bool(set(tools) & {"create_event", "update_event", "delete_event"})
+            self._invocation_model, self._invocation_effort = ((self.config.tool_model, self.config.tool_effort) if tools
+                else (self.config.analysis_model, self.config.analysis_effort))
             self._active_tool_request = (expected_tool, expected_args, write) if tools else None
             try:
                 returncode, stdout, stderr = self.run_process(args, prompt, self.timeout)
@@ -617,7 +746,11 @@ class CodexRuntime:
             raise RuntimeFailure('agenda_model_configuration_required')
         prompt = agenda_prompt(snapshot)
         import hashlib
-        result = validate_agenda_plan(self._invoke(prompt, 'agenda_plan.json'), snapshot)
+        result = None
+        def validate(data):
+            nonlocal result
+            result = validate_agenda_plan(data, snapshot)
+        self._invoke(prompt, 'agenda_plan.json', validate=validate)
         self.last_agenda_metadata = {'model': AGENDA_MODEL, 'effort': AGENDA_EFFORT,
                                     'prompt_version': AGENDA_VERSION,
                                     'input_bytes': len(prompt.encode('utf-8')),

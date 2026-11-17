@@ -40,7 +40,7 @@ PROBE_FIELDS = ('attempt_number', 'model', 'effort', 'cli_version', 'started_at'
 DIAGNOSTIC_FIELDS = frozenset({'phase', 'state', 'requested_count', 'received_count',
     'duration_seconds', 'process_code', 'started_count', 'completed_count'})
 DIAGNOSTIC_OPTIONAL_FIELDS = frozenset({'error_code', 'source_kind', 'collection_step', 'http_status', 'evidence',
-    'private_capture_status', 'private_capture_id',
+    'private_capture_status', 'private_capture_id', 'process_observation',
     'batch_index', 'attempt_number', 'retry_decision', 'recovered', 'parse_error_count',
     'unknown_event_count', 'incomplete_count', 'turn_completed', 'final_answer_classification'})
 STRUCTURE_TAGS = frozenset(('html', 'body', 'div', 'table', 'tbody', 'thead', 'tfoot', 'tr',
@@ -179,6 +179,9 @@ def sync_diagnostics(value):
                              ('final_answer_classification', {'missing', 'exact_ok_true', 'exact_ok_false', 'other', 'multiple'})):
             if key in item and (not isinstance(item[key], str) or item[key] not in allowed):
                 raise ValueError('Invalid sync diagnostic classification.')
+        if 'process_observation' in item:
+            from .codex_diagnostics import validate_process_observation
+            validate_process_observation(item['process_observation'])
         if 'private_capture_status' in item or 'private_capture_id' in item:
             private_capture_metadata(item)
         if 'evidence' in item:

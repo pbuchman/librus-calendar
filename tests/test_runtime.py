@@ -127,12 +127,12 @@ class RuntimeTests(unittest.TestCase):
     def test_worker_interruption_kills_and_reaps_isolated_process_group(self):
         from app.sync import SyncInterrupted
         process = MagicMock(pid=12345)
-        process.communicate.side_effect = [SyncInterrupted('sync_interrupted'), ('', '')]
-        with patch('app.codex_runtime.subprocess.Popen', return_value=process), patch('app.codex_runtime.os.killpg') as kill:
+        process.communicate.return_value = ('', '')
+        with patch('app.codex_runtime.subprocess.Popen', return_value=process), patch('app.codex_runtime.CodexRuntime._pump_process', side_effect=SyncInterrupted('sync_interrupted')), patch('app.codex_runtime.os.killpg') as kill:
             with self.assertRaises(SyncInterrupted):
                 CodexRuntime()._run_process(['codex'], 'private input', 300)
             kill.assert_called_once_with(12345, signal.SIGKILL)
-            self.assertEqual(process.communicate.call_count, 2)
+            self.assertEqual(process.communicate.call_count, 1)
 
     def test_mcp_self_report_without_actual_call_is_rejected(self):
         def process(args, prompt, timeout):
@@ -543,9 +543,9 @@ class CalendarProbeTests(unittest.TestCase):
         from app.codex_runtime import CodexRuntime as ActualRuntime
         process = MagicMock(pid=12345, returncode=-9)
         started = json.dumps(self.call(identity='a', kind='item.started'))
-        process.communicate.side_effect = [subprocess.TimeoutExpired('codex', 300), (started, 'PRIVATE stderr')]
+        process.communicate.return_value = (started, 'PRIVATE stderr')
         runtime = ActualRuntime(TEST_CONFIG)
-        with patch.object(runtime, '_cli_version', return_value=None), patch('app.codex_runtime.subprocess.Popen', return_value=process), patch('app.codex_runtime.os.killpg'), self.assertRaisesRegex(RuntimeFailure, 'codex_timeout'):
+        with patch.object(runtime, '_cli_version', return_value=None), patch('app.codex_runtime.subprocess.Popen', return_value=process), patch.object(runtime, '_pump_process', side_effect=subprocess.TimeoutExpired('codex',300)), patch('app.codex_runtime.os.killpg'), self.assertRaisesRegex(RuntimeFailure, 'codex_timeout'):
             runtime.probe()
         attempt = runtime.last_probe_attempts[0]
         self.assertEqual((attempt['started_count'], attempt['completed_count'], attempt['process_code']), (1, 0, -9))

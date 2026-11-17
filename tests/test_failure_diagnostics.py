@@ -362,11 +362,11 @@ class ProcessDiagnosticsTests(unittest.TestCase):
             for error, code in ((subprocess.TimeoutExpired('synthetic', 1), 'codex_timeout'),
                                 (SyncInterrupted('sync_interrupted'), 'sync_interrupted')):
                 process = MagicMock(pid=12345, returncode=-9)
-                process.communicate.side_effect = [error, (output, 'PRIVATE quota')]
+                process.communicate.return_value = (output, 'PRIVATE quota')
                 runtime = CodexRuntime(TEST_CONFIG)
                 saved = []
                 runtime.invocation_sink = lambda item: saved.append(dict(item))
-                with self.subTest(counts=counts, code=code), patch('app.codex_runtime.subprocess.Popen', return_value=process), patch('app.codex_runtime.os.killpg'):
+                with self.subTest(counts=counts, code=code), patch('app.codex_runtime.subprocess.Popen', return_value=process), patch.object(runtime, '_pump_process', side_effect=error), patch('app.codex_runtime.os.killpg'):
                     with self.assertRaises((RuntimeFailure, SyncInterrupted)):
                         runtime._invoke('PRIVATE', 'tool.json', ('read_event',), 'read_event', args)
                 self.assertEqual(saved[-1]['error_code'], code)

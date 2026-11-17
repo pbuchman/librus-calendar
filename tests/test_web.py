@@ -71,6 +71,23 @@ class WebTests(unittest.TestCase):
                     self.assertIn('message_body',response.text)
                     self.assertIn('HTTP 503',response.text)
 
+    def test_process_observation_summary_and_legacy_rows_render_together(self):
+        from app.codex_diagnostics import ProcessObservation
+        original = self.store.status
+        observation = ProcessObservation()
+        observation.feed('stdout', b'{"type":"turn.started"}\n')
+        observation.finish(-9, 'app_timeout')
+        summary = observation.summary()
+        legacy = dict(phase='reconcile', state='failed', requested_count=1,
+            received_count=0, duration_seconds=.2, process_code=-9, started_count=0, completed_count=0)
+        diagnostics = dict(invocations=[legacy, dict(legacy, process_observation=summary)], omitted_count=0)
+        self.store.status = lambda: dict(original(), sync_diagnostics=diagnostics)
+        text = self.client.get('/').text
+        for expected in ('Ostatnia obserwacja: turn_started', 'bez postępu:', 'app_timeout',
+                         'Zaobserwowany błąd: unknown (none)', 'prywatny ślad: not_configured'):
+            self.assertIn(expected, text)
+        self.assertEqual(self.client.get('/api/status').json()['sync_diagnostics'], diagnostics)
+
     def test_batch_retry_attempts_and_recovery_render_in_existing_diagnostics(self):
         original=self.store.status
         base=dict(phase='reconcile',requested_count=1,received_count=0,duration_seconds=1.0,

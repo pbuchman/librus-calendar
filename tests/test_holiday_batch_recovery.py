@@ -282,11 +282,11 @@ class DiagnosticTests(TestCase):
         for output,counts in (('',(0,0)),(record('item.started'),(1,0)),(record('item.started')+'\n'+record('item.completed'),(1,1))):
             for failure in (subprocess.TimeoutExpired('codex',300),SyncInterrupted('sync_interrupted')):
                 child=MagicMock(pid=12345,returncode=-9)
-                child.communicate.side_effect=[failure,(output,'private stderr')]
+                child.communicate.return_value=(output,'private stderr')
                 runtime=CodexRuntime(TEST_CONFIG)
                 records=[]
                 runtime.invocation_sink=lambda data:records.append(dict(data))
-                with self.subTest(counts=counts,failure=type(failure)),patch('app.codex_runtime.subprocess.Popen',return_value=child),patch('app.codex_runtime.os.killpg'):
+                with self.subTest(counts=counts,failure=type(failure)),patch('app.codex_runtime.subprocess.Popen',return_value=child),patch.object(runtime,'_pump_process',side_effect=failure),patch('app.codex_runtime.os.killpg'):
                     with self.assertRaises((RuntimeFailure,SyncInterrupted)):runtime.read_events(BatchCalendarTests().expected(1))
                 self.assertEqual((records[-1]['started_count'],records[-1]['completed_count']),counts)
                 self.assertEqual(records[-1]['process_code'],-9)
