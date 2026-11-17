@@ -446,8 +446,10 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
         action = str(form.get('action', ''))
         if action not in {'approve', 'reject', 'confirm_cancel'}:
             raise HTTPException(400, 'Nieprawidłowa operacja.')
-        changes = {key: str(form[key]).strip() for key in ('title', 'start', 'end')
+        changes = {key: str(form[key]).strip() for key in ('title', 'start')
                    if key in form and str(form[key]).strip()}
+        if 'end' in form:
+            changes['end'] = str(form['end']).strip() or None
         if 'due_time' in form:
             changes['due_time'] = str(form['due_time']).strip()
         if 'edit_dates' in form:

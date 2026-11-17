@@ -114,5 +114,87 @@ class ReviewFormTests(unittest.TestCase):
         self.assertEqual(response.status_code, 303)
         saved, = store.list_proposals()
         self.assertEqual(saved['due_at'], before['due_at'])
+        self.assertFalse(saved['user_edited'])
         first_occurrence = datetime.fromisoformat('2030-10-27T02:45:00+02:00').astimezone(WARSAW)
         self.assertEqual(len(store.queue_operations(first_occurrence)), 1)
+
+    def test_unchanged_rendered_form_preserves_default_duration_and_decision(self):
+        store, client, before, endpoint, fields = self.prepare_form()
+        self.assertTrue(before['default_duration'])
+        self.assertEqual(fields['end'], '2030-11-10T10:00:00+01:00')
+        response = self.submit(client, endpoint, fields)
+        self.assertEqual(response.status_code, 303)
+        saved, = store.list_proposals()
+        self.assertTrue(saved['user_approved'])
+        self.assertFalse(saved['user_edited'])
+        self.assertTrue(saved['default_duration'])
+        decision = store.get_action(saved['id'])['decision']['proposal']
+        self.assertTrue(decision['user_approved'])
+        self.assertFalse(decision['user_edited'])
+        self.assertTrue(decision['default_duration'])
+        queued, = store.queue_operations(NOW)
+        self.assertIn('Czas trwania 60 minut przyjęty automatycznie', queued['event']['description'])
+
+    def test_equivalent_title_and_times_are_not_manual_edits(self):
+        store, client, _, endpoint, fields = self.prepare_form()
+        response = self.submit(client, endpoint, {**fields, 'title': 'Wycieczka',
+                               'start': '2030-11-10T08:00Z', 'end': '2030-11-10T09:00Z'})
+        self.assertEqual(response.status_code, 303)
+        saved, = store.list_proposals()
+        self.assertFalse(saved['user_edited'])
+        self.assertTrue(saved['default_duration'])
+
+    def test_submitted_end_edit_replaces_default_and_counts_as_manual(self):
+        store, client, _, endpoint, fields = self.prepare_form()
+        response = self.submit(client, endpoint, {**fields, 'end': '2030-11-10T10:30:00+01:00'})
+        self.assertEqual(response.status_code, 303)
+        saved, = store.list_proposals()
+        self.assertEqual(saved['end'], '2030-11-10T10:30:00+01:00')
+        self.assertTrue(saved['user_edited'])
+        self.assertFalse(saved['default_duration'])
+        queued, = store.queue_operations(NOW)
+        self.assertNotIn('Czas trwania 60 minut przyjęty automatycznie', queued['event']['description'])
+
+    def test_missing_end_preserves_explicit_end_and_empty_end_clears_it(self):
+        explicit_end = '2030-11-10T10:30:00+01:00'
+        for clear in (False, True):
+            with self.subTest(clear=clear):
+                store, client, _, endpoint, fields = self.prepare_form(end=explicit_end)
+                if clear:
+                    fields['end'] = ''
+                else:
+                    del fields['end']
+                response = self.submit(client, endpoint, fields)
+                self.assertEqual(response.status_code, 303)
+                saved, = store.list_proposals()
+                self.assertEqual(saved['end'], '2030-11-10T10:00:00+01:00' if clear else explicit_end)
+                self.assertEqual(saved['user_edited'], clear)
+                self.assertEqual(saved['default_duration'], clear)
+                queued, = store.queue_operations(NOW)
+                self.assertEqual(queued['event']['end']['dateTime'], saved['end'])
+                disclosed = 'Czas trwania 60 minut przyjęty automatycznie' in queued['event']['description']
+                self.assertEqual(disclosed, clear)
+                if clear:
+                    self.assertNotIn('wiadomość nie podaje końca', queued['event']['description'])
+
+    def test_moving_start_alone_recalculates_the_inferred_end(self):
+        store, client, _, endpoint, fields = self.prepare_form()
+        response = self.submit(client, endpoint, {**fields, 'start': '2030-11-10T11:15:00+01:00'})
+        self.assertEqual(response.status_code, 303)
+        saved, = store.list_proposals()
+        self.assertTrue(saved['user_edited'])
+        self.assertTrue(saved['default_duration'])
+        self.assertEqual(saved['end'], '2030-11-10T12:15:00+01:00')
+
+    def test_date_only_deadline_keeps_a_literal_title_suffix(self):
+        store, client, before, endpoint, fields = self.prepare_form(
+            title='Wycieczka — do 16:30', temporal_kind='deadline',
+            all_day=True, start='2030-03-12',
+        )
+        response = self.submit(client, endpoint, fields)
+        self.assertEqual(response.status_code, 303)
+        saved, = store.list_proposals()
+        self.assertEqual(saved['title'], before['title'])
+        self.assertFalse(saved['user_edited'])
+        self.assertIsNone(saved['due_at'])
+        self.assertEqual(fields['due_time'], '')

@@ -171,6 +171,27 @@ def apply_deadline_edit(item, patch):
     patch['description'] = '\n'.join(line for line in description.split('\n') if line != old_detail).rstrip()
 
 
+def apply_proposal_edit(item, patch):
+    """Apply form fields against the row read inside the approval transaction."""
+    apply_deadline_edit(item, patch)
+    if 'end' in patch:
+        end = patch['end'] or None
+        fixed_end = item.get('temporal_kind') in ('deadline', 'reminder')
+        if end and end != item.get('end') and not fixed_end:
+            all_day = patch.get('all_day', item.get('all_day')) is True
+            end = (date.fromisoformat(str(end)) if all_day else as_datetime(end)).isoformat()
+        if end == item.get('end') or fixed_end:
+            del patch['end']
+        else:
+            patch['end'] = end
+    updated = {**item, **patch}
+    if 'end' in patch:
+        updated['default_duration'] = False
+    elif item.get('default_duration') and updated.get('start') != item.get('start'):
+        updated['end'] = None
+    return updated
+
+
 def analysis_metadata(data, proposal_count):
     """Persist only the documented provenance fields; legacy runtimes remain unknown."""
     data = data if isinstance(data, dict) else {}
@@ -275,7 +296,8 @@ def event_body(proposal, message, marker, synchronization_started_at=None):
     if proposal.get('source_quote'):
         source += '\nFragment: ' + proposal['source_quote']
     if proposal.get('default_duration'):
-        source += '\nCzas trwania 60 minut przyjęty automatycznie; wiadomość nie podaje końca.'
+        source += '\nCzas trwania 60 minut przyjęty automatycznie'
+        source += '.' if proposal.get('user_edited') else '; wiadomość nie podaje końca.'
     if proposal.get('preference_decision') and not proposal.get('user_approved'):
         source += '\nAutomatyczna akceptacja na podstawie wcześniejszych decyzji rodzica (' + str(len(proposal['preference_decision']['example_ids'])) + ' przykłady).'
     source += '\n' + marker
@@ -863,20 +885,16 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             active = self.db.execute("SELECT status FROM operations WHERE proposal_id=? AND status IN ('inflight','unknown','applied')", (str(proposal_id),)).fetchone()
             if active:
                 raise ValueError('Resolve the existing operation before changing this proposal.')
-            item = self._proposal(row)
+            original = self._proposal(row)
             if decision == 'ignore':
-                item['status'] = 'ignored'
+                item = dict(original, status='ignored')
                 item['user_rejected'] = True
                 self.db.execute("UPDATE operations SET status='review',last_error='User ignored proposal.',updated_at=? WHERE proposal_id=? AND status='pending'", (utcnow(), str(proposal_id)))
             else:
                 patch = dict(patch or {})
                 if set(patch) - {'title','description','start','end','all_day','due_time'}:
                     raise ValueError('Unsupported proposal edit.')
-                apply_deadline_edit(item, patch)
-                item.update(patch)
-                if 'end' in patch:
-                    item['default_duration'] = False
-                item['user_edited'] = item.get('user_edited') is True or bool(patch)
+                item = apply_proposal_edit(original, patch)
                 if item['kind'] == 'cancel' and decision != 'confirm_cancel':
                     raise ValueError('Cancellation requires explicit confirm_cancel.')
                 if decision == 'confirm_cancel':
@@ -887,7 +905,10 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                     item['deletion_approved'] = True
                 item.update(confidence='high', needs_review=False, review_reason='', user_approved=True)
                 item = {**normalize_proposal(item), 'id': row['id'], 'message_id': row['message_id']}
-                if not self._approve_reviewed_create(self._proposal(row), item):
+                edited_fields = patch.keys() | {'default_duration'} if 'end' in patch else patch.keys()
+                item['user_edited'] = item['user_edited'] or any(
+                    item.get(field) != original.get(field) for field in edited_fields)
+                if not self._approve_reviewed_create(original, item):
                     if item['kind'] == 'update' and not self.db.execute('SELECT 1 FROM events WHERE id=? AND calendar_id=?', (item.get('event_id'), self.calendar_id)).fetchone():
                         raise ValueError('Target event is not app-owned.')
                     self._rebase_reviewed_conflict(item)
@@ -898,7 +919,7 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             self.db.execute('UPDATE proposals SET payload=?,status=?,updated_at=?,pending_since=? WHERE id=?',
                             (json.dumps(item, ensure_ascii=False), item['status'], stamp, pending_since, row['id']))
             from .data_admin import remember_decision
-            remember_decision(self, row, item, original=self._proposal(row))
+            remember_decision(self, row, item, original=original)
             self.remember_canonical_decision(row['id'])
             from .preferences import remember_proposal_choice
             remember_proposal_choice(self, row, item, decision)
