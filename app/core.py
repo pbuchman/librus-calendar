@@ -15,6 +15,8 @@ from .health_state import ERROR_CODES, RESULTS, STAGES, PROBE_FIELDS, probe_meta
 WARSAW = ZoneInfo('Europe/Warsaw')
 from .config import AppConfig, ConfigurationError, load_config
 PREFIX = 'librus-calendar:'
+SOURCE_LABELS = {'message': 'wiadomość', 'announcement': 'ogłoszenie',
+                 'school_event': 'terminarz szkolny', 'substitution': 'zastępstwo'}
 
 
 def utcnow():
@@ -204,7 +206,7 @@ def normalize_proposal(data, current=None, *, participation_preference=False):
 
 def event_body(proposal, message, marker, synchronization_started_at=None):
     description = proposal['description'].strip()
-    kind_label={'announcement':'ogłoszenie','school_event':'terminarz szkolny','substitution':'zastępstwo'}.get(message.get('source_kind'),'wiadomość')
+    kind_label = SOURCE_LABELS.get(message.get('source_kind'), SOURCE_LABELS['message'])
     source = '\n\nŹródło: Librus, ' + kind_label + ' ' + message['id'] + '\n' + (message.get('subject') or '')
     source += '\nNadawca: ' + (message.get('sender') or '') + '\nWysłano: ' + (message.get('sent_at') or '')
     if proposal.get('source_quote'):

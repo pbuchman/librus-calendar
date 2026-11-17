@@ -8,7 +8,7 @@ import re
 import sqlite3
 import stat
 
-from .core import WARSAW, as_datetime, digest, has_external_attendees, start_key, utcnow
+from .core import SOURCE_LABELS, WARSAW, as_datetime, digest, has_external_attendees, start_key, utcnow
 from .codex_runtime import event_fingerprint, normalize_event, RuntimeFailure
 from .sync import execution_deadline, safe_error, sync_lock, SyncInterrupted
 
@@ -479,7 +479,12 @@ def _prune_state_locked(store, *, days=30, apply=False, current=None):
 def event_ownership(event):
     text = str(event.get('description') or '')
     markers = set(re.findall(r'librus-calendar:[A-Za-z0-9_-]{8,128}', re.sub(r'\s+', '', text)))
-    sources = set(re.findall(r'Źródło\s*:\s*Librus\s*,\s*wiadomość\s+([A-Za-z0-9_-]{1,200})', text, re.IGNORECASE))
+    sources = set()
+    for kind, label in SOURCE_LABELS.items():
+        label_pattern = r'\s+'.join(map(re.escape, label.split()))
+        source_id = r'[A-Za-z0-9_-]{1,200}' if kind == 'message' else rf'{kind}:[0-9a-f]{{32}}'
+        sources.update(re.findall(rf'^\s*Źródło\s*:\s*Librus\s*,\s*{label_pattern}\s+({source_id})[^\S\r\n]*\r?$',
+                                  text, re.IGNORECASE | re.MULTILINE))
     return markers, sources
 
 

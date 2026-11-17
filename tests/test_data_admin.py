@@ -1,4 +1,5 @@
 """Synthetic-only migration, retention and Calendar reconstruction evidence."""
+from contextlib import closing
 from dataclasses import replace
 from datetime import timedelta
 import json
@@ -226,6 +227,46 @@ class DataAdminTests(unittest.TestCase):
         self.assertEqual(self.old.path.read_bytes(), before)
         self.assertEqual(self.store.db.execute('SELECT pending_since FROM proposals').fetchone()[0], baseline)
         self.assertEqual(read_monitoring_state(self.store.path)['oldest_pending_at'], baseline)
+
+    def test_fresh_rebuild_recovers_all_emitted_source_types(self):
+        from app.source_store import source_identity
+        from app.sync import SyncController
+        from test_agenda import NOW as AGENDA_NOW, item, plan
+
+        for kind in ('message', 'announcement', 'school_event'):
+            with self.subTest(kind=kind):
+                client = FakeClient(count=int(kind == 'message'))
+                batch = client.collect_sources()
+                learner_id = batch['learner']['id']
+                if kind != 'message':
+                    batch['sources'] = [{'kind': kind, 'upstream_id': 'example', 'learner_id': learner_id,
+                                         'title': 'Materiały', 'text': 'Klasa 1x przynosi papier do 12 marca.',
+                                         'published_at': AGENDA_NOW.isoformat(), 'metadata': {}}]
+                    client.collect_sources = lambda **kwargs: batch
+                else:
+                    snippets, total = client.messages()
+                    snippets[0]['sendDate'] = AGENDA_NOW.isoformat()
+                    client.messages = lambda **kwargs: (snippets, total)
+                    body = client.message('0')
+                    client.message = lambda mid: dict(body, sent_at=AGENDA_NOW.isoformat())
+                runtime = FakeRuntime()
+                runtime.plan_agenda = lambda snapshot: plan(snapshot, [item(snapshot)])
+                path = Path(self.tmp.name) / kind
+                with closing(AppStore(path / 'original' / 'state.sqlite3', config=TEST_CONFIG)) as original:
+                    original.set_writes_paused(False)
+                    sync = SyncController(original, client, runtime).run(current=AGENDA_NOW)
+                    self.assertEqual(sync['calendar_writes'], 1)
+                    saved, = original.list_events()
+                    snapshot = runtime.read_event(saved['id'])
+                expected_source = '0' if kind == 'message' else source_identity(kind, 'example', learner_id)
+                self.assertEqual(saved['message_id'], expected_source)
+                with closing(AppStore(path / 'rebuilt' / 'state.sqlite3', config=TEST_CONFIG)) as fresh:
+                    result = RebuildController(fresh, FakeClient(count=0), ReadRuntime([snapshot])).run(current=AGENDA_NOW)
+                    self.assertEqual((result['status'], result['events'], result['calendar_blocking_ambiguities']),
+                                     ('rebuilt', 1, 0))
+                    event, = fresh.list_events()
+                    self.assertEqual((event['id'], event['message_id'], event['marker']),
+                                     (saved['id'], expected_source, saved['marker']))
 
     def test_rebuild_complete_over_100_preserves_calendar_edits_and_repeated_ids(self):
         self.store.set_writes_paused(False)
