@@ -17,6 +17,8 @@ from .config import AppConfig, ConfigurationError, load_config
 PREFIX = 'librus-calendar:'
 SOURCE_LABELS = {'message': 'wiadomość', 'announcement': 'ogłoszenie',
                  'school_event': 'terminarz szkolny', 'substitution': 'zastępstwo'}
+REVIEWED_CREATE_WITH_TARGET = """(o.status='review' AND json_extract(o.payload,'$.action')='create'
+    AND COALESCE(json_extract(o.payload,'$.event_id'),json_extract(o.result,'$.event_id')) IS NOT NULL)"""
 
 
 def utcnow():
@@ -706,6 +708,67 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
         self.db.execute('UPDATE events SET snapshot=?,fingerprint=?,updated_at=? WHERE id=? AND calendar_id=?',
                         (json.dumps(snapshot, ensure_ascii=False), fingerprint, utcnow(), target_id, self.calendar_id))
 
+    def _verified_create_snapshot(self, operation, result, event_id):
+        from .codex_runtime import event_fingerprint, marker_present
+        snapshot = result.get('snapshot')
+        if (operation['calendar_id'] == self.calendar_id and event_id and event_id == result.get('event_id')
+                and isinstance(snapshot, dict) and snapshot.get('id') == event_id and snapshot.get('status') != 'cancelled'
+                and marker_present(snapshot.get('description'), operation['marker'])
+                and not has_external_attendees(snapshot, self.config.calendar_owner) and not snapshot.get('recurrence')
+                and result.get('fingerprint') == event_fingerprint(snapshot, self.config.calendar_owner)):
+            return snapshot
+        return None
+
+    def _approve_reviewed_create(self, original, item):
+        """Rebase a confirmed creation as an update of its exact Calendar ID."""
+        row = self.db.execute("SELECT * FROM operations WHERE proposal_id=? AND status IN ('pending','review')",
+                              (item['id'],)).fetchone()
+        if not row or not row['result']:
+            return False
+        operation = json.loads(row['payload'])
+        result = json.loads(row['result'])
+        history = operation.get('reviewed_create')
+        if not history and not (operation['action'] == 'create' and result.get('error') in
+                                ('write_verification_mismatch', 'existing_event_changed', 'duplicate_marker')):
+            return False
+        if item['status'] != 'pending':
+            return True
+        from .codex_runtime import normalize_event
+        event_id = operation.get('event_id') or result.get('event_id')
+        marker = operation['marker']
+        snapshot = self._verified_create_snapshot(operation, result, event_id)
+        if not snapshot or result.get('error') not in ('write_verification_mismatch', 'existing_event_changed', 'manual_edit_conflict'):
+            raise ValueError('The reviewed create lacks safe evidence of an exact owned Calendar event.')
+        owned = self.db.execute('SELECT calendar_id,marker,state FROM events WHERE id=?', (event_id,)).fetchone()
+        if owned and (owned['calendar_id'], owned['marker'], owned['state']) != (self.calendar_id, marker, 'active'):
+            raise ValueError('The reviewed Calendar event conflicts with existing local ownership.')
+
+        writable = ('summary', 'description', 'start', 'end', 'location', 'reminders')
+        observed = normalize_event(snapshot, self.config.calendar_owner)
+        body = {**{field: observed[field] for field in writable}, 'description': snapshot['description']}
+        stamp = operation.get('synchronization_started_at') or utcnow()
+        source = self.get_message(item['message_id'])
+        # Approval also changes how learned provenance is rendered. That metadata
+        # transition is not a user edit to the Calendar description.
+        before = event_body({**original, 'user_approved': item['user_approved']}, source, marker, stamp)
+        after = event_body(item, source, marker, stamp)
+        fields = {field for field in ('summary', 'description', 'start', 'end') if before[field] != after[field]}
+        # Keep corrections already approved if a later remote edit interrupts the update.
+        fields.update(operation.get('approved_fields', ()))
+        body.update({field: after[field] for field in fields})
+        start, end = body['start'], body['end']
+        date_field = 'date' if 'date' in start else 'dateTime'
+        if date_field not in start or date_field not in end or as_datetime(end[date_field]) <= as_datetime(start[date_field]):
+            raise ValueError('The reviewed Calendar interval requires an explicit start and end correction.')
+        history = history or {'event': operation['event'], 'result': result}
+        operation.update(action='update', event_id=event_id, expected_fingerprint=result['fingerprint'],
+                         event=body, reviewed_create=history, approved_fields=sorted(fields),
+                         prior_snapshot={'start': observed['start'], 'end': observed['end']})
+        self.db.execute("UPDATE operations SET payload=?,status='pending',last_error=NULL,updated_at=? WHERE id=?",
+                        (json.dumps(operation, ensure_ascii=False), utcnow(), row['id']))
+        item.update(kind='update', event_id=event_id)
+        return True
+
     def resolve_proposal(self, proposal_id, decision, patch=None):
         if decision not in ('approve','ignore','confirm_cancel'):
             raise ValueError('Decision must be approve, ignore, or confirm_cancel.')
@@ -719,7 +782,7 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             if json.loads(row['payload']).get('blocked_by_offer_group') and decision != 'ignore':
                 raise ValueError('This option belongs to an existing offer; reconcile the complete membership before approval.')
             deferred = json.loads(row['payload']).get('deferred_unknown_operation')
-            if deferred and decision != 'ignore' and self.db.execute("SELECT 1 FROM operations WHERE id=? AND status IN ('unknown','inflight')", (deferred,)).fetchone():
+            if deferred and decision != 'ignore' and self.write_needs_reconciliation(deferred):
                 raise ValueError('Reconcile the prior write before approving this change.')
             if json.loads(row['payload']).get('blocked_by_group_decision') and decision != 'ignore':
                 raise ValueError('A prior group decision blocks this ambiguous replacement.')
@@ -760,11 +823,12 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                     item['deletion_approved'] = True
                 item.update(confidence='high', needs_review=False, review_reason='', user_approved=True)
                 item = {**normalize_proposal(item), 'id': row['id'], 'message_id': row['message_id']}
-                if item['kind'] == 'update' and not self.db.execute('SELECT 1 FROM events WHERE id=? AND calendar_id=?', (item.get('event_id'), self.calendar_id)).fetchone():
-                    raise ValueError('Target event is not app-owned.')
-                self._rebase_reviewed_conflict(item)
-                # An edited, definitely-unwritten operation can be rebuilt from the new proposal.
-                self.db.execute("DELETE FROM operations WHERE proposal_id=? AND status IN ('pending','review')", (row['id'],))
+                if not self._approve_reviewed_create(self._proposal(row), item):
+                    if item['kind'] == 'update' and not self.db.execute('SELECT 1 FROM events WHERE id=? AND calendar_id=?', (item.get('event_id'), self.calendar_id)).fetchone():
+                        raise ValueError('Target event is not app-owned.')
+                    self._rebase_reviewed_conflict(item)
+                    # Definitely unwritten work can be rebuilt from the new proposal.
+                    self.db.execute("DELETE FROM operations WHERE proposal_id=? AND status IN ('pending','review')", (row['id'],))
             stamp = utcnow()
             pending_since = ((row['pending_since'] or row['created_at']) if row['status'] == 'pending' else stamp) if item['status'] == 'pending' else None
             self.db.execute('UPDATE proposals SET payload=?,status=?,updated_at=?,pending_since=? WHERE id=?',
@@ -905,6 +969,10 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
         with self.lock:
             return [json.loads(row[0]) for row in self.db.execute("SELECT o.payload FROM operations o JOIN proposals p ON p.id=o.proposal_id WHERE o.status='pending' AND p.status='pending' ORDER BY o.created_at,o.id LIMIT ?", (limit,))]
 
+    def write_needs_reconciliation(self, operation_id):
+        return self.db.execute(f"SELECT 1 FROM operations o WHERE id=? AND (o.status IN ('unknown','inflight') OR {REVIEWED_CREATE_WITH_TARGET})",
+                               (operation_id,)).fetchone() is not None
+
     def recover_interrupted(self):
         # Only call under the single worker lock, never from the web process.
         with self.lock, self.db:
@@ -977,6 +1045,20 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                             (json.dumps(operation, ensure_ascii=False), utcnow(), operation_id))
             return operation
 
+    def _register_reviewed_create_target(self, operation, result):
+        """Keep the exact owned ID and the attempted baseline during review."""
+        from .codex_runtime import event_fingerprint
+        event_id = operation['event_id']
+        if (result.get('error') not in ('write_verification_mismatch', 'existing_event_changed')
+                or not self._verified_create_snapshot(operation, result, event_id)):
+            return False
+        baseline = dict(operation['event'], id=event_id)
+        inserted = self.db.execute("""INSERT INTO events(id,calendar_id,message_id,proposal_id,snapshot,fingerprint,marker,updated_at,state)
+            VALUES (?,?,?,?,?,?,?,?,'active') ON CONFLICT(id) DO NOTHING""",
+            (event_id, self.calendar_id, operation['message_id'], operation['proposal_id'], json.dumps(baseline, ensure_ascii=False),
+             event_fingerprint(baseline, self.config.calendar_owner), operation['marker'], utcnow()))
+        return bool(inserted.rowcount)
+
     def record_result(self, operation_id, result, *, agenda_calendar=None, current=None):
         if not isinstance(result, dict) or result.get('status') not in ('applied','review','unknown','failed'):
             result = {'status': 'unknown', 'error': 'Invalid execution result; possible external write.'}
@@ -1006,8 +1088,14 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                 if has_external_attendees(snapshot, self.config.calendar_owner) or not contains_marker(snapshot.get('description'), owned_marker):
                     result = {'status': 'review', 'error': 'Returned event has attendees or lacks application ownership.'}
                     status = 'review'
+            if operation['action'] == 'create' and status in ('unknown', 'review') and result.get('event_id'):
+                # Definite identity survives a failed verification read and later approval.
+                operation['event_id'] = operation.get('event_id') or result['event_id']
+                operation.setdefault('reviewed_create', {'event': operation['event'], 'result': result})
+                if status == 'review' and self._register_reviewed_create_target(operation, result) and agenda_calendar is not None:
+                    agenda_calendar[operation['event_id']] = result['snapshot']
             state = 'pending' if status == 'failed' else status
-            self.db.execute('UPDATE operations SET status=?,result=?,last_error=?,updated_at=? WHERE id=?', (state, json.dumps(result, ensure_ascii=False), str(result.get('error') or '')[:500], utcnow(), operation_id))
+            self.db.execute('UPDATE operations SET payload=?,status=?,result=?,last_error=?,updated_at=? WHERE id=?', (json.dumps(operation, ensure_ascii=False), state, json.dumps(result, ensure_ascii=False), str(result.get('error') or '')[:500], utcnow(), operation_id))
             if status == 'applied':
                 snapshot = result['snapshot']
                 self.db.execute('INSERT INTO events(id,calendar_id,message_id,proposal_id,snapshot,fingerprint,marker,updated_at,state) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET proposal_id=excluded.proposal_id,snapshot=excluded.snapshot,fingerprint=excluded.fingerprint,marker=excluded.marker,updated_at=excluded.updated_at,state=excluded.state',

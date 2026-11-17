@@ -137,10 +137,10 @@ def event_fingerprint(event, owner_email=""):
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def _result(status, *, event=None, error=None, owner_email=""):
+def _result(status, *, event=None, event_id=None, error=None, owner_email=""):
     return {
         "status": status,
-        "event_id": (event or {}).get("id"),
+        "event_id": event_id or (event or {}).get("id"),
         "event_url": (event or {}).get("htmlLink") or (event or {}).get("html_link") or (event or {}).get("web_link") or (event or {}).get("url"),
         "snapshot": event,
         "fingerprint": event_fingerprint(event, owner_email) if event else None,
@@ -1059,7 +1059,9 @@ class CodexRuntime:
         event = operation.get("event") or {}
         if set(event) - {"summary", "description", "location", "start", "end", "reminders"}:
             raise RuntimeFailure("unsafe_event_fields")
-        if not str(event.get("summary", "")).startswith(("[Librus]", "[Szkoła]")) or operation["marker"] not in str(event.get("description", "")):
+        reviewed_create = operation["action"] == "update" and operation.get("reviewed_create")
+        if ((not reviewed_create and not str(event.get("summary", "")).startswith(("[Librus]", "[Szkoła]")))
+                or not marker_present(event.get("description"), operation["marker"])):
             raise RuntimeFailure("event_ownership_missing")
         start, end = event.get("start") or {}, event.get("end") or {}
         if set(start) - {"date", "dateTime", "timeZone"} or set(end) - {"date", "dateTime", "timeZone"}:
@@ -1131,12 +1133,18 @@ class CodexRuntime:
         except (RuntimeFailure, TypeError, ValueError, KeyError) as exc:
             return _result("failed", error=exc.code if isinstance(exc, RuntimeFailure) else "invalid_operation", owner_email=self.config.calendar_owner)
         written = False
+        event_id = operation.get("event_id")
         try:
             action = operation["action"]
             desired = operation["event"]
             if action == "create":
-                if operation.get("event_id"):
-                    known = self._fetch(operation["event_id"], desired)
+                if event_id:
+                    try:
+                        known = self._fetch(event_id, desired)
+                    except RuntimeFailure as exc:
+                        if exc.code not in ("calendar_event_not_found", "calendar_event_missing", "calendar_event_id_mismatch"):
+                            raise
+                        return _result("review", event_id=event_id, error="event_deleted_or_unavailable", owner_email=self.config.calendar_owner)
                     if not marker_present(known.get("description"), operation["marker"]):
                         return _result("review", event=known, error="known_event_marker_missing", owner_email=self.config.calendar_owner)
                     existing = [known]
@@ -1168,14 +1176,21 @@ class CodexRuntime:
                         tombstone = self._cancel_tombstone(operation, current)
                         return _result("applied", event=tombstone, owner_email=self.config.calendar_owner) if tombstone else _result("review", event=current, error="cancelled_event_conflict", owner_email=self.config.calendar_owner)
                     return _result("review", event=current, error="event_deleted_or_unavailable", owner_email=self.config.calendar_owner)
-                if not re.search(r"librus-calendar:[A-Za-z0-9_-]{8,128}", "".join(str(current.get("description", "")).split())):
+                if operation.get("reviewed_create"):
+                    owned = marker_present(current.get("description"), operation["marker"])
+                else:
+                    owned = re.search(r"librus-calendar:[A-Za-z0-9_-]{8,128}", "".join(str(current.get("description", "")).split()))
+                if not owned:
                     return _result("review", event=current, error="event_not_owned", owner_email=self.config.calendar_owner)
+                current_fingerprint = event_fingerprint(current, owner_email=self.config.calendar_owner)
                 if operation.get("reconcile_only"):
-                    if action == "update" and event_fingerprint(current, owner_email=self.config.calendar_owner) == event_fingerprint(desired, owner_email=self.config.calendar_owner):
+                    if action == "update" and current_fingerprint == event_fingerprint(desired, owner_email=self.config.calendar_owner):
                         return _result("applied", event=current, owner_email=self.config.calendar_owner)
                     return _result("unknown", event=current, error="write_not_reconciled", owner_email=self.config.calendar_owner)
-                if event_fingerprint(current, owner_email=self.config.calendar_owner) != operation["expected_fingerprint"]:
+                if current_fingerprint != operation["expected_fingerprint"]:
                     return _result("review", event=current, error="manual_edit_conflict", owner_email=self.config.calendar_owner)
+                if operation.get("reviewed_create") and current_fingerprint == event_fingerprint(desired, owner_email=self.config.calendar_owner):
+                    return {**_result("applied", event=current, owner_email=self.config.calendar_owner), "reconciled": True}
             if action == "cancel":
                 self._tool("delete_event", {"calendar_id": self.config.calendar_id, "event_id": operation["event_id"]})
                 written = True
@@ -1192,14 +1207,19 @@ class CodexRuntime:
             result = self._tool("create_event" if action == "create" else "update_event", self._write_args(operation))
             written = True
             event = self._event_from(result)
-            event_id = (event or {}).get("id") or operation.get("event_id")
+            returned_id = (event or {}).get("id")
+            if event_id and returned_id and returned_id != event_id:
+                return _result("unknown", event_id=event_id, error="calendar_event_id_mismatch", owner_email=self.config.calendar_owner)
+            event_id = event_id or returned_id
             if not event_id:
                 return _result("unknown", error="write_id_missing", owner_email=self.config.calendar_owner)
             fetched = self._fetch(event_id, desired)
             if not marker_present(fetched.get("description"), operation["marker"]):
                 return _result("unknown", event=fetched, error="write_marker_missing", owner_email=self.config.calendar_owner)
+            if fetched.get("status") == "cancelled":
+                return _result("review", event=fetched, error="event_deleted_or_unavailable", owner_email=self.config.calendar_owner)
             if event_fingerprint(fetched, owner_email=self.config.calendar_owner) != event_fingerprint(desired, owner_email=self.config.calendar_owner):
                 return _result("review", event=fetched, error="write_verification_mismatch", owner_email=self.config.calendar_owner)
             return _result("applied", event=fetched, owner_email=self.config.calendar_owner)
         except RuntimeFailure as exc:
-            return _result("unknown" if written or exc.possible_write or operation.get("reconcile_only") else "failed", error=exc.code, owner_email=self.config.calendar_owner)
+            return _result("unknown" if written or exc.possible_write or operation.get("reconcile_only") else "failed", event_id=event_id, error=exc.code, owner_email=self.config.calendar_owner)

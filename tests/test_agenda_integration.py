@@ -591,6 +591,68 @@ class AgendaIntegrationTests(AgendaTests):
         self.assertEqual(planner.run(NOW)['status'], 'unchanged')
         self.assertEqual(runtime.calls, 1)
 
+    def test_new_agenda_revision_targets_known_create_after_verification_conflict(self):
+        from test_runtime import FakeRuntime
+
+        initial, runtime, planner = self.apply(lambda snapshot: [item(snapshot)])
+        original, = initial['items']
+        self.store.set_writes_paused(False)
+        operation, = self.store.queue_operations(NOW)
+        self.assertTrue(self.store.claim_operation(operation['operation_id']))
+        outcome = runtime.execute(operation)
+        eid = outcome['event_id']
+        runtime.events[eid]['location'] = 'Sala 12'
+        observed = runtime.events[eid]
+        self.store.record_result(operation['operation_id'], {
+            'status': 'review', 'error': 'write_verification_mismatch', 'event_id': eid,
+            'snapshot': observed, 'fingerprint': event_fingerprint(observed)}, agenda_calendar=planner.calendar, current=NOW)
+
+        message = self.store.get_message('fictional-message')
+        self.store.save_message({**message, 'text': message['text'] + ' Przełożono na 19 marca.'})
+        runtime.select = lambda snapshot: [item(snapshot, 'update', action_id=original['action_id'],
+                                               action=dict(action(), start='2030-03-19'))]
+        revision, = planner.run(NOW)['items']
+        self.assertEqual(revision['operation'], 'review')
+        self.assertNotEqual(revision['proposal_id'], original['proposal_id'])
+        new = next(proposal for proposal in self.store.list_proposals() if proposal['id'] == revision['proposal_id'])
+        self.assertEqual((new['kind'], new['event_id'], new['start']), ('update', eid, '2030-03-19'))
+        self.assertEqual(self.store.queue_operations(NOW), [])
+        self.store.resolve_proposal(new['id'], 'approve')
+        queued, = self.store.queue_operations(NOW)
+        self.assertEqual((queued['action'], queued['event_id']), ('update', eid))
+        self.assertTrue(self.store.claim_operation(queued['operation_id']))
+        writer = FakeRuntime([{'event': observed}])
+        check = writer.execute(queued)
+        self.assertEqual((check['status'], check['error']), ('review', 'manual_edit_conflict'))
+        self.assertEqual([tool for tool, args in writer.calls], ['read_event'])
+        self.store.record_result(queued['operation_id'], check, agenda_calendar=planner.calendar, current=NOW)
+        self.assertEqual(list(runtime.events), [eid])
+        self.assertEqual([write['action'] for write in runtime.writes], ['create'])
+
+    def test_unverified_known_create_blocks_new_agenda_revision_approval(self):
+        initial, runtime, planner = self.apply(lambda snapshot: [item(snapshot)])
+        original, = initial['items']
+        self.store.set_writes_paused(False)
+        operation, = self.store.queue_operations(NOW)
+        self.assertTrue(self.store.claim_operation(operation['operation_id']))
+        outcome = runtime.execute(operation)
+        del runtime.events[outcome['event_id']]
+        self.store.record_result(operation['operation_id'], {
+            'status': 'review', 'error': 'event_deleted_or_unavailable', 'event_id': outcome['event_id']},
+            agenda_calendar=planner.calendar, current=NOW)
+
+        message = self.store.get_message('fictional-message')
+        self.store.save_message({**message, 'text': message['text'] + ' Przełożono na 19 marca.'})
+        runtime.select = lambda snapshot: [item(snapshot, 'update', action_id=original['action_id'],
+                                               action=dict(action(), start='2030-03-19'))]
+        revision, = planner.run(NOW)['items']
+        self.assertNotEqual(revision['proposal_id'], original['proposal_id'])
+        self.assertEqual(revision['status'], 'review')
+        with self.assertRaisesRegex(ValueError, 'Reconcile the prior write'):
+            self.store.resolve_proposal(revision['proposal_id'], 'approve')
+        self.assertEqual(self.store.queue_operations(NOW), [])
+        self.assertEqual(len(runtime.writes), 1)
+
     def test_external_event_edit_forces_review_but_link_preserves_human_hours(self):
         event = self.inventory()
         self.ready()

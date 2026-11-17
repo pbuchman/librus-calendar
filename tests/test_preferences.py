@@ -141,6 +141,39 @@ class PreferenceTests(unittest.TestCase):
         self.assertEqual(preference_status(self.store.db)['examples'], 2)
         self.assertEqual(self.store.db.execute('SELECT status FROM proposals WHERE id=?', (pid,)).fetchone()[0], 'applied')
 
+    def test_approval_after_learned_create_conflict_preserves_external_description(self):
+        from test_write_reviews import Calendar as WriteCalendar
+
+        class CalendarWithParentNote(WriteCalendar):
+            def _tool(self, name, args):
+                result = super()._tool(name, args)
+                if name == 'create_event':
+                    self.event['description'] = 'Notatka rodzica.\n' + self.event['description']
+                return result
+
+        context = self.examples()
+        snapshot, selected = self.learned(context)
+        pid = self.apply(snapshot, selected)['items'][0]['proposal_id']
+        integration_tests.AgendaIntegrationTests.ready(self)
+        self.store.set_writes_paused(False)
+        operation = next(op for op in self.store.queue_operations(NOW) if op['proposal_id'] == pid)
+        self.assertIn('Automatyczna akceptacja', operation['event']['description'])
+        self.assertTrue(self.store.claim_operation(operation['operation_id']))
+        runtime = CalendarWithParentNote()
+        review = runtime.execute(operation)
+        self.assertEqual(review['error'], 'write_verification_mismatch')
+        self.store.record_result(operation['operation_id'], review)
+
+        approved = self.store.resolve_proposal(pid, 'approve')
+        self.assertFalse(approved['user_edited'])
+        correction = next(op for op in self.store.pending_operations() if op['proposal_id'] == pid)
+        self.assertEqual(correction['event']['description'], runtime.event['description'])
+        self.assertTrue(self.store.claim_operation(correction['operation_id']))
+        settled = runtime.execute(correction)
+        self.assertEqual(settled['status'], 'applied')
+        self.assertTrue(settled['reconciled'])
+        self.assertEqual(runtime.writes, [('create_event', settled['event_id'])])
+
     def test_automatic_reject_keeps_provenance_and_has_no_human_rejection_flag(self):
         context = self.examples('ignore')
         snapshot, selected = self.learned(context, operation='ignore')
