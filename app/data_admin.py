@@ -571,6 +571,13 @@ class RebuildController:
         # Exact transferred IDs are verified even when connector search omitted
         # a modified description. Ownership is never inferred from a title.
         saved = {event['id']: event for event in self.store.list_events(100000, include_cancelled=True)}
+        uncertain_events = {row['event_id'] for row in self.store.db.execute("""
+            SELECT event_id FROM metadata_refresh WHERE status IN ('inflight','unknown')
+            UNION
+            SELECT json_extract(payload, '$.event_id') FROM operations WHERE status IN ('inflight','unknown')
+            UNION
+            SELECT json_extract(result, '$.event_id') FROM operations WHERE status IN ('inflight','unknown')
+        """)}
         for event_id, row in saved.items():
             # Search may flatten all-day dates to ambiguous midnight strings.
             # The verified saved snapshot supplies only the temporal kind; the
@@ -586,6 +593,8 @@ class RebuildController:
                 snapshot = self.runtime.read_event(event_id, hint)
             except RuntimeFailure as error:
                 if error.code == 'calendar_event_not_found' and event_id in saved:
+                    if saved[event_id]['state'] == 'cancelled' and event_id not in uncertain_events:
+                        continue
                     problems[event_id] = 'Transferred event deleted or unavailable; ownership retained.'
                     continue
                 raise

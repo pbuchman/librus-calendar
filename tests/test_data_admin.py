@@ -563,6 +563,51 @@ class DataAdminTests(unittest.TestCase):
         self.assertEqual(second['state']['operations_unknown'], 0)
         self.assertEqual(calls.count('delete_event'), 1)
 
+    def test_missing_settled_cancellation_does_not_block_unrelated_writes(self):
+        from app.sync import SyncController
+
+        self.decision('0', apply=True)
+        event, = self.old.list_events()
+        self.old.save_message(message('4'))
+        cancellation, = self.old.save_proposals('4', [proposal(kind='cancel', event_id=event['id'])], NOW)
+        self.old.resolve_proposal(cancellation['id'], 'confirm_cancel')
+        operation, = self.old.queue_operations(NOW)
+        self.old.set_writes_paused(False)
+
+        rebuild = RebuildController(self.old, FakeClient(count=0), ReadRuntime())
+        active = rebuild.run(current=NOW)
+        self.assertEqual((active['status'], active['calendar_blocking_ambiguities']), ('review', 1))
+        # Restore verified ownership before simulating a cancellation of uncertain outcome.
+        RebuildController(self.old, FakeClient(count=0), ReadRuntime([event['snapshot']])).run(current=NOW)
+        self.assertTrue(self.old.claim_operation(operation['operation_id']))
+        self.old.record_result(operation['operation_id'], {'status': 'unknown'})
+        unknown = rebuild.run(current=NOW)
+        self.assertEqual((unknown['status'], unknown['calendar_blocking_ambiguities']), ('review', 1))
+        self.assertEqual(self.old.status()['operations_unknown'], 1)
+
+        tombstone = dict(event['snapshot'], status='cancelled')
+        self.old.record_result(operation['operation_id'], {'status': 'applied', 'event_id': event['id'],
+            'snapshot': tombstone, 'fingerprint': event_fingerprint(tombstone, TEST_CONFIG.calendar_owner)})
+        migrate_decisions(self.store, self.old.path)
+        transferred, = self.store.list_events(include_cancelled=True)
+        self.assertEqual(transferred['state'], 'cancelled')
+        control = RebuildController(self.store, FakeClient(count=0), ReadRuntime([tombstone])).run(current=NOW)
+        self.assertEqual((control['status'], control['calendar_blocking_ambiguities']), ('rebuilt', 0))
+        transferred, = self.store.list_events(include_cancelled=True)
+        rebuilt = RebuildController(self.store, FakeClient(count=0), ReadRuntime()).run(current=NOW)
+        self.assertEqual((rebuilt['status'], rebuilt['calendar_blocking_ambiguities']), ('rebuilt', 0))
+        self.assertEqual(self.store.list_events(include_cancelled=True), [transferred])
+
+        self.store.set_writes_paused(False)
+        client = FakeClient()
+        snippets, total = client.messages()
+        snippets[0]['messageId'] = '7'
+        client.messages = lambda **kwargs: (snippets, total)
+        runtime = FakeRuntime()
+        sync = SyncController(self.store, client, runtime).run(current=NOW)
+        self.assertEqual(sync['calendar_writes'], 1)
+        self.assertEqual([op['message_id'] for op in runtime.executed], ['7'])
+
     def test_rebuild_write_gate_applies_at_claim_for_an_existing_pending_operation(self):
         self.store.save_message(message('0'))
         self.store.save_proposals('0', [proposal()], NOW)
