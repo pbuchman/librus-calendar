@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from dataclasses import replace
 from urllib.parse import urlsplit
 from .config import AppConfig, ConfigurationError, load_config
+from .core import deadline_datetime, without_deadline_title_label
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -108,6 +109,14 @@ def human_date(value):
         return str(value)
 
 
+def deadline_form_time(value):
+    try:
+        hour = deadline_datetime(value).time()
+        return hour.isoformat(timespec='auto' if hour.second or hour.microsecond else 'minutes')
+    except ValueError:
+        return ''
+
+
 def event_date(snapshot):
     boundary = snapshot.get('start') or snapshot.get('start_time') or snapshot.get('start_date')
     if isinstance(boundary, dict):
@@ -165,6 +174,8 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
     application = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     templates = Jinja2Templates(directory=str(ROOT / 'templates'))
     templates.env.filters['human_date'] = human_date
+    templates.env.filters['deadline_form_time'] = deadline_form_time
+    templates.env.filters['deadline_base_title'] = without_deadline_title_label
     templates.env.filters['event_date'] = event_date
     templates.env.filters['calendar_probe_status'] = calendar_probe_status
     templates.env.filters['source_outcome'] = source_outcome
@@ -437,6 +448,8 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
             raise HTTPException(400, 'Nieprawidłowa operacja.')
         changes = {key: str(form[key]).strip() for key in ('title', 'start', 'end')
                    if key in form and str(form[key]).strip()}
+        if 'due_time' in form:
+            changes['due_time'] = str(form['due_time']).strip()
         if 'edit_dates' in form:
             changes['all_day'] = form.get('all_day') == 'true'
         try:
@@ -444,7 +457,7 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
             if not proposal or (proposal.get('kind') == 'cancel' and action == 'approve'):
                 raise ValueError('Cancellation requires explicit confirmation')
             store.resolve_proposal(proposal_id, 'ignore' if action == 'reject' else action, changes)
-        except (ValueError, KeyError) as error:
+        except (ValueError, KeyError, OverflowError):
             raise HTTPException(400, 'Nie można zapisać tej decyzji. Sprawdź daty i stan propozycji.') from None
         return RedirectResponse('/review?notice=resolved', status_code=303)
 

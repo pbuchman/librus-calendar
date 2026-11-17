@@ -114,6 +114,62 @@ def deadline_datetime(value):
     return local
 
 
+def deadline_label(due):
+    return 'do ' + due.strftime('%H:%M')
+
+
+def deadline_detail(due):
+    return f'Termin: {due.date().isoformat()} {deadline_label(due)} (Europe/Warsaw).'
+
+
+def without_deadline_title_label(title, previous=None):
+    title = re.sub(r'(?: — do \d{2}:\d{2})+$', '', title)
+    # Older proposals sometimes already included the hour in the supplied title.
+    return title.removesuffix(' ' + deadline_label(previous)).rstrip() if previous else title
+
+
+def edited_deadline_due_at(day, value, previous):
+    if not value:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r'\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?', value):
+        raise ValueError('A deadline hour must be a local time.')
+    wall = datetime.fromisoformat(f'{day}T{value}')
+    if previous and previous.replace(tzinfo=None) == wall:
+        return previous.isoformat()
+    local = wall.replace(tzinfo=WARSAW)
+    if local.utcoffset() != local.replace(fold=1).utcoffset():
+        raise ValueError('Choose a deadline time outside the Warsaw clock change.')
+    return deadline_datetime(local.isoformat()).isoformat()
+
+
+def apply_deadline_edit(item, patch):
+    if item.get('temporal_kind') != 'deadline':
+        if 'due_time' in patch:
+            raise ValueError('Only deadlines can have a deadline hour.')
+        return
+    if 'due_time' not in patch and not (item.get('due_at') and 'start' in patch):
+        return
+
+    previous = None
+    if item.get('due_at'):
+        try:
+            previous = deadline_datetime(item['due_at'])
+        except ValueError:
+            if 'due_time' not in patch:
+                raise
+    due_time = patch.pop('due_time', previous.time().isoformat() if previous else None)
+    due_at = edited_deadline_due_at(patch.get('start', item['start']), due_time, previous)
+    if due_at == item.get('due_at'):
+        return
+    patch['due_at'] = due_at
+    if not previous:
+        return
+    patch['title'] = without_deadline_title_label(patch.get('title', item['title']), previous)
+    description = patch.get('description', item['description']) or ''
+    old_detail = deadline_detail(previous)
+    patch['description'] = '\n'.join(line for line in description.split('\n') if line != old_detail).rstrip()
+
+
 def analysis_metadata(data, proposal_count):
     """Persist only the documented provenance fields; legacy runtimes remain unknown."""
     data = data if isinstance(data, dict) else {}
@@ -168,10 +224,11 @@ def normalize_proposal(data, current=None, *, participation_preference=False):
             if due.date().isoformat() != proposal['start']:
                 raise ValueError('Deadline timestamp and calendar day do not match.')
             proposal['due_at'] = due.isoformat()
-            label = 'do ' + due.strftime('%H:%M')
-            if label not in proposal['title']:
-                proposal['title'] += ' — ' + label
-            detail = 'Termin: ' + due.date().isoformat() + ' ' + label + ' (Europe/Warsaw).'
+            title = librus_title(without_deadline_title_label(str(data['title']).strip()))
+            label = deadline_label(due)
+            suffix = ' — ' + label
+            proposal['title'] = title if label in title else title[:250 - len(suffix)].rstrip() + suffix
+            detail = deadline_detail(due)
             if detail not in proposal['description']:
                 proposal['description'] = (proposal['description'].rstrip() + '\n' + detail).lstrip()
     elif proposal['due_at'] is not None:
@@ -182,7 +239,10 @@ def normalize_proposal(data, current=None, *, participation_preference=False):
         start = date.fromisoformat(str(proposal['start']))
         end = start + timedelta(days=1) if temporal_kind in ('deadline', 'reminder') or not proposal['end'] else date.fromisoformat(str(proposal['end']))
         proposal['start'], proposal['end'] = start.isoformat(), end.isoformat()
-        past = due <= current.astimezone(WARSAW) if due is not None else start < current.astimezone(WARSAW).date()
+        if due is not None:
+            past = due.astimezone(timezone.utc) <= current.astimezone(timezone.utc)
+        else:
+            past = start < current.astimezone(WARSAW).date()
     else:
         if len(str(proposal['start'])) <= 10:
             raise ValueError('A timed event requires an explicit time; choose all_day for date-only events.')
@@ -806,9 +866,10 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                 item['user_rejected'] = True
                 self.db.execute("UPDATE operations SET status='review',last_error='User ignored proposal.',updated_at=? WHERE proposal_id=? AND status='pending'", (utcnow(), str(proposal_id)))
             else:
-                patch = patch or {}
-                if set(patch) - {'title','description','start','end','all_day'}:
+                patch = dict(patch or {})
+                if set(patch) - {'title','description','start','end','all_day','due_time'}:
                     raise ValueError('Unsupported proposal edit.')
+                apply_deadline_edit(item, patch)
                 item.update(patch)
                 if 'end' in patch:
                     item['default_duration'] = False
