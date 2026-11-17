@@ -655,11 +655,24 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
         data.update(id=row['id'], message_id=row['message_id'], status=row['status'])
         return data
 
-    def list_proposals(self, status=None, limit=100):
-        sql = 'SELECT * FROM proposals' + (' WHERE status=?' if status else '') + ' ORDER BY created_at DESC,id LIMIT ?'
-        params = (status, limit) if status else (limit,)
+    def get_proposal(self, proposal_id):
         with self.lock:
-            return [self._proposal(row) for row in self.db.execute(sql, params)]
+            row = self.db.execute('SELECT * FROM proposals WHERE id=?', (str(proposal_id),)).fetchone()
+            return self._proposal(row) if row else None
+
+    def list_proposals(self, status=None, limit=100, *, offset=0, exclude_grouped=False):
+        filters, params = [], []
+        if status:
+            filters.append('status=?')
+            params.append(status)
+        if exclude_grouped:
+            filters.append('NOT EXISTS (SELECT 1 FROM proposal_group_members m WHERE m.proposal_id=proposals.id)')
+        sql = 'SELECT * FROM proposals'
+        if filters:
+            sql += ' WHERE ' + ' AND '.join(filters)
+        sql += ' ORDER BY created_at DESC,id LIMIT ? OFFSET ?'
+        with self.lock:
+            return [self._proposal(row) for row in self.db.execute(sql, (*params, limit, offset))]
 
     def list_events(self, limit=100, include_cancelled=False):
         with self.lock:
