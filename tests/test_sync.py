@@ -1,4 +1,5 @@
 from test_support import TEST_CONFIG
+from contextlib import closing
 from datetime import datetime, timedelta
 import fcntl
 import io
@@ -122,6 +123,156 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(self.store.status()['messages'], 125)
         self.assertEqual(len(runtime.analyzed), 125)
 
+    def test_inbox_cursor_survives_reopen_until_every_message_is_fetched(self):
+        cases = ((1, 25, 30, ()), (5, 25, 7, ()), (11, 25, 5, ()),
+                 (98, 99, 4, ()), (100, 175, 4, map(str, range(65, 84))))
+        for limit, count, rounds, failures in cases:
+            with self.subTest(limit=limit):
+                path = self.store.path.parent / str(limit) / 'state.sqlite3'
+                client, runtime = FakeClient(count=count, fail_ids=failures), FakeRuntime(propose=False)
+                for attempt in range(rounds):
+                    client.pages.clear()
+                    client.details.clear()
+                    store = AppStore(path, config=TEST_CONFIG)
+                    try:
+                        store.set_writes_paused(False)
+                        result = SyncController(store, client, runtime, max_messages=limit).run(current=NOW)
+                        saved = {row[0] for row in store.db.execute('SELECT id FROM messages WHERE payload_hash IS NOT NULL')}
+                        health, = store.db.execute("SELECT last_result FROM source_health WHERE kind='message'").fetchone()
+                        self.assertLessEqual(len(client.details), limit)
+                        self.assertLessEqual(len(client.pages), limit // min(10, limit) + 4)
+                        if saved == {str(i) for i in range(count)}:
+                            self.assertEqual((result['status'], health), ('ok', 'ok'))
+                            self.assertIsNotNone(result['state']['last_successful_sync'])
+                            if limit == 100:
+                                self.assertGreaterEqual(attempt, 1)
+                            break
+                        self.assertEqual((result['status'], health), ('partial', 'partial'))
+                        self.assertIsNone(result['state']['last_successful_sync'])
+                    finally:
+                        store.close()
+                    client.fail_ids.clear()
+                else:
+                    self.fail(f'Limit {limit} fetched only {len(saved)} of {count} messages')
+
+    def test_legacy_completion_is_invalidated_until_new_scan_reaches_tail(self):
+        self.store.set_writes_paused(False)
+        self.store.set_setting('discovery_page_size', '5')
+        self.store.set_setting('discovery_page', '9')
+        self.store.set_setting('discovery_initialized_at', NOW.isoformat())
+        client, runtime = FakeClient(count=12), FakeRuntime(propose=False)
+        first = SyncController(self.store, client, runtime, max_messages=5).run(current=NOW)
+        self.assertEqual(first['status'], 'partial')
+        self.assertIsNone(self.store._setting('discovery_initialized_at'))
+        self.assertEqual(client.details, list(map(str, range(5))))
+        for _ in range(3):
+            result = SyncController(self.store, client, runtime, max_messages=5).run(current=NOW)
+            if result['status'] == 'ok':
+                break
+        self.assertEqual(result['status'], 'ok')
+        self.assertEqual(self.store.status()['messages'], 12)
+        self.assertIsNotNone(self.store._setting('discovery_initialized_at'))
+
+    def test_limit_one_services_both_fresh_discovery_and_history_while_a_retry_fails(self):
+        client, runtime = FakeClient(count=5, fail_ids={'0'}), FakeRuntime(propose=False)
+        inbox_ids = list(map(str, range(5)))
+        fixture, _ = client.messages(limit=1)
+
+        def fetch_page(limit, page):
+            subset = inbox_ids[(page - 1) * limit:page * limit]
+            return [dict(fixture[0], messageId=mid) for mid in subset], len(inbox_ids)
+
+        client.messages = fetch_page
+        controller = SyncController(self.store, client, runtime, max_messages=1)
+        controller.run(current=NOW)
+        inbox_ids.insert(0, '5')
+        for _ in range(12):
+            client.details.clear()
+            result = controller.run(current=NOW)
+            self.assertLessEqual(len(client.details), 1)
+            self.assertEqual(result['status'], 'partial')
+        self.assertEqual(self.store.get_message('0')['status'], 'fetch_failed')
+        saved = {row[0] for row in self.store.db.execute('SELECT id FROM messages WHERE payload_hash IS NOT NULL')}
+        self.assertEqual(saved, set(inbox_ids) - {'0'})
+
+    def test_changed_prefix_of_a_partially_consumed_page_is_rechecked(self):
+        client, runtime = FakeClient(count=99), FakeRuntime(propose=False)
+        original_list = client.messages
+        controller = SyncController(self.store, client, runtime, max_messages=98)
+        first = controller.run(current=NOW)
+        self.assertEqual(first['status'], 'partial')
+
+        def shifted_page(limit, page):
+            snippets, total = original_list(limit=limit, page=page)
+            if page == 10:
+                snippets[1] = dict(snippets[1], messageId='replacement')
+            return snippets, total
+
+        client.messages = shifted_page
+        self.store.set_writes_paused(False)
+        second = controller.run(current=NOW)
+        self.assertEqual(second['status'], 'ok')
+        for mid in ('98', 'replacement'):
+            self.assertTrue(self.store.get_message(mid)['payload_hash'])
+
+    def test_deletion_shifting_an_unread_message_to_the_previous_page_cannot_hide_it(self):
+        cases = ((5, 35, 6, 6, {'22'}), (11, 30, 2, 3, {'16'}),
+                 (11, 30, 2, 3, set(map(str, range(10, 20)))))
+        for limit, count, runs, boundary_page, removed in cases:
+            with self.subTest(limit=limit, removed=len(removed)):
+                path = self.store.path.parent / f'{limit}-{len(removed)}' / 'state.sqlite3'
+                with closing(AppStore(path, config=TEST_CONFIG)) as store:
+                    store.set_writes_paused(False)
+                    client, runtime = FakeClient(count=count), FakeRuntime(propose=False)
+                    inbox_ids = list(map(str, range(count)))
+                    fixture, _ = client.messages(limit=1)
+
+                    def fetch_page(limit, page):
+                        subset = inbox_ids[(page - 1) * limit:page * limit]
+                        return [dict(fixture[0], messageId=mid) for mid in subset], len(inbox_ids)
+
+                    client.messages = fetch_page
+                    controller = SyncController(store, client, runtime, max_messages=limit)
+                    for _ in range(runs):
+                        self.assertEqual(controller.run(current=NOW)['status'], 'partial')
+                    self.assertEqual(store._setting('discovery_page'), str(boundary_page))
+                    self.assertEqual(store._setting('discovery_page_offset'), '0')
+                    unseen = str((boundary_page - 1) * min(10, limit))
+                    self.assertIsNone(store.get_message(unseen))
+                    inbox_ids = [mid for mid in inbox_ids if mid not in removed]
+                    for _ in range(6):
+                        client.details.clear()
+                        result = controller.run(current=NOW)
+                        self.assertLessEqual(len(client.details), limit)
+                        if result['status'] == 'ok':
+                            saved = {row[0] for row in store.db.execute(
+                                'SELECT id FROM messages WHERE payload_hash IS NOT NULL')}
+                            self.assertEqual(set(inbox_ids) - saved, set())
+                            break
+                    else:
+                        self.fail('Discovery did not reach the reshuffled final page')
+
+    def test_incomplete_refresh_stays_partial_after_a_changed_head_is_fetched(self):
+        self.store.set_writes_paused(False)
+        client, runtime = FakeClient(count=250), FakeRuntime(propose=False)
+        controller = SyncController(self.store, client, runtime)
+        for _ in range(3):
+            initial = controller.run(current=NOW)
+        self.assertEqual(initial['status'], 'ok')
+        original_fetch = client.message
+
+        def updated_body(mid):
+            body = original_fetch(mid)
+            return dict(body, text=body['text'] + ' Zmiana.') if mid == '0' else body
+
+        client.message = updated_body
+        changed = controller.run(current=NOW)
+        self.assertEqual((changed['status'], changed['changed']), ('partial', 1))
+        incomplete = controller.run(current=NOW)
+        self.assertEqual((incomplete['status'], incomplete['changed']), ('partial', 0))
+        complete = controller.run(current=NOW)
+        self.assertEqual((complete['status'], complete['changed']), ('ok', 0))
+
     def test_limit_one_cursor_and_page_size_change_fill_history_in_same_run(self):
         client, runtime = FakeClient(count=25), FakeRuntime(propose=False)
         first = SyncController(self.store, client, runtime, max_messages=1).run(current=NOW)
@@ -136,7 +287,7 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(client.pages, [1, 2, 3])
         self.assertEqual(self.store.status()['messages'], 25)
         self.assertEqual(self.store._setting('discovery_page_size'), '10')
-        self.assertEqual(self.store._setting('discovery_page'), '2')
+        self.assertEqual(self.store._setting('discovery_page'), '1')
 
     def test_30day_history_ends_at_old_page(self):
         client, runtime = FakeClient(count=60, old_after=12), FakeRuntime(propose=False)

@@ -7,8 +7,10 @@ import signal
 import threading
 import time
 from pathlib import Path
-from .core import AppStore, WARSAW, analysis_metadata, as_datetime, utcnow
+from .core import AppStore, WARSAW, analysis_metadata, as_datetime, digest, utcnow
 from .health_state import ERROR_CODES, error_code, collection_attempt
+
+DISCOVERY_CURSOR_VERSION = '3'
 
 
 def safe_error(error):
@@ -100,6 +102,131 @@ class SyncController:
         except (ValueError, TypeError):
             # Unknown dates must not silently disappear; analysis will resolve ambiguity.
             return True
+
+    def _discover_messages(self, cutoff, result):
+        from .librus_client import DiscoveryParsingError
+
+        page_size = min(10, self.max_messages)
+        if (self.store._setting('discovery_cursor_version') != DISCOVERY_CURSOR_VERSION
+                or self.store._setting('discovery_page_size') != str(page_size)):
+            # Old page cursors and completion markers did not prove every
+            # position was visited. Page numbers also depend on page size.
+            with self.store.lock, self.store.db:
+                self.store.db.execute("""DELETE FROM settings WHERE key IN (
+                    'discovery_initialized_at', 'discovery_page_prefix', 'discovery_preceding_page')""")
+                self.store.db.executemany('INSERT OR REPLACE INTO settings VALUES (?,?)',
+                    (('discovery_cursor_version', DISCOVERY_CURSOR_VERSION), ('discovery_page_size', str(page_size)),
+                     ('discovery_page', '1'), ('discovery_page_offset', '0'), ('discovery_retry_turn', 'retry')))
+
+        page = int(self.store._setting('discovery_page'))
+        offset = int(self.store._setting('discovery_page_offset'))
+        prefix = self.store._setting('discovery_page_prefix', '')
+        preceding = self.store._setting('discovery_preceding_page', '').split()
+        retry_turn = self.max_messages > 1 or self.store._setting('discovery_retry_turn') == 'retry'
+        retry_limit = min(20, max(1, self.max_messages // 3))
+        selected = self.store.retry_message_ids(retry_limit) if retry_turn else []
+        next_turn = 'scan' if self.max_messages == 1 and selected else 'retry'
+        seen = set(selected)
+        snippets_by_id = {}
+        finished = list_failed = boundary_lost = False
+
+        def get_page(number):
+            nonlocal list_failed
+            try:
+                with collection_attempt(self._collection_diagnostic, source_kind='message', collection_step='message_list'):
+                    snippets, total = self.client.messages(limit=page_size, page=number)
+                    if not isinstance(snippets, list) or len(snippets) > page_size or any(not isinstance(s, dict) for s in snippets):
+                        raise DiscoveryParsingError('Unexpected inbox page schema.')
+            except Exception as error:
+                result.update(status='partial', error_code=error_code(error, 'discovery'), error_stage='discovery')
+                list_failed = True
+                return None, None
+            result['listed'] += len(snippets)
+            return snippets, total
+
+        def note(snippet):
+            try:
+                message_id = self.store.note_discovered(snippet)
+            except ValueError:
+                result['fetch_failures'] += 1
+                result.update(error_code='fetch_failed', error_stage='discovery')
+                return None
+            snippets_by_id[message_id] = snippet
+            return message_id
+
+        def snippet_id(snippet):
+            return str(snippet.get('messageId') or snippet.get('id') or '').strip()
+
+        head, head_total = None, None
+        recent = []
+        if page > 1 or len(selected) == self.max_messages:
+            # Observe the head even at limit one. Unfetched head items enter
+            # the durable retry queue. Keep a detail slot for the history
+            # cursor whenever retries have not already used this run's slot.
+            head, head_total = get_page(1)
+            recent.extend(head or ())
+        if preceding and page > 1 and not list_failed and len(selected) < self.max_messages:
+            previous, _ = (head, head_total) if page == 2 else get_page(page - 1)
+            if previous is not None:
+                current_boundary = [digest(snippet_id(snippet)) for snippet in previous]
+                if current_boundary != preceding:
+                    # A deletion can shift unread items back across the cursor.
+                    # With no shared ID, the old page number cannot anchor a resume.
+                    known = set(preceding)
+                    if known.isdisjoint(current_boundary):
+                        page, offset, prefix, preceding = 1, 0, '', []
+                        boundary_lost = True
+                    else:
+                        recent.extend(snippet for snippet, identity in zip(previous, current_boundary) if identity not in known)
+                        preceding = current_boundary
+        recent_ids = {note(snippet) for snippet in recent if self._in_window(snippet.get('sendDate'), cutoff)}
+        recent_ids.discard(None)
+        refresh_slots = min(max(1, self.max_messages // 5), max(0, self.max_messages - len(selected) - 1))
+        refresh = sorted(recent_ids - seen, key=lambda mid: (self.store.get_message(mid)['fetched_at'] or '', mid))
+        selected.extend(refresh[:refresh_slots])
+        seen.update(selected)
+
+        # Bound list requests even if the provider repeats previously seen IDs.
+        for _ in range(self.max_messages // page_size + 2):
+            if list_failed or len(selected) == self.max_messages:
+                break
+            snippets, total = (head, head_total) if page == 1 and head is not None else get_page(page)
+            if list_failed:
+                break
+            ids = [snippet_id(snippet) for snippet in snippets]
+            if offset and (offset > len(snippets) or digest(ids[:offset]) != prefix):
+                # A shifted page can put unseen messages before the old offset.
+                offset = 0
+            eligible = [self._in_window(snippet.get('sendDate'), cutoff) for snippet in snippets]
+            while offset < len(snippets):
+                if eligible[offset]:
+                    snippet = snippets[offset]
+                    message_id = ids[offset]
+                    if message_id not in seen:
+                        if len(selected) == self.max_messages:
+                            break
+                        if note(snippet) is not None:
+                            selected.append(message_id)
+                            seen.add(message_id)
+                    else:
+                        snippets_by_id[message_id] = snippet
+                offset += 1
+            if offset < len(snippets):
+                prefix = digest(ids[:offset])
+                break
+            if not any(eligible) or len(snippets) < page_size or (isinstance(total, int) and page * page_size >= total):
+                page, offset, prefix, preceding, finished = 1, 0, '', [], True
+                break
+            page, offset, prefix, preceding = page + 1, 0, '', [digest(message_id) for message_id in ids]
+
+        with self.store.lock, self.store.db:
+            if boundary_lost:
+                self.store.db.execute("DELETE FROM settings WHERE key='discovery_initialized_at'")
+            self.store.db.executemany('INSERT OR REPLACE INTO settings VALUES (?,?)',
+                (('discovery_page', str(page)), ('discovery_page_offset', str(offset)),
+                 ('discovery_page_prefix', prefix), ('discovery_preceding_page', ' '.join(preceding)),
+                 ('discovery_retry_turn', next_turn)))
+        return selected, snippets_by_id, finished, list_failed
 
     def _source_collection(self, current):
         """Collect only; all three channels feed the one agenda task."""
@@ -226,71 +353,10 @@ class SyncController:
             self.store.record_result(operation['operation_id'], outcome, agenda_calendar=calendar, current=current)
         cutoff = current - timedelta(days=self.history_days)
         self._stage('discovery')
-        # Retries are durable independently of pagination and therefore survive moving pages.
-        selected = list(self.store.retry_message_ids(min(20, self.max_messages)))
-        seen = set(selected)
-        snippets_by_id = {}
-        page_size = min(10, self.max_messages)
-        stored_size = self.store._setting('discovery_page_size')
-        if stored_size != str(page_size):
-            # A page cursor is meaningful only with the page size that produced it.
-            self.store.set_setting('discovery_page', '2')
-            self.store.set_setting('discovery_page_size', str(page_size))
-        resume = int(self.store._setting('discovery_page', '2'))
-        page = 1
-        pages_seen = set()
-        finished = False
-        consumed = 0
-        snippets = []
-        list_failed = False
-        while len(selected) < self.max_messages:
-            if page in pages_seen:
-                break
-            pages_seen.add(page)
-            last_page = page
-            try:
-                with collection_attempt(self._collection_diagnostic, source_kind='message', collection_step='message_list'):
-                    snippets, total = self.client.messages(limit=page_size, page=page)
-            except Exception as error:
-                self.store.set_setting('last_error', safe_error(error))
-                result.update(status='partial', error_code=error_code(error, 'discovery'), error_stage='discovery')
-                list_failed = True
-                break
-            result['listed'] += len(snippets)
-            if not snippets:
-                finished = True
-                break
-            in_window = 0
-            consumed = 0
-            for snippet in snippets:
-                consumed += 1
-                if not self._in_window(snippet.get('sendDate'), cutoff):
-                    continue
-                in_window += 1
-                try:
-                    message_id = self.store.note_discovered(snippet)
-                except ValueError:
-                    result['fetch_failures'] += 1
-                    result.update(error_code='fetch_failed', error_stage='discovery')
-                    continue
-                snippets_by_id[message_id] = snippet
-                if message_id not in seen:
-                    selected.append(message_id)
-                    seen.add(message_id)
-                if len(selected) >= self.max_messages:
-                    break
-            if in_window == 0 or len(snippets) < page_size or (isinstance(total, int) and page * page_size >= total):
-                finished = True
-                break
-            page = max(2, resume) if page == 1 else page + 1
-        if not list_failed and pages_seen:
-            next_page = last_page if consumed < len(snippets) else last_page + 1
-            self.store.set_setting('discovery_page', '2' if finished else str(max(2, next_page)))
-            if finished:
-                self.store.set_setting('discovery_initialized_at', utcnow())
+        selected, snippets_by_id, finished, list_failed = self._discover_messages(cutoff, result)
         self._stage('fetch')
         unread_probe = None
-        for message_id in selected[:self.max_messages]:
+        for message_id in selected:
             try:
                 with collection_attempt(self._collection_diagnostic, source_kind='message', collection_step='message_body'):
                     data = self.client.message(message_id)
@@ -317,12 +383,17 @@ class SyncController:
                 result['read_marking_observation'] = 'unverified_after_fetch_error'
         else:
             result['read_marking_observation'] = 'unverified_no_unread_message_observed'
-        stamp=utcnow()
-        message_fetch_complete=(not list_failed and not result['fetch_failures'] and
-            (finished or (self.store._setting('discovery_initialized_at') and result['changed']==0)))
-        if not message_fetch_complete and not result.get('error_code'):
-            result.update(error_code='discovery_incomplete', error_stage='discovery')
-        with self.store.lock,self.store.db:
+        stamp = utcnow()
+        retry_pending = bool(self.store.retry_message_ids(1))
+        with self.store.lock, self.store.db:
+            if finished and not list_failed:
+                self.store.db.execute("INSERT OR REPLACE INTO settings VALUES ('discovery_initialized_at',?)", (stamp,))
+            elif result['changed'] or retry_pending:
+                self.store.db.execute("DELETE FROM settings WHERE key='discovery_initialized_at'")
+            discovery_incomplete = not self.store._setting('discovery_initialized_at')
+            message_fetch_complete = not (list_failed or result['fetch_failures'] or retry_pending or discovery_incomplete)
+            if not message_fetch_complete and not result.get('error_code'):
+                result.update(error_code='discovery_incomplete', error_stage='discovery')
             self.store.db.execute('INSERT INTO source_health VALUES (?,?,?,?,?,?) ON CONFLICT(kind) DO UPDATE SET last_attempt_at=excluded.last_attempt_at,last_successful_fetch=COALESCE(excluded.last_successful_fetch,source_health.last_successful_fetch),last_result=excluded.last_result,last_error=excluded.last_error,learner_verified=excluded.learner_verified',
                 ('message',stamp,stamp if message_fetch_complete else None,'ok' if message_fetch_complete else 'partial',None if message_fetch_complete else 'source_collection_incomplete',int(self.store._setting('source_learner_verified')=='true')))
         self._stage('analysis')
@@ -371,7 +442,6 @@ class SyncController:
         if result['fetch_failures'] or result['analysis_failures']:
             result['status'] = 'partial'
         state = self.store.status()
-        discovery_incomplete = not finished and (not self.store._setting('discovery_initialized_at') or result['changed'] > 0)
         if result['status'] == 'ok' and (state['messages_pending'] or discovery_incomplete):
             result.update(status='partial', error_code='messages_pending' if state['messages_pending'] else 'discovery_incomplete',
                           error_stage='analysis' if state['messages_pending'] else 'discovery')
