@@ -743,6 +743,51 @@ class AgendaIntegrationTests(AgendaTests):
         # Old event's proposal ID remains history; one canonical action survives.
         self.assertEqual(len(self.snapshot(runtime.events)['agenda']), 1)
 
+    def test_remote_calendar_cancellation_invalidates_reuse_with_preserved_content_or_not_found(self):
+        from app.agenda import read_calendar
+        from test_support import CodexRuntime
+
+        initial, runtime, planner = self.apply(lambda snapshot: [item(snapshot)])
+        aid = initial['items'][0]['action_id']
+        self.store.set_writes_paused(False)
+        self.execute_pending(runtime, planner)
+        eid, = runtime.events
+        active = runtime.events[eid]
+        cancelled = dict(active, status='cancelled')
+        self.assertEqual(event_fingerprint(active), event_fingerprint(cancelled))
+
+        class BatchReader(CodexRuntime):
+            def _tool(self, tool, args):
+                if tool != 'batch_read_event':
+                    raise AssertionError(tool)
+                not_found = {'error': 'Failed to read event',
+                             'detail': '404: HTTP request failed (Response: ' + json.dumps({'error': {
+                                 'errors': [{'domain': 'global', 'reason': 'notFound', 'message': 'Not Found'}],
+                                 'code': 404, 'message': 'Not Found'}}) + ')'}
+                return {'responses': [copy.deepcopy(runtime.events.get(eid, not_found)) for eid in args['event_ids']]}
+
+        runtime.read_events = BatchReader().read_events
+        runtime.select = lambda snapshot: [item(snapshot, 'link', action=None, action_id=aid)]
+        self.assertEqual(planner.run(NOW)['status'], 'unchanged')
+        for visible in (True, False):
+            with self.subTest(cancelled_response_keeps_content=visible):
+                if visible:
+                    runtime.events[eid] = cancelled
+                else:
+                    del runtime.events[eid]
+                calls = runtime.calls
+                self.assertEqual(planner.run(NOW)['status'], 'applied')
+                self.assertEqual(runtime.calls, calls + 1)
+                projection, = self.snapshot(read_calendar(self.store, runtime))['agenda'][0]['calendar']
+                self.assertTrue(projection['externally_changed'])
+                if visible:
+                    self.assertEqual(projection['state'], 'cancelled')
+                    self.assertEqual(projection['current']['summary'], active['summary'])
+                else:
+                    self.assertIsNone(projection['current'])
+                self.assertEqual(planner.run(NOW)['status'], 'unchanged')
+        self.assertEqual(len(runtime.writes), 1)
+
     def test_new_offer_five_choices_selects_one_and_closed_choice_is_not_revived(self):
         result, runtime, planner = self.apply(lambda snapshot: [item(snapshot, 'review', review_change='create',
             action=dict(action(), activity_scope='extracurricular', temporal_kind='event', start='2030-03-%02d' % day),

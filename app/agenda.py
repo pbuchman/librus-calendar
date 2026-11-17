@@ -147,9 +147,14 @@ def _agenda(tables, calendar_events, owner_email):
                 'status': 'inventory_only', 'action': {}, 'links': [], 'decisions': [], 'calendar': []})
         saved = json.loads(row['snapshot'])
         current = normalize_event(observed, owner_email) if observed else None
-        entry['calendar'].append({'id': eid, 'state': row['state'], 'marker': row['marker'],
+        # A Calendar cancellation can keep all the writable content intact.
+        # Observe its state here without changing the executor's content fingerprint.
+        state = row['state'] if observed is None else ('cancelled' if observed.get('status') == 'cancelled' else 'active')
+        externally_changed = (state != row['state'] or event_fingerprint(observed, owner_email) != row['fingerprint']
+                              if observed is not None else row['state'] == 'active')
+        entry['calendar'].append({'id': eid, 'state': state, 'marker': row['marker'],
             'saved_fingerprint': row['fingerprint'], 'current': current,
-            'externally_changed': (event_fingerprint(observed, owner_email) != row['fingerprint']) if observed else row['state'] == 'active'})
+            'externally_changed': externally_changed})
         if not entry['action']:
             normalized = normalize_event(saved, owner_email)
             entry['action'] = {'title': normalized['summary'], 'start': normalized['start'], 'end': normalized['end']}
