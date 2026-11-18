@@ -13,6 +13,13 @@ update_every = 60
 priority = 90000
 WIRE_SCALE = 1000
 MAX_METRIC_VALUE = 10**12
+SYNC_TIMER_MAINTENANCE_SECONDS = 15 * 60
+
+CODEX_TIMEOUT_COUNTS = {
+    'codex_timeout_retries_24h': 'Codex timeout retries (24h)',
+    'codex_timeout_recovered_24h': 'Codex timeout retries recovered (24h)',
+    'codex_timeout_retry_failures_24h': 'Codex timeout retries failed (24h)',
+}
 
 ORDER = ['sync', 'diagnostics', 'queue', 'services', 'monitoring', 'backup', 'pause', 'calendar_probe']
 CHARTS = {
@@ -23,8 +30,8 @@ CHARTS = {
     'queue': {'options': [None, 'Librus automatic queue', 'minutes / count', 'sync', 'librus_local.queue', 'line'],
         'lines': [['pending_age', 'oldest automatic work age'], ['pending_alert_age', 'unpaused automatic work age'], ['messages', 'pending messages'],
                   ['operations', 'pending operations'], ['review', 'awaiting owner decision']]},
-    'diagnostics': {'options': [None, 'Librus synchronization diagnostics', 'failures', 'sync', 'librus_local.diagnostics', 'line'],
-        'lines': [['failures', 'consecutive failures']]},
+    'diagnostics': {'options': [None, 'Librus synchronization diagnostics', 'count', 'sync', 'librus_local.diagnostics', 'line'],
+        'lines': [['failures', 'consecutive failures'], *[[key, label] for key, label in CODEX_TIMEOUT_COUNTS.items()]]},
     'services': {'options': [None, 'Librus service outages', 'minutes', 'services', 'librus_local.services', 'line'],
         'lines': [['sync_timer_down', 'sync timer'], ['backup_timer_down', 'backup timer'],
                   ['web_down', 'web'], ['sync_unit_down', 'sync unit unavailable']]},
@@ -39,7 +46,7 @@ CHARTS = {
     'calendar_probe': {'options': [None, 'Librus calendar probe (rolling 24 hours)', 'count', 'sync', 'librus_local.calendar_probe', 'line'],
         'lines': [['probe_retries_24h', 'read probe retries'], ['probe_recoveries_24h', 'read probe recoveries']]},
 }
-OPTIONAL_METRICS = {'probe_retries_24h', 'probe_recoveries_24h'}
+OPTIONAL_METRICS = {'probe_retries_24h', 'probe_recoveries_24h', *CODEX_TIMEOUT_COUNTS}
 
 SOURCE_KINDS = ('message', 'announcement', 'school_event', 'substitution')
 SOURCE_MODES = ('off', 'preview', 'active')
@@ -229,10 +236,10 @@ def validate_snapshot(snapshot, now):
         recovered = state.get('calendar_probe_recovered')
         if recovered is not None and type(recovered) is not bool:
             raise ValueError('invalid probe recovery')
-        for name in ('calendar_probe_retries_24h', 'calendar_probe_recoveries_24h'):
+        for name in ('calendar_probe_retries_24h', 'calendar_probe_recoveries_24h', *CODEX_TIMEOUT_COUNTS):
             value = state.get(name)
             if value is not None and (type(value) is not int or not 0 <= value <= MAX_METRIC_VALUE):
-                raise ValueError('invalid probe count')
+                raise ValueError('invalid optional count')
         # These timestamps are required to age nonempty queues/runs without hiding outages.
         if (state['messages_pending'] or state['operations_pending']) and parsed['oldest_pending_at'] is None:
             raise ValueError('pending age unavailable')
@@ -271,6 +278,24 @@ def validate_snapshot(snapshot, now):
     return generated, parsed
 
 
+def sync_timer_maintenance_elapsed(snapshot, generated, now):
+    maintenance = snapshot.get('sync_timer_maintenance')
+    if not isinstance(maintenance, dict):
+        return None
+    started_at = maintenance.get('started_at')
+    started_monotonic_us = maintenance.get('started_monotonic_us')
+    monotonic_us = time.monotonic_ns() // 1000
+    if (type(started_at) is not int or type(started_monotonic_us) is not int
+            or not 0 < started_at <= generated
+            or not 0 <= generated - started_at < SYNC_TIMER_MAINTENANCE_SECONDS
+            or not 0 < started_monotonic_us <= monotonic_us):
+        return None
+    monotonic_age = (monotonic_us - started_monotonic_us) / 1_000_000
+    # Monotonic time bounds cached snapshots if wall time moves backwards.
+    # Wall time also advances when the host is suspended.
+    return max(now - started_at, monotonic_age)
+
+
 class HealthMetrics:
     """Independent clock means a stalled export cannot freeze healthy metrics."""
     def __init__(self):
@@ -302,8 +327,8 @@ class HealthMetrics:
 
     @staticmethod
     def empty_data():
-        # An old exporter/DB has no probe evidence. Leave a chart gap rather than
-        # claiming zero retries or a successful calendar read.
+        # Older exporters may not provide retry counts. Leave a chart gap
+        # when data is unavailable.
         return {line[0]: 0 for chart in CHARTS.values() for line in chart['lines']
                 if line[0] not in OPTIONAL_METRICS}
 
@@ -316,7 +341,15 @@ class HealthMetrics:
         data['snapshot_age'] = max(0, now - generated) / 60.0
         data['db_down'] = self.outage('db', not snapshot['db_ok'], now)
         data['invalid'] = int(not snapshot['db_ok'] or data['snapshot_age'] >= 3)
-        for field, dimension in (('sync_timer_ok', 'sync_timer_down'), ('backup_timer_ok', 'backup_timer_down'),
+        timer_bad = not snapshot['sync_timer_ok']
+        maintenance_age = sync_timer_maintenance_elapsed(snapshot, generated, now) if timer_bad else None
+        if maintenance_age is not None:
+            began = now - min(maintenance_age, SYNC_TIMER_MAINTENANCE_SECONDS)
+            self.bad_since['sync_timer_ok'] = min(self.bad_since.get('sync_timer_ok', began), began)
+        timer_down = self.outage('sync_timer_ok', timer_bad, now)
+        data['sync_timer_down'] = (0 if maintenance_age is not None
+                                   and maintenance_age < SYNC_TIMER_MAINTENANCE_SECONDS else timer_down)
+        for field, dimension in (('backup_timer_ok', 'backup_timer_down'),
                                  ('web_ok', 'web_down'), ('sync_unit_ok', 'sync_unit_down')):
             data[dimension] = self.outage(field, not snapshot[field] and (field != 'backup_timer_ok' or snapshot['backup_enabled']), now)
         if times is None:
@@ -326,6 +359,10 @@ class HealthMetrics:
                                  ('calendar_probe_recoveries_24h', 'probe_recoveries_24h')):
             if state.get(field) is not None:
                 data[dimension] = state[field]
+        if not data['invalid']:
+            for field in CODEX_TIMEOUT_COUNTS:
+                if state.get(field) is not None:
+                    data[field] = state[field]
         sources = state.get('sources')
         if sources is not None:
             data['source_preview_count'] = sources['preview_count']

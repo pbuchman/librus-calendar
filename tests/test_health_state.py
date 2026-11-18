@@ -8,7 +8,7 @@ import unittest
 from unittest.mock import patch
 
 from app.core import AppStore
-from app.health_state import read_monitoring_state
+from app.health_state import read_monitoring_state, sync_diagnostics
 from app.monitoring import sanitize_state
 from test_core import NOW, message, proposal
 
@@ -162,6 +162,97 @@ class HealthStateTests(unittest.TestCase):
             self.store.db.execute("UPDATE sync_runs SET error_code='PRIVATE-TOKEN' WHERE id=?", (failed,))
         with self.assertRaisesRegex(ValueError, 'completed sync health metadata'):
             read_monitoring_state(self.path)
+
+    def test_timeout_retry_counters_use_attempt_times_and_keep_mixed_failure_after_eviction(self):
+        now = datetime(2026, 11, 18, 12, tzinfo=timezone.utc)
+        fields = ('codex_timeout_retries_24h', 'codex_timeout_recovered_24h',
+                  'codex_timeout_retry_failures_24h')
+
+        def stamp(minutes_ago):
+            return (now - timedelta(minutes=minutes_ago)).isoformat()
+
+        def read(at=now):
+            state = read_monitoring_state(self.path, now=at)
+            return tuple(state[field] for field in fields)
+
+        def start_run(minutes_ago):
+            with patch('app.core.utcnow', return_value=stamp(minutes_ago)):
+                return self.store.start_sync_run()
+
+        def finish_run(run, minutes_ago, result='ok', code=None):
+            with patch('app.core.utcnow', return_value=stamp(minutes_ago)):
+                self.store.finish_sync_run(run, result, code)
+
+        def attempt(run, call, number, start, *, reason='none', state='completed', finished=None, code=None):
+            entry = dict(phase='analysis', state='running', requested_count=1, received_count=0,
+                         duration_seconds=0, process_code=None, started_count=0, completed_count=0,
+                         operation_kind='agenda_plan', logical_call_index=call, attempt_number=number,
+                         retry_decision='pending', retry_reason='none', recovered=False, attempt_started_at=stamp(start))
+            self.store.record_sync_diagnostic(run, entry)
+            self.store.record_sync_diagnostic(run, dict(entry, duration_seconds=1))
+            if state == 'running':
+                return
+            entry.update(state=state, attempt_finished_at=stamp(finished), retry_reason=reason,
+                         retry_decision='retry' if number == 1 and state == 'failed' else 'not_needed',
+                         recovered=state == 'completed' and number == 2)
+            if code:
+                entry['error_code'] = code
+            self.store.record_sync_diagnostic(run, entry)
+
+        legacy_run = start_run(1450)
+        self.assertEqual(read(), (None, None, None))
+        finish_run(legacy_run, 1449)
+
+        crossing_run = start_run(1444)
+        attempt(crossing_run, 1, 1, 1443, reason='app_timeout', state='failed', finished=1442, code='codex_timeout')
+        attempt(crossing_run, 1, 2, 1441, finished=1439)
+        finish_run(crossing_run, 1438)
+        self.assertEqual(read(), (0, 1, 0))
+
+        run = start_run(50)
+        attempt(run, 1, 1, 49, reason='app_timeout', state='failed', finished=48, code='codex_timeout')
+        attempt(run, 1, 2, 47, finished=46)
+        attempt(run, 2, 1, 45, reason='app_timeout', state='failed', finished=44, code='codex_timeout')
+        attempt(run, 2, 2, 43, reason='other_failure', state='failed', finished=42, code='invalid_analysis_json')
+        attempt(run, 3, 1, 41, reason='clean_batch_zero_calls', state='failed', finished=40, code='unexpected_tool_count')
+        attempt(run, 3, 2, 39, finished=38)
+
+        # Simulate diagnostic volume without calling an external service.
+        raw = self.store.db.execute('SELECT diagnostics FROM sync_runs WHERE id=?', (run,)).fetchone()[0]
+        diagnostics = json.loads(raw)
+        diagnostic = dict(phase='reconcile', state='completed', requested_count=1, received_count=1,
+                          duration_seconds=0, process_code=0, started_count=0, completed_count=0)
+        diagnostics['invocations'].extend([diagnostic] * 506)
+        with self.store.db:
+            self.store.db.execute('UPDATE sync_runs SET diagnostics=? WHERE id=?', (json.dumps(diagnostics), run))
+        attempt(run, 4, 1, 37, reason='app_timeout', state='failed', finished=36, code='codex_timeout')
+        attempt(run, 4, 2, 35, state='running')
+        current = read_monitoring_state(self.path, now=now)['sync_diagnostics']
+        self.assertGreater(current['omitted_count'], 0)
+        self.assertFalse(any(item.get('logical_call_index') == 1 for item in current['invocations']))
+        self.assertEqual(read(), (3, 2, 1))
+        finish_run(run, 30, 'interrupted', 'sync_timeout')
+        self.assertEqual(read(), (3, 2, 2))
+        self.assertEqual(read(now + timedelta(hours=25)), (0, 0, 0))
+
+    def test_retry_invocation_fields_reject_private_or_malformed_metadata(self):
+        legacy = dict(phase='analysis', state='failed', requested_count=1, received_count=0,
+                      duration_seconds=1, process_code=0, started_count=0, completed_count=0)
+        entry = dict(legacy, logical_call_index=1, operation_kind='agenda_plan', attempt_number=1,
+                     retry_decision='deadline_exhausted', retry_reason='app_timeout',
+                     attempt_started_at='2026-11-18T11:00:00+00:00',
+                     attempt_finished_at='2026-11-18T11:01:00+00:00')
+        for item in (legacy, entry):
+            diagnostics = dict(invocations=[item], omitted_count=0)
+            self.assertEqual(sync_diagnostics(diagnostics), diagnostics)
+        for key, bad in (
+            ('logical_call_index', True), ('logical_call_index', 0), ('operation_kind', 'private text'),
+            ('retry_reason', ['private text']), ('retry_reason', 'private text'),
+            ('attempt_started_at', '2026-11-18T11:00:00'),
+            ('attempt_finished_at', '2026-11-18T10:00:00+00:00'),
+        ):
+            with self.subTest(field=key, value=bad), self.assertRaises(ValueError):
+                sync_diagnostics(dict(invocations=[dict(entry, **{key: bad})], omitted_count=0))
 
     def test_pause_timestamp_changes_only_on_transitions(self):
         first = self.store.status()['writes_paused_since']

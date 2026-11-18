@@ -109,6 +109,32 @@ class WebTests(unittest.TestCase):
                          'retry','not_needed','exact_ok_true','Parser: 0 / 0 / 0','Tura zakończona: tak'):
             self.assertIn(expected,text)
 
+    def test_linked_timeout_attempts_show_kind_timing_and_retry_disposition(self):
+        from app.codex_diagnostics import ProcessObservation
+        observation = ProcessObservation()
+        observation.feed('stdout', b'{"type":"turn.started"}\n')
+        observation.finish(-9, 'app_timeout')
+        base = dict(phase='analysis', state='failed', requested_count=1, received_count=0,
+                    duration_seconds=20.0, process_code=-9, started_count=0, completed_count=0,
+                    error_code='codex_timeout', operation_kind='agenda_plan', logical_call_index=2,
+                    attempt_started_at='2026-11-18T11:00:00+00:00', attempt_finished_at='2026-11-18T11:00:20+00:00',
+                    retry_reason='app_timeout', process_observation=observation.summary())
+        diagnostics = dict(invocations=[
+            dict(base, attempt_number=1, retry_decision='retry'),
+            dict(base, attempt_number=2, retry_decision='exhausted'),
+            dict(base, phase='write', operation_kind='create_event', logical_call_index=3, attempt_number=1,
+                 retry_decision='not_eligible', retry_reason='possible_write'),
+        ], omitted_count=0)
+        original = self.store.status
+        self.store.status = lambda: dict(original(), sync_diagnostics=diagnostics)
+        response = self.client.get('/')
+        self.assertEqual(response.status_code, 200)
+        for expected in ('Wywołanie 2', 'agenda_plan', 'próba 2', '2026-11-18T11:00:00+00:00',
+                         'turn_started', 'app_timeout', 'bez postępu', 'Limit ponowień wyczerpany',
+                         'create_event', 'Możliwy zapis w kalendarzu'):
+            self.assertIn(expected, response.text)
+        self.assertEqual(self.client.get('/api/status').json()['sync_diagnostics'], diagnostics)
+
     def test_structural_diagnostics_render_in_existing_table(self):
         original = self.store.status
         evidence = {'tag_path': ['div', 'table', 'tr', 'td'], 'child_tags': ['br', 'other'],

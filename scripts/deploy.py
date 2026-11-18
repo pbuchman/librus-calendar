@@ -337,7 +337,7 @@ def install_units(home, release, *, migrate=False, activation=False):
 
 def service_state(unit):
     output = command(['systemctl', '--user', 'show', unit,
-                      '--property=LoadState,ActiveState,SubState,FragmentPath,DropInPaths'], capture=True)
+                      '--property=LoadState,ActiveState,SubState,UnitFileState,FragmentPath,DropInPaths'], capture=True)
     return dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
 
 
@@ -397,6 +397,23 @@ def stop_if_loaded(unit):
         command(['systemctl', '--user', 'stop', unit])
 
 
+def stop_sync_timer():
+    from app.monitoring import SYNC_TIMER_MAINTENANCE_SECONDS, SYNC_TIMER_MAINTENANCE_UNIT, timer_available
+    timer = 'librus-sync.timer'
+    state = service_state(timer)
+    if state.get('LoadState') != 'loaded':
+        return
+    if timer_available(state):
+        # The conflict stops only the timer. Starting it again cancels maintenance,
+        # including a manual resume after --no-sync. The user manager owns expiry.
+        command(['systemd-run', '--user', '--collect',
+                 '--unit=' + SYNC_TIMER_MAINTENANCE_UNIT, '--service-type=exec',
+                 '--property=Conflicts=' + timer, '--property=After=' + timer,
+                 '/usr/bin/sleep', str(SYNC_TIMER_MAINTENANCE_SECONDS)])
+    else:
+        command(['systemctl', '--user', 'stop', timer])
+
+
 def activate(home, sha, *, migrate=False, no_sync=False):
     release = validate_release(home, sha)
     package_probe(release)  # The target must also satisfy this source checkout's contract.
@@ -410,7 +427,7 @@ def activate(home, sha, *, migrate=False, no_sync=False):
     # Build, import and all owned-target checks happen before the first stop.
     # Prevent new runs, then refuse activation while an existing writer is alive.
     # Never kill a worker that may be committing an external calendar write.
-    stop_if_loaded('librus-sync.timer')
+    stop_sync_timer()
     worker = service_state('librus-sync.service')
     if worker.get('ActiveState') in {'active', 'activating', 'deactivating', 'reloading'}:
         raise DeploymentError('Sync timer stopped; worker still running. Retry activation after it finishes.')

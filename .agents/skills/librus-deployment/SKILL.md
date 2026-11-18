@@ -53,7 +53,9 @@ Only exact known legacy unit contents may be replaced. Arbitrary different units
 
 `bash scripts/install_linux.sh --sha FULL_SHA` installs units only; it does not activate the release or start services. Production remains on loopback port 8795 and its existing private Tailscale Serve route on 8445. Preserve all other Serve routes and never enable Funnel.
 
-The optional root Netdata installer is `deploy/install-librus-monitor.sh APP_USER`; append `--migrate-legacy` only for explicitly authorized replacement of known prior collector files. It does not restart Netdata. Collector updates may require a controlled Netdata/Python worker restart; health-rule reload alone does not reload Python code. If maintenance notifications must be muted, first save existing silence rules, apply a bounded Librus-only mute and guaranteed cleanup, then restore exactly those prior rules. Never blindly clear somebody else's silence configuration.
+The optional root Netdata installer is `deploy/install-librus-monitor.sh APP_USER`; append `--migrate-legacy` only for explicitly authorized replacement of known prior collector files. It does not restart Netdata. Use a controlled Netdata or Python worker restart to load the collector. On the first rollout with sync timer maintenance, load the updated collector before activating the release.
+
+Activation opens a 15-minute systemd maintenance window when it stops an active, enabled sync timer. The updated exporter and collector use the window only for the timer-down alert. Resuming the timer ends the window. Staged and interrupted activations expire automatically. Retrying with the timer already down never renews the window.
 
 ## Verify and recover
 

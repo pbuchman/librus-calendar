@@ -42,7 +42,15 @@ DIAGNOSTIC_FIELDS = frozenset({'phase', 'state', 'requested_count', 'received_co
 DIAGNOSTIC_OPTIONAL_FIELDS = frozenset({'error_code', 'source_kind', 'collection_step', 'http_status', 'evidence',
     'private_capture_status', 'private_capture_id', 'process_observation',
     'batch_index', 'attempt_number', 'retry_decision', 'recovered', 'parse_error_count',
-    'unknown_event_count', 'incomplete_count', 'turn_completed', 'final_answer_classification'})
+    'unknown_event_count', 'incomplete_count', 'turn_completed', 'final_answer_classification',
+    'logical_call_index', 'operation_kind', 'retry_reason', 'attempt_started_at', 'attempt_finished_at'})
+CODEX_OPERATION_KINDS = frozenset(('agenda_plan', 'list_calendars', 'search_events', 'list_events',
+    'read_event', 'batch_read_event', 'fetch', 'create_event', 'update_event', 'delete_event',
+    'tool_free', 'other_tool'))
+CODEX_RETRY_REASONS = frozenset(('app_timeout', 'possible_write', 'interrupted', 'clean_batch_zero_calls',
+    'probe_tool_count', 'other_failure', 'none'))
+CODEX_TIMEOUT_COUNTS = ('codex_timeout_retries_24h', 'codex_timeout_recovered_24h',
+                        'codex_timeout_retry_failures_24h')
 STRUCTURE_TAGS = frozenset(('html', 'body', 'div', 'table', 'tbody', 'thead', 'tfoot', 'tr',
     'td', 'th', 'br', 'a', 'span', 'p', 'b', 'strong', 'script', 'form', 'input', 'select', 'other'))
 STRUCTURE_ATTRIBUTES = frozenset(('class', 'style', 'title', 'onclick', 'href', 'id', 'form', 'other'))
@@ -149,14 +157,47 @@ def private_capture_metadata(value):
     return dict(private_capture_status=status)
 
 
+def _attempt_timestamp(value):
+    if not isinstance(value, str) or len(value) > 40:
+        raise ValueError('Invalid diagnostic attempt timestamp.')
+    stamp = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if stamp.tzinfo is None:
+        raise ValueError('Diagnostic attempt timestamp must include a timezone.')
+    return stamp
+
+
+def _timeout_retry_records(value):
+    # Each real retry needs a timed-out invocation and a five-second delay
+    # within the 45-minute maximum sync duration.
+    if not isinstance(value, list) or len(value) > 512:
+        raise ValueError('Invalid timeout retry records.')
+    result = []
+    for record in value:
+        if (not isinstance(record, list) or len(record) not in (2, 4)
+                or type(record[0]) is not int or not 1 <= record[0] <= 1000000):
+            raise ValueError('Invalid timeout retry record.')
+        started = _attempt_timestamp(record[1])
+        finished, outcome = None, None
+        if len(record) == 4:
+            finished, outcome = _attempt_timestamp(record[2]), record[3]
+            if finished < started or not isinstance(outcome, str) or outcome not in {'recovered', 'failed'}:
+                raise ValueError('Invalid timeout retry result.')
+        result.append((started, finished, outcome))
+    return result
+
+
 def sync_diagnostics(value):
     """Bounded technical fields only; never tool names, IDs, arguments or text."""
     if value is None:
         return None
-    if (not isinstance(value, dict) or set(value) != {'invocations', 'omitted_count'}
+    required = {'invocations', 'omitted_count'}
+    if (not isinstance(value, dict) or not required <= set(value)
+            or set(value) - required - {'timeout_retries'}
             or not isinstance(value['invocations'], list) or len(value['invocations']) > 512
             or type(value['omitted_count']) is not int or value['omitted_count'] < 0):
         raise ValueError('Invalid sync diagnostics.')
+    if 'timeout_retries' in value:
+        _timeout_retry_records(value['timeout_retries'])
     for item in value['invocations']:
         if (not isinstance(item, dict) or not DIAGNOSTIC_FIELDS <= set(item)
                 or set(item) - DIAGNOSTIC_FIELDS - DIAGNOSTIC_OPTIONAL_FIELDS
@@ -167,18 +208,25 @@ def sync_diagnostics(value):
                 or 'collection_step' in item and (not isinstance(item['collection_step'], str) or item['collection_step'] not in COLLECTION_STEPS)
                 or 'http_status' in item and (type(item['http_status']) is not int or not 100 <= item['http_status'] <= 599)):
             raise ValueError('Invalid sync diagnostic detail.')
-        for key in ('batch_index', 'parse_error_count', 'unknown_event_count', 'incomplete_count'):
-            if key in item and (type(item[key]) is not int or not (1 if key == 'batch_index' else 0) <= item[key] <= 1000000):
-                raise ValueError('Invalid sync diagnostic parser count.')
+        for key in ('batch_index', 'logical_call_index', 'parse_error_count', 'unknown_event_count', 'incomplete_count'):
+            minimum = 1 if key in {'batch_index', 'logical_call_index'} else 0
+            if key in item and (type(item[key]) is not int or not minimum <= item[key] <= 1000000):
+                raise ValueError('Invalid sync diagnostic index or parser count.')
         if 'attempt_number' in item and (type(item['attempt_number']) is not int or item['attempt_number'] not in (1, 2)):
             raise ValueError('Invalid sync diagnostic attempt.')
         for key in ('turn_completed', 'recovered'):
             if key in item and type(item[key]) is not bool:
                 raise ValueError('Invalid sync diagnostic flag.')
-        for key, allowed in (('retry_decision', {'pending', 'retry', 'exhausted', 'not_eligible', 'not_needed'}),
+        for key, allowed in (('retry_decision', {'pending', 'retry', 'exhausted', 'deadline_exhausted', 'not_eligible', 'not_needed'}),
+                             ('operation_kind', CODEX_OPERATION_KINDS), ('retry_reason', CODEX_RETRY_REASONS),
                              ('final_answer_classification', {'missing', 'exact_ok_true', 'exact_ok_false', 'other', 'multiple'})):
             if key in item and (not isinstance(item[key], str) or item[key] not in allowed):
                 raise ValueError('Invalid sync diagnostic classification.')
+        started = _attempt_timestamp(item['attempt_started_at']) if 'attempt_started_at' in item else None
+        if 'attempt_finished_at' in item:
+            finished = _attempt_timestamp(item['attempt_finished_at'])
+            if item['state'] == 'running' or started is None or finished < started:
+                raise ValueError('Invalid sync diagnostic attempt finish.')
         if 'process_observation' in item:
             from .codex_diagnostics import validate_process_observation
             validate_process_observation(item['process_observation'])
@@ -395,6 +443,27 @@ def read_agenda_health(db, tables):
     return result
 
 
+def _read_timeout_counts(db, now, *, has_evidence):
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    cutoff = now - timedelta(hours=24)
+    attempts = recovered = failed = 0
+    # Keep the rolling totals independent of eviction of the larger invocation
+    # observations. Older rows have no timeout retry records.
+    for raw, in db.execute("""
+        SELECT CASE WHEN json_valid(diagnostics) THEN json_extract(diagnostics,'$.timeout_retries') END
+        FROM sync_runs WHERE finished_at IS NULL OR julianday(finished_at)>=julianday(?)
+    """, (cutoff.isoformat(),)):
+        if raw is None:
+            continue
+        has_evidence = True
+        for started, finished, outcome in _timeout_retry_records(json.loads(raw)):
+            attempts += cutoff <= started <= now
+            if finished is not None and cutoff <= finished <= now:
+                recovered += outcome == 'recovered'
+                failed += outcome == 'failed'
+    return (attempts, recovered, failed) if has_evidence else (None,) * len(CODEX_TIMEOUT_COUNTS)
+
+
 def read_connection_state(db, now=None):
     """Read aggregate columns only, on the caller's existing consistent snapshot."""
     tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
@@ -429,13 +498,18 @@ def read_connection_state(db, now=None):
         oldest = min((value for value in (oldest, metadata_oldest) if value), default=None)
     last = None
     completed = dict(last_completed_result=None, last_completed_stage=None, last_completed_error_code=None)
+    timeout_counts = dict.fromkeys(CODEX_TIMEOUT_COUNTS)
     if 'sync_runs' in tables:
         cursor = db.execute('SELECT id,started_at,finished_at,stage,result,error_code,duration_seconds FROM sync_runs ORDER BY started_at DESC,rowid DESC LIMIT 1')
         row = cursor.fetchone()
         last = dict(zip((col[0] for col in cursor.description), row)) if row else None
         if last and 'diagnostics' in {row[1] for row in db.execute('PRAGMA table_info(sync_runs)')}:
             raw = db.execute('SELECT diagnostics FROM sync_runs WHERE id=?', (last['id'],)).fetchone()[0]
-            last['diagnostics'] = sync_diagnostics(json.loads(raw)) if raw else None
+            diagnostics = sync_diagnostics(json.loads(raw)) if raw else None
+            if diagnostics is not None:
+                last['diagnostics'] = {key: diagnostics[key] for key in ('invocations', 'omitted_count')}
+            counts = _read_timeout_counts(db, now, has_evidence='timeout_retries' in (diagnostics or {}))
+            timeout_counts.update(zip(CODEX_TIMEOUT_COUNTS, counts))
         # A running attempt, preview or pause does not resolve an earlier sync
         # failure. Keep the latest finished actual sync, ordered by UTC instant.
         row = db.execute("SELECT result,stage,error_code,finished_at FROM sync_runs "
@@ -486,7 +560,8 @@ def read_connection_state(db, now=None):
                 item = max(latest, key=lambda value: value['attempt_number'])
                 probe.update(calendar_probe_result=item['result'], calendar_probe_attempts=len(latest),
                     calendar_probe_recovered=None if item['result'] == 'running' else item['result'] == 'ok' and item['attempt_number'] == 2)
-    return dict(schema_version=1, sources=read_source_health(db, tables), agenda=read_agenda_health(db, tables), **probe, **completed, initialized_at=timestamp(settings.get('health_initialized_at')),
+    return dict(schema_version=1, sources=read_source_health(db, tables), agenda=read_agenda_health(db, tables), **probe, **completed, **timeout_counts,
+        initialized_at=timestamp(settings.get('health_initialized_at')),
         last_attempt_at=timestamp(last['started_at'] if last else settings.get('last_sync')),
         last_successful_sync=timestamp(settings.get('last_successful_sync')),
         sync_diagnostics=last.get('diagnostics') if last else None,

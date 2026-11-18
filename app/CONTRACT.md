@@ -244,16 +244,22 @@ sibling in its requested position. Mixed reordered/error batches and authenticat
 errors fail closed. Both batch and individual reads use the same existing
 all-day midnight normalization, including DST boundaries. Individual `read_event`
 remains the prewrite/write-verification mechanism. Full fresh planning and
-pre/post-application state reads remain in place. A sync run permits one additional
-`batch_read_event` invocation across all batches and all `read_events` calls, after
-five seconds within the existing whole-sync deadline. Only `unexpected_tool_count`
-with process exit 0, zero started/completed calls and zero parse/unknown/incomplete
-records qualifies. Protocol/process failures, observed calls, malformed results,
-individual reads and writes never qualify. The failed batch alone runs again in a
-fresh ephemeral session with the same request. A failed retry or another eligible
-failure after that run's budget is spent raises normally. Standalone runtime use
-keeps the same one-retry budget until `reset_batch_retry_budget()` is called.
-The initial Calendar access probe retains its separate existing retry policy.
+pre/post-application state reads remain in place.
+
+An application watchdog timeout permits one retry per Calendar read or tool-free
+agenda planning request, even if the first process completed a read before it
+stalled. The runtime waits five seconds within the existing whole-sync deadline
+and starts a fresh ephemeral process with the exact same request. Interruption
+ends the call. A timed-out write, or evidence that a write may have occurred,
+requires read-only reconciliation through the durable operation journal.
+
+The initial Calendar access probe also permits its existing retry for verified
+tool-count failures. Across all batches and `read_events` calls in one sync, one
+clean batch failure can also be retried. It must be `unexpected_tool_count` with
+process exit 0 and zero started, completed, parse, unknown and incomplete
+records. Timeout retries use their own per-request budget. A logical request
+can start at most two attempts across all retry reasons. Standalone runtime use
+resets the clean batch budget with `reset_batch_retry_budget()`.
 
 `sync_runs.diagnostics` is an additive nullable JSON column. Legacy rows remain
 null. The local authenticated `/api/status` and synchronization panel expose
@@ -266,10 +272,13 @@ completed-turn presence and a structural final-answer category: `missing`,
 JSON object with a boolean `ok`; duplicate keys, other types/keys, invalid JSON and
 answers over 4096 characters are `other`. No answer text is retained or classified
 by meaning. A model answer of `{"ok":true}` never substitutes for an actual tool
-result. Batch records add a run-local batch index, attempt 1/2, retry decision
-(`pending`, `retry`, `exhausted`, `not_eligible`, `not_needed`) and a recovery flag.
-Recovery requires complete validated batch coverage and event normalization.
-Older records without these fields remain valid.
+result. Codex records may include a run-local logical-call index, operation kind,
+attempt number, start and finish times, retry decision and reason, and a recovery
+flag. Calendar batch reads also include a batch index. An outcome counts as
+recovered only after validation. Older records without these fields remain
+valid. Compact timeout retry records preserve timestamps and outcomes when the
+larger invocation details expire from the per-run diagnostic list. The monitor
+exports only their rolling 24-hour counts.
 Form invariant failures retain the compatibility code `calendar_form_invalid`
 in source health; local diagnostics distinguish each form rule and initial load,
 month selection and restoration. A restoration failure cannot replace a prior

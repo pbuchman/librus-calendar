@@ -488,7 +488,7 @@ class CalendarProbeTests(unittest.TestCase):
         self.assertEqual(runtime.probe()['access_role'], 'owner')
         self.assertNotIn('PRIVATE', json.dumps(runtime.last_probe_attempts))
 
-    def test_tool_errors_unreadable_result_access_and_timeout_never_retry(self):
+    def test_tool_errors_unreadable_result_and_access_failures_never_retry(self):
         bad_error = self.call()
         bad_error['item']['error'] = {'message': 'Permission denied PRIVATE'}
         missing = self.call()
@@ -505,10 +505,6 @@ class CalendarProbeTests(unittest.TestCase):
             with patch('app.codex_runtime.time.sleep') as sleep, self.assertRaisesRegex(RuntimeFailure, code):
                 runtime.probe()
             sleep.assert_not_called()
-        runtime = CodexRuntime({'run_process': lambda *_: (_ for _ in ()).throw(RuntimeFailure('codex_timeout'))})
-        with patch('app.codex_runtime.time.sleep') as sleep, self.assertRaisesRegex(RuntimeFailure, 'codex_timeout'):
-            runtime.probe()
-        sleep.assert_not_called()
 
     def test_audit_failure_blocks_dispatch_or_retry(self):
         for fail_on in (1, 2, 3, 4):
@@ -545,7 +541,7 @@ class CalendarProbeTests(unittest.TestCase):
         started = json.dumps(self.call(identity='a', kind='item.started'))
         process.communicate.return_value = (started, 'PRIVATE stderr')
         runtime = ActualRuntime(TEST_CONFIG)
-        with patch.object(runtime, '_cli_version', return_value=None), patch('app.codex_runtime.subprocess.Popen', return_value=process), patch.object(runtime, '_pump_process', side_effect=subprocess.TimeoutExpired('codex',300)), patch('app.codex_runtime.os.killpg'), self.assertRaisesRegex(RuntimeFailure, 'codex_timeout'):
+        with patch.object(runtime, '_cli_version', return_value=None), patch('app.codex_runtime.subprocess.Popen', return_value=process), patch.object(runtime, '_pump_process', side_effect=subprocess.TimeoutExpired('codex',300)), patch('app.codex_runtime.os.killpg'), patch('app.codex_runtime.time.sleep'), self.assertRaisesRegex(RuntimeFailure, 'codex_timeout'):
             runtime.probe()
         attempt = runtime.last_probe_attempts[0]
         self.assertEqual((attempt['started_count'], attempt['completed_count'], attempt['process_code']), (1, 0, -9))

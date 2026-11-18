@@ -9,12 +9,14 @@ import re
 import subprocess
 import tempfile
 from .config import ConfigurationError, load_config
-from .health_state import SOURCE_ERROR_CODES, ERROR_CODES, STAGES, COMPLETED_SYNC_RESULTS
+from .health_state import CODEX_TIMEOUT_COUNTS, SOURCE_ERROR_CODES, ERROR_CODES, STAGES, COMPLETED_SYNC_RESULTS
 from datetime import datetime, timezone
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 DEFAULT_DB = Path('~/.local/share/librus-calendar/state.sqlite3').expanduser()
 DEFAULT_OUTPUT = Path('/var/lib/librus-monitor/status.json')
+SYNC_TIMER_MAINTENANCE_UNIT = 'librus-sync-timer-maintenance.service'
+SYNC_TIMER_MAINTENANCE_SECONDS = 15 * 60
 TIME_FIELDS = ('initialized_at', 'last_attempt_at', 'last_successful_sync', 'running_since',
                'writes_paused_since', 'oldest_pending_at', 'last_backup_success_at', 'last_backup_attempt_at')
 COUNT_FIELDS = ('consecutive_failures', 'messages_pending', 'operations_pending', 'operations_unknown', 'review_count')
@@ -88,10 +90,10 @@ def sanitize_state(state, now):
     if recovered is not None and type(recovered) is not bool:
         raise ValueError('invalid probe recovery')
     clean['calendar_probe_recovered'] = recovered
-    for name in PROBE_COUNTS:
+    for name in (*PROBE_COUNTS, *CODEX_TIMEOUT_COUNTS):
         value = state.get(name)
         if value is not None and (type(value) is not int or not 0 <= value <= 10**12):
-            raise ValueError('invalid probe count')
+            raise ValueError('invalid optional count')
         clean[name] = value
     clean['sources'] = sanitize_source_health(state.get('sources'), now)
     clean['agenda'] = sanitize_agenda_health(state.get('agenda'), now)
@@ -164,9 +166,13 @@ def sanitize_source_health(sources, now):
 
 
 def unit_state(unit):
+    args = ['systemctl', '--user', 'show', unit]
+    properties = 'LoadState,ActiveState,SubState,UnitFileState,Result,ExecMainStatus'
+    if unit == SYNC_TIMER_MAINTENANCE_UNIT:
+        args.append('--timestamp=unix')
+        properties += ',Transient,ActiveEnterTimestamp,ActiveEnterTimestampMonotonic'
     try:
-        result = subprocess.run(['systemctl', '--user', 'show', unit,
-            '--property=LoadState,ActiveState,SubState,UnitFileState,Result,ExecMainStatus'],
+        result = subprocess.run([*args, '--property=' + properties],
             timeout=5, check=True, capture_output=True, text=True)
         values = dict(line.split('=', 1) for line in result.stdout.splitlines() if '=' in line)
         if values.get('LoadState') != 'loaded':
@@ -206,6 +212,26 @@ def timer_available(state):
                 and state.get('UnitFileState') in {'enabled', 'enabled-runtime'})
 
 
+def sync_timer_maintenance(timer, now):
+    if timer is None or timer.get('ActiveState') != 'inactive':
+        return None
+    maintenance = unit_state(SYNC_TIMER_MAINTENANCE_UNIT)
+    if (not maintenance or maintenance.get('ActiveState') != 'active'
+            or maintenance.get('SubState') != 'running' or maintenance.get('Transient') != 'yes'):
+        return None
+    started = maintenance.get('ActiveEnterTimestamp', '')
+    if not started.startswith('@'):
+        return None
+    try:
+        started_at = int(started[1:])
+        started_monotonic_us = int(maintenance.get('ActiveEnterTimestampMonotonic', ''))
+    except ValueError:
+        return None
+    if not 0 <= now.timestamp() - started_at < SYNC_TIMER_MAINTENANCE_SECONDS or started_monotonic_us <= 0:
+        return None
+    return {'started_at': started_at, 'started_monotonic_us': started_monotonic_us}
+
+
 def collect_snapshot(database=None, now=None, reader=None, *, config=None):
     config = config if config is not None else load_config()
     database = database if database is not None else config.state_path
@@ -221,7 +247,11 @@ def collect_snapshot(database=None, now=None, reader=None, *, config=None):
     except Exception:
         # A sanitized source failure is observable; exception messages may contain private data.
         snapshot['state'] = None
-    snapshot['sync_timer_ok'] = timer_available(unit_state('librus-sync.timer'))
+    timer = unit_state('librus-sync.timer')
+    snapshot['sync_timer_ok'] = timer_available(timer)
+    maintenance = sync_timer_maintenance(timer, now)
+    if maintenance is not None:
+        snapshot['sync_timer_maintenance'] = maintenance
     snapshot['backup_timer_ok'] = not config.backup_enabled or timer_available(unit_state('librus-backup.timer'))
     sync = unit_state('librus-sync.service')
     backup = unit_state('librus-backup.service') if config.backup_enabled else None
