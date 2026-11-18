@@ -13,6 +13,7 @@ update_every = 60
 priority = 90000
 WIRE_SCALE = 1000
 MAX_METRIC_VALUE = 10**12
+SYNC_TIMER_MAINTENANCE_SECONDS = 15 * 60
 
 ORDER = ['sync', 'diagnostics', 'queue', 'services', 'monitoring', 'backup', 'pause', 'calendar_probe']
 CHARTS = {
@@ -271,6 +272,24 @@ def validate_snapshot(snapshot, now):
     return generated, parsed
 
 
+def sync_timer_maintenance_elapsed(snapshot, generated, now):
+    maintenance = snapshot.get('sync_timer_maintenance')
+    if not isinstance(maintenance, dict):
+        return None
+    started_at = maintenance.get('started_at')
+    started_monotonic_us = maintenance.get('started_monotonic_us')
+    monotonic_us = time.monotonic_ns() // 1000
+    if (type(started_at) is not int or type(started_monotonic_us) is not int
+            or not 0 < started_at <= generated
+            or not 0 <= generated - started_at < SYNC_TIMER_MAINTENANCE_SECONDS
+            or not 0 < started_monotonic_us <= monotonic_us):
+        return None
+    monotonic_age = (monotonic_us - started_monotonic_us) / 1_000_000
+    # Monotonic time bounds cached snapshots if wall time moves backwards.
+    # Wall time also advances when the host is suspended.
+    return max(now - started_at, monotonic_age)
+
+
 class HealthMetrics:
     """Independent clock means a stalled export cannot freeze healthy metrics."""
     def __init__(self):
@@ -316,7 +335,15 @@ class HealthMetrics:
         data['snapshot_age'] = max(0, now - generated) / 60.0
         data['db_down'] = self.outage('db', not snapshot['db_ok'], now)
         data['invalid'] = int(not snapshot['db_ok'] or data['snapshot_age'] >= 3)
-        for field, dimension in (('sync_timer_ok', 'sync_timer_down'), ('backup_timer_ok', 'backup_timer_down'),
+        timer_bad = not snapshot['sync_timer_ok']
+        maintenance_age = sync_timer_maintenance_elapsed(snapshot, generated, now) if timer_bad else None
+        if maintenance_age is not None:
+            began = now - min(maintenance_age, SYNC_TIMER_MAINTENANCE_SECONDS)
+            self.bad_since['sync_timer_ok'] = min(self.bad_since.get('sync_timer_ok', began), began)
+        timer_down = self.outage('sync_timer_ok', timer_bad, now)
+        data['sync_timer_down'] = (0 if maintenance_age is not None
+                                   and maintenance_age < SYNC_TIMER_MAINTENANCE_SECONDS else timer_down)
+        for field, dimension in (('backup_timer_ok', 'backup_timer_down'),
                                  ('web_ok', 'web_down'), ('sync_unit_ok', 'sync_unit_down')):
             data[dimension] = self.outage(field, not snapshot[field] and (field != 'backup_timer_ok' or snapshot['backup_enabled']), now)
         if times is None:
