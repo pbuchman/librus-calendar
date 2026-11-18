@@ -436,8 +436,34 @@ class CollectorTests(unittest.TestCase):
         self.assertNotIn('on: librus_local.diagnostics', rules)
         self.assertNotIn('${label:', rules)
         self.assertEqual(rules.count('Librus synchronization diagnostics chart'), 6)
-        self.assertEqual(COLLECTOR.CHARTS['diagnostics']['lines'],
-                         [['failures', 'consecutive failures', 'absolute', 1, COLLECTOR.WIRE_SCALE]])
+        self.assertEqual(COLLECTOR.CHARTS['diagnostics']['lines'][0],
+                         ['failures', 'consecutive failures', 'absolute', 1, COLLECTOR.WIRE_SCALE])
+
+    def test_timeout_retry_counters_are_optional_and_informational(self):
+        counts = dict(codex_timeout_retries_24h=2, codex_timeout_recovered_24h=1,
+                      codex_timeout_retry_failures_24h=1)
+        value = snapshot()
+        baseline = self.metrics.calculate(value, self.now)
+        self.assertFalse(set(counts) & set(baseline))
+        self.assertTrue(all(monitoring.sanitize_state(value['state'], NOW)[name] is None for name in counts))
+        value['state'].update(counts, sync_diagnostics={'private': 'private'})
+        value['state'] = monitoring.sanitize_state(value['state'], NOW)
+        self.assertNotIn('sync_diagnostics', value['state'])
+        self.assertEqual(self.metrics.calculate(value, self.now), {**baseline, **counts})
+        self.assertFalse(set(counts) & set(self.metrics.calculate(value, self.now + 180)))
+        chart = COLLECTOR.CHARTS['diagnostics']
+        self.assertEqual({line[0] for line in chart['lines']}, {'failures', *counts})
+        self.assertTrue(all(line[2:] == ['absolute', 1, 1000] for line in chart['lines']))
+        rules = (ROOT/'deploy/netdata/librus_local-health.conf').read_text()
+        for field in counts:
+            self.assertNotIn(field, rules)
+            for bad in (True, -1, 10**12 + 1, 'private'):
+                with self.subTest(field=field, value=bad):
+                    malformed = {**value['state'], field: bad}
+                    with self.assertRaises(ValueError):
+                        monitoring.sanitize_state(malformed, NOW)
+                    with self.assertRaises(ValueError):
+                        COLLECTOR.validate_snapshot({**value, 'state': malformed}, self.now)
 
     def test_probe_chart_is_optional_and_rolling_counts_are_absolute(self):
         value = snapshot()

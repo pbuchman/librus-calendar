@@ -9,7 +9,7 @@ import re
 import subprocess
 import tempfile
 from .config import ConfigurationError, load_config
-from .health_state import SOURCE_ERROR_CODES, ERROR_CODES, STAGES, COMPLETED_SYNC_RESULTS
+from .health_state import CODEX_TIMEOUT_COUNTS, SOURCE_ERROR_CODES, ERROR_CODES, STAGES, COMPLETED_SYNC_RESULTS
 from datetime import datetime, timezone
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -90,10 +90,10 @@ def sanitize_state(state, now):
     if recovered is not None and type(recovered) is not bool:
         raise ValueError('invalid probe recovery')
     clean['calendar_probe_recovered'] = recovered
-    for name in PROBE_COUNTS:
+    for name in (*PROBE_COUNTS, *CODEX_TIMEOUT_COUNTS):
         value = state.get(name)
         if value is not None and (type(value) is not int or not 0 <= value <= 10**12):
-            raise ValueError('invalid probe count')
+            raise ValueError('invalid optional count')
         clean[name] = value
     clean['sources'] = sanitize_source_health(state.get('sources'), now)
     clean['agenda'] = sanitize_agenda_health(state.get('agenda'), now)

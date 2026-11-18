@@ -266,10 +266,13 @@ completed-turn presence and a structural final-answer category: `missing`,
 JSON object with a boolean `ok`; duplicate keys, other types/keys, invalid JSON and
 answers over 4096 characters are `other`. No answer text is retained or classified
 by meaning. A model answer of `{"ok":true}` never substitutes for an actual tool
-result. Batch records add a run-local batch index, attempt 1/2, retry decision
-(`pending`, `retry`, `exhausted`, `not_eligible`, `not_needed`) and a recovery flag.
-Recovery requires complete validated batch coverage and event normalization.
-Older records without these fields remain valid.
+result. Codex records may include a run-local logical-call index, operation kind,
+attempt number, start and finish times, retry decision and reason, and a recovery
+flag. Calendar batch reads also include a batch index. An outcome counts as
+recovered only after validation. Older records without these fields remain
+valid. Compact timeout retry records preserve timestamps and outcomes when the
+larger invocation details expire from the per-run diagnostic list. The monitor
+exports only their rolling 24-hour counts.
 Form invariant failures retain the compatibility code `calendar_form_invalid`
 in source health; local diagnostics distinguish each form rule and initial load,
 month selection and restoration. A restoration failure cannot replace a prior
