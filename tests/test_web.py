@@ -1,6 +1,8 @@
 from test_support import TEST_CONFIG
 import unittest
 import tempfile
+import json
+from contextlib import closing
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
@@ -29,9 +31,12 @@ class FakeStore:
         return None
     def list_events(self):
         return []
-    def list_proposals(self):
-        return [dict(id='p1',message_id='m1',kind='cancel',title='Wycieczka',
-                     status='review',review_reason='Odwołano',source_quote='Nie jedziemy',start='',end='')]
+    def list_proposals(self, status=None, **kwargs):
+        items = [dict(id='p1',message_id='m1',kind='cancel',title='Wycieczka',
+                      status='review',review_reason='Odwołano',source_quote='Nie jedziemy',start='',end='')]
+        return [item for item in items if status is None or item['status'] == status]
+    def get_proposal(self, key):
+        return next((item for item in self.list_proposals() if item['id'] == key), None)
     def set_writes_paused(self, paused):
         self.paused = paused
     def resolve_proposal(self, key, action, changes):
@@ -278,6 +283,63 @@ class WebTests(unittest.TestCase):
         self.assertNotIn('private', probe)
 
 class RealStoreIntegrationTests(unittest.TestCase):
+    def review_backlog(self, newer_status):
+        from app.core import AppStore
+
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        store = self.enterContext(closing(AppStore(Path(directory) / 'state.sqlite3', config=TEST_CONFIG)))
+        store.save_message({'id': 'target', 'text': 'Fikcyjna wycieczka'})
+        target, = store.save_proposals('target', [
+            {'kind': 'create', 'title': 'Fikcyjna wycieczka', 'start': '2030-03-12',
+             'all_day': True, 'needs_review': True, 'source_quote': 'Fikcyjna wycieczka'},
+        ], current=datetime(2026, 11, 18, tzinfo=timezone.utc))
+        payload = json.dumps({'kind': 'create', 'title': 'Inna propozycja', 'start': '2030-04-12',
+                              'all_day': True})
+        with store.db:
+            store.db.execute("UPDATE proposals SET created_at='2026-11-18' WHERE id=?", (target['id'],))
+            store.db.executemany(
+                "INSERT INTO proposals (id,message_id,source_hash,payload,status,created_at,updated_at) "
+                "VALUES (?,'target','synthetic',?,?,'2026-11-19','2026-11-19')",
+                ((f'newer-{index}', payload, newer_status) for index in range(100)),
+            )
+        client = self.enterContext(TestClient(
+            create_app(store, lambda: None, allow_local=True, config=TEST_CONFIG),
+            base_url='http://testserver', client=('127.0.0.1', 1234),
+        ))
+        return store, client, '/proposals/' + target['id']
+
+    def test_review_filters_out_resolved_proposals_before_limiting(self):
+        _, client, endpoint = self.review_backlog('ignored')
+        self.assertNotIn(endpoint.rsplit('/', 1)[1], {p['id'] for p in client.get('/api/proposals').json()})
+        page = client.get('/review')
+        self.assertIn('Do sprawdzenia <span>1</span>', page.text)
+        self.assertIn(f'action="{endpoint}"', page.text)
+        self.assertNotIn('Wszystko sprawdzone', page.text)
+
+    def test_more_than_a_hundred_open_proposals_can_be_reached(self):
+        _, client, endpoint = self.review_backlog('review')
+        first = client.get('/review')
+        self.assertIn('Do sprawdzenia <span>101</span>', first.text)
+        self.assertNotIn(f'action="{endpoint}"', first.text)
+        self.assertIn('href="/review?offset=100"', first.text)
+        second = client.get('/review?offset=100')
+        self.assertIn(f'action="{endpoint}"', second.text)
+        self.assertIn('href="/review?offset=0"', second.text)
+        self.assertNotIn('Wszystko sprawdzone', second.text)
+
+    def test_older_proposal_approval_and_rejection_use_exact_id(self):
+        for choice, status, flag in (('approve', 'pending', 'user_approved'),
+                                     ('reject', 'ignored', 'user_rejected')):
+            with self.subTest(choice=choice):
+                store, client, endpoint = self.review_backlog('ignored')
+                client.get('/review')
+                response = client.post(endpoint, data={'csrf': client.cookies['librus_csrf'], 'action': choice},
+                                       headers={'origin': 'http://testserver'}, follow_redirects=False)
+                self.assertEqual(response.status_code, 303)
+                proposal, = [p for p in store.list_proposals(limit=101) if p['id'] == endpoint.rsplit('/', 1)[1]]
+                self.assertEqual(proposal['status'], status)
+                self.assertTrue(proposal[flag])
+
     def test_panel_controls_persist_and_approval_survives_reload(self):
         from app.core import AppStore
         with tempfile.TemporaryDirectory() as directory:

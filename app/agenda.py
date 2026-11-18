@@ -14,7 +14,7 @@ import json
 import jsonschema
 
 from .codex_runtime import SCHEMAS, CodexRuntime, RuntimeFailure, normalize_event, event_fingerprint
-from .core import WARSAW, digest, normalize_proposal, utcnow
+from .core import REVIEWED_CREATE_WITH_TARGET, WARSAW, digest, normalize_proposal, utcnow
 
 AGENDA_VERSION = 'simple-agenda-v9-school-reconfirmation'
 AGENDA_MODEL = 'gpt-6.1-sol'
@@ -147,9 +147,14 @@ def _agenda(tables, calendar_events, owner_email):
                 'status': 'inventory_only', 'action': {}, 'links': [], 'decisions': [], 'calendar': []})
         saved = json.loads(row['snapshot'])
         current = normalize_event(observed, owner_email) if observed else None
-        entry['calendar'].append({'id': eid, 'state': row['state'], 'marker': row['marker'],
+        # A Calendar cancellation can keep all the writable content intact.
+        # Observe its state here without changing the executor's content fingerprint.
+        state = row['state'] if observed is None else ('cancelled' if observed.get('status') == 'cancelled' else 'active')
+        externally_changed = (state != row['state'] or event_fingerprint(observed, owner_email) != row['fingerprint']
+                              if observed is not None else row['state'] == 'active')
+        entry['calendar'].append({'id': eid, 'state': state, 'marker': row['marker'],
             'saved_fingerprint': row['fingerprint'], 'current': current,
-            'externally_changed': (event_fingerprint(observed, owner_email) != row['fingerprint']) if observed else row['state'] == 'active'})
+            'externally_changed': externally_changed})
         if not entry['action']:
             normalized = normalize_event(saved, owner_email)
             entry['action'] = {'title': normalized['summary'], 'start': normalized['start'], 'end': normalized['end']}
@@ -553,7 +558,7 @@ def _prepare_item(store, snapshot, item, plan_id, index, current):
         # source identity alone does not block independent duties in one notice.
         fields = ('title','description','start','end','all_day','temporal_kind','due_at','activity_scope','optional')
         ref_ids = {ref['source_id'] for ref in refs}
-        for pending in store.db.execute("SELECT o.id,p.payload FROM operations o JOIN proposals p ON p.id=o.proposal_id WHERE o.status IN ('unknown','inflight')"):
+        for pending in store.db.execute(f"SELECT o.id,p.payload FROM operations o JOIN proposals p ON p.id=o.proposal_id WHERE o.status IN ('unknown','inflight') OR {REVIEWED_CREATE_WITH_TARGET}"):
             prior = json.loads(pending['payload'])
             prior_refs = {ref['source_id'] for ref in prior.get('agenda_sources', [])} | {prior.get('source_id')}
             if (prior.get('kind') == 'create' and ref_ids & prior_refs
@@ -586,11 +591,14 @@ def _prepare_item(store, snapshot, item, plan_id, index, current):
         proposal['review_reason'] = reason
     if selected_change:
         proposal['alternative_group_id'] = group['id']
-    # Unknown/inflight intent cannot be superseded or followed by another create.
+    # An uncertain write or a known target without verified ownership cannot
+    # authorize a second create for the same action.
     related = ([entry] if entry else []) + [entries[candidate] for candidate in item['candidate_action_ids']]
     for target in related:
-        uncertain = store.db.execute("SELECT o.id FROM operations o JOIN proposals p ON p.id=o.proposal_id WHERE (p.id=? OR p.id=? OR json_extract(p.payload,'$.canonical_action_id')=?) AND o.status IN ('unknown','inflight')",
-                                     (target['proposal_id'], target['id'], target['id'])).fetchone()
+        uncertain = store.db.execute(f"""SELECT o.id FROM operations o JOIN proposals p ON p.id=o.proposal_id
+            WHERE (p.id=? OR p.id=? OR json_extract(p.payload,'$.canonical_action_id')=?)
+            AND (o.status IN ('unknown','inflight') OR (? AND {REVIEWED_CREATE_WITH_TARGET}))""",
+            (target['proposal_id'], target['id'], target['id'], kind == 'create')).fetchone()
         if uncertain:
             proposal.update(status='review', needs_review=True, deferred_unknown_operation=uncertain[0],
                             review_reason='Prior write must be reconciled before this change can be approved.')
@@ -639,6 +647,8 @@ def materialize_plan(store, snapshot, plan, calendar, *, current, preview=False,
         store.db.execute('INSERT INTO agenda_plans VALUES (?,?,?,?,?,?,NULL)',
                          (pid, snapshot['snapshot_hash'], json.dumps(payload, ensure_ascii=False), json.dumps(metadata or {}), 'applied', stamp))
         groups = {}
+        body_versions = {(source['id'], source['content_hash']) for source in snapshot['sources']
+                         if source.get('text') and not source.get('deleted') and source.get('status') != 'retained'}
         for item, proposal in prepared:
             aid = item['action_id']
             if item['operation'] == 'ignore':
@@ -647,7 +657,10 @@ def materialize_plan(store, snapshot, plan, calendar, *, current, preview=False,
                 row = store.db.execute('SELECT p.* FROM proposals p JOIN canonical_actions a ON a.proposal_id=p.id WHERE a.id=?', (aid,)).fetchone()
                 attempted = store.db.execute("SELECT 1 FROM operations o JOIN proposals p ON p.id=o.proposal_id WHERE (p.id=? OR json_extract(p.payload,'$.canonical_action_id')=?) AND (o.attempts>0 OR o.status IN ('unknown','inflight','applied'))", (aid, aid)).fetchone()
                 owned = store.db.execute('SELECT 1 FROM events WHERE proposal_id=?', (item['proposal_id'],)).fetchone()
-                if row and row['status'] in ('pending', 'review') and not attempted and not owned:
+                linked_versions = {(ref['source_id'], ref['source_hash']) for ref in item['sources']}
+                changed = store.changed_approved_message_refs(store._proposal(row)) if row else set()
+                if (row and row['status'] in ('pending', 'review') and not attempted and not owned
+                        and changed <= linked_versions & body_versions):
                     # Fresh validated corroboration admits the same unwritten
                     # intent; retain consent, content, IDs and historical links.
                     admission = {'agenda_plan_id': pid, 'agenda_sources': item['sources'],

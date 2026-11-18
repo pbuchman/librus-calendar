@@ -147,7 +147,7 @@ class SourcesWebTests(unittest.TestCase):
     def test_changed_offer_membership_has_no_standalone_approval(self):
         proposal=self.store.list_proposals()[0]
         proposal.update(kind='create',blocked_by_offer_group='original-group',alternative_group='new-option')
-        self.store.list_proposals=lambda:[proposal]
+        self.store.list_proposals=lambda **kwargs:[proposal]
         self.store.get_proposal_group=lambda key,**kw:{'message_id':'original-offer-message'}
         page=self.client.get('/review')
         self.assertEqual(page.status_code,200)
@@ -173,7 +173,7 @@ class SourcesWebTests(unittest.TestCase):
                       review_reason='Nowy termin wymaga zgody.',source_quote='Pierwszy cytat',
                       start='2030-03-09T11:00:00+01:00',end='2030-03-09T12:00:00+01:00',all_day=False,
                       agenda_sources=[{'source_id':'s2'}])
-        self.store.list_proposals=lambda:[proposal]
+        self.store.list_proposals=lambda **kwargs:[proposal]
         self.store.list_events=lambda:[{'id':'existing-event','snapshot':{'summary':'Zatwierdzony tytuł',
             'start':{'dateTime':'2030-03-08T10:00:00+01:00'},'end':{'dateTime':'2030-03-08T11:00:00+01:00'}}}]
         page=self.client.get('/review').text

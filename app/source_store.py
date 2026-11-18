@@ -392,7 +392,7 @@ class SourceStoreMixin:
         if not item.get('canonical_action_id'):
             return None
         uncertain = item.get('deferred_unknown_operation')
-        if uncertain and self.db.execute("SELECT 1 FROM operations WHERE id=? AND status IN ('unknown','inflight')", (uncertain,)).fetchone():
+        if uncertain and self.write_needs_reconciliation(uncertain):
             return 'Prior write must be reconciled before this change can execute.'
         if self._setting('source_learner_verified') != 'true':
             return 'Selected learner context is unverified.'

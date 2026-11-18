@@ -21,6 +21,8 @@ class OfferStore(FakeStore):
         return {**super().status(), 'proposals_review': 1 + sum(item['status'] == 'review' for item in self.group['members'])}
     def list_proposal_groups(self, **kwargs):
         return [deepcopy(self.group)]
+    def get_proposal(self, key):
+        return next((item for item in self.group['members'] if item['id'] == key), None) or super().get_proposal(key)
     def get_proposal_group(self, key, **kwargs):
         return deepcopy(self.group) if key == 'offer1' else None
     def get_proposal_group_for_proposal(self, key, **kwargs):
@@ -53,7 +55,7 @@ class OfferWebTests(unittest.TestCase):
                                 data={'csrf': self.client.cookies['librus_csrf'], 'expected_revision': '1', **data},
                                 headers={'origin': 'http://testserver'}, follow_redirects=False, **kwargs)
     def test_groups_are_complete_independent_of_legacy_proposal_limit_and_no_default(self):
-        self.store.list_proposals = lambda: [dict(id=f'noise{i}', message_id='m1', title='Other', status='ignored') for i in range(100)]
+        self.store.list_proposals = lambda **kwargs: [dict(id=f'noise{i}', message_id='m1', title='Other', status='ignored') for i in range(100)]
         page = self.client.get('/review').text
         self.assertEqual(page.count('data-offer-id='), 1)
         self.assertEqual(page.count('type="radio"'), 3)
@@ -79,7 +81,7 @@ class OfferWebTests(unittest.TestCase):
     def test_selected_term_requiring_review_is_visible_and_actionable_beyond_legacy_limit(self):
         self.assertEqual(self.submit({'decision':'select','proposal_id':'option1'}).status_code, 303)
         self.store.group['members'][1]['status'] = 'review'
-        self.store.list_proposals = lambda: [dict(id=f'noise{i}', message_id='m1', title='Other', status='ignored') for i in range(100)]
+        self.store.list_proposals = lambda **kwargs: [dict(id=f'noise{i}', message_id='m1', title='Other', status='ignored') for i in range(100)]
         status = self.store.status()
         self.store.status = lambda: {**status, 'proposals_review': 1}
         page = self.client.get('/review').text
@@ -98,7 +100,7 @@ class OfferWebTests(unittest.TestCase):
 
     def test_selected_pending_term_remains_closed_and_absent_from_review(self):
         self.assertEqual(self.submit({'decision':'select','proposal_id':'option1'}).status_code, 303)
-        self.store.list_proposals = lambda: []
+        self.store.list_proposals = lambda **kwargs: []
         status = self.store.status()
         self.store.status = lambda: {**status, 'proposals_review': 0}
         page = self.client.get('/review').text
@@ -112,7 +114,7 @@ class OfferWebTests(unittest.TestCase):
                            status='review', start='2030-03-09T10:00:00+01:00', end=None,
                            description='Sala C', source_quote='Wybierz jeden termin', review_reason='',
                            blocked_by_group_decision='old-offer')
-        self.store.list_proposals = lambda: [replacement]
+        self.store.list_proposals = lambda **kwargs: [replacement]
         self.store.list_proposal_groups = lambda **kwargs: []
         page = self.client.get('/review').text
         self.assertIn('wymaga ręcznego sprawdzenia po wcześniejszej decyzji', page)

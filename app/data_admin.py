@@ -8,7 +8,7 @@ import re
 import sqlite3
 import stat
 
-from .core import WARSAW, as_datetime, digest, has_external_attendees, start_key, utcnow
+from .core import SOURCE_LABELS, WARSAW, as_datetime, digest, has_external_attendees, start_key, utcnow
 from .codex_runtime import event_fingerprint, normalize_event, RuntimeFailure
 from .sync import execution_deadline, safe_error, sync_lock, SyncInterrupted
 
@@ -479,7 +479,12 @@ def _prune_state_locked(store, *, days=30, apply=False, current=None):
 def event_ownership(event):
     text = str(event.get('description') or '')
     markers = set(re.findall(r'librus-calendar:[A-Za-z0-9_-]{8,128}', re.sub(r'\s+', '', text)))
-    sources = set(re.findall(r'Źródło\s*:\s*Librus\s*,\s*wiadomość\s+([A-Za-z0-9_-]{1,200})', text, re.IGNORECASE))
+    sources = set()
+    for kind, label in SOURCE_LABELS.items():
+        label_pattern = r'\s+'.join(map(re.escape, label.split()))
+        source_id = r'[A-Za-z0-9_-]{1,200}' if kind == 'message' else rf'{kind}:[0-9a-f]{{32}}'
+        sources.update(re.findall(rf'^\s*Źródło\s*:\s*Librus\s*,\s*{label_pattern}\s+({source_id})[^\S\r\n]*\r?$',
+                                  text, re.IGNORECASE | re.MULTILINE))
     return markers, sources
 
 
@@ -566,6 +571,13 @@ class RebuildController:
         # Exact transferred IDs are verified even when connector search omitted
         # a modified description. Ownership is never inferred from a title.
         saved = {event['id']: event for event in self.store.list_events(100000, include_cancelled=True)}
+        uncertain_events = {row['event_id'] for row in self.store.db.execute("""
+            SELECT event_id FROM metadata_refresh WHERE status IN ('inflight','unknown')
+            UNION
+            SELECT json_extract(payload, '$.event_id') FROM operations WHERE status IN ('inflight','unknown')
+            UNION
+            SELECT json_extract(result, '$.event_id') FROM operations WHERE status IN ('inflight','unknown')
+        """)}
         for event_id, row in saved.items():
             # Search may flatten all-day dates to ambiguous midnight strings.
             # The verified saved snapshot supplies only the temporal kind; the
@@ -581,6 +593,8 @@ class RebuildController:
                 snapshot = self.runtime.read_event(event_id, hint)
             except RuntimeFailure as error:
                 if error.code == 'calendar_event_not_found' and event_id in saved:
+                    if saved[event_id]['state'] == 'cancelled' and event_id not in uncertain_events:
+                        continue
                     problems[event_id] = 'Transferred event deleted or unavailable; ownership retained.'
                     continue
                 raise

@@ -15,6 +15,11 @@ from .health_state import ERROR_CODES, RESULTS, STAGES, PROBE_FIELDS, probe_meta
 WARSAW = ZoneInfo('Europe/Warsaw')
 from .config import AppConfig, ConfigurationError, load_config
 PREFIX = 'librus-calendar:'
+SOURCE_LABELS = {'message': 'wiadomość', 'announcement': 'ogłoszenie',
+                 'school_event': 'terminarz szkolny', 'substitution': 'zastępstwo'}
+MESSAGE_RELINK_REQUIRED = 'Source message changed; reanalysis required.'
+REVIEWED_CREATE_WITH_TARGET = """(o.status='review' AND json_extract(o.payload,'$.action')='create'
+    AND COALESCE(json_extract(o.payload,'$.event_id'),json_extract(o.result,'$.event_id')) IS NOT NULL)"""
 
 
 def utcnow():
@@ -110,6 +115,83 @@ def deadline_datetime(value):
     return local
 
 
+def deadline_label(due):
+    return 'do ' + due.strftime('%H:%M')
+
+
+def deadline_detail(due):
+    return f'Termin: {due.date().isoformat()} {deadline_label(due)} (Europe/Warsaw).'
+
+
+def without_deadline_title_label(title, previous=None):
+    title = re.sub(r'(?: — do \d{2}:\d{2})+$', '', title)
+    # Older proposals sometimes already included the hour in the supplied title.
+    return title.removesuffix(' ' + deadline_label(previous)).rstrip() if previous else title
+
+
+def edited_deadline_due_at(day, value, previous):
+    if not value:
+        return None
+    if not isinstance(value, str) or not re.fullmatch(r'\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?', value):
+        raise ValueError('A deadline hour must be a local time.')
+    wall = datetime.fromisoformat(f'{day}T{value}')
+    if previous and previous.replace(tzinfo=None) == wall:
+        return previous.isoformat()
+    local = wall.replace(tzinfo=WARSAW)
+    if local.utcoffset() != local.replace(fold=1).utcoffset():
+        raise ValueError('Choose a deadline time outside the Warsaw clock change.')
+    return deadline_datetime(local.isoformat()).isoformat()
+
+
+def apply_deadline_edit(item, patch):
+    if item.get('temporal_kind') != 'deadline':
+        if 'due_time' in patch:
+            raise ValueError('Only deadlines can have a deadline hour.')
+        return
+    if 'due_time' not in patch and not (item.get('due_at') and 'start' in patch):
+        return
+
+    previous = None
+    if item.get('due_at'):
+        try:
+            previous = deadline_datetime(item['due_at'])
+        except ValueError:
+            if 'due_time' not in patch:
+                raise
+    due_time = patch.pop('due_time', previous.time().isoformat() if previous else None)
+    due_at = edited_deadline_due_at(patch.get('start', item['start']), due_time, previous)
+    if due_at == item.get('due_at'):
+        return
+    patch['due_at'] = due_at
+    if not previous:
+        return
+    patch['title'] = without_deadline_title_label(patch.get('title', item['title']), previous)
+    description = patch.get('description', item['description']) or ''
+    old_detail = deadline_detail(previous)
+    patch['description'] = '\n'.join(line for line in description.split('\n') if line != old_detail).rstrip()
+
+
+def apply_proposal_edit(item, patch):
+    """Apply form fields against the row read inside the approval transaction."""
+    apply_deadline_edit(item, patch)
+    if 'end' in patch:
+        end = patch['end'] or None
+        fixed_end = item.get('temporal_kind') in ('deadline', 'reminder')
+        if end and end != item.get('end') and not fixed_end:
+            all_day = patch.get('all_day', item.get('all_day')) is True
+            end = (date.fromisoformat(str(end)) if all_day else as_datetime(end)).isoformat()
+        if end == item.get('end') or fixed_end:
+            del patch['end']
+        else:
+            patch['end'] = end
+    updated = {**item, **patch}
+    if 'end' in patch:
+        updated['default_duration'] = False
+    elif item.get('default_duration') and updated.get('start') != item.get('start'):
+        updated['end'] = None
+    return updated
+
+
 def analysis_metadata(data, proposal_count):
     """Persist only the documented provenance fields; legacy runtimes remain unknown."""
     data = data if isinstance(data, dict) else {}
@@ -164,10 +246,11 @@ def normalize_proposal(data, current=None, *, participation_preference=False):
             if due.date().isoformat() != proposal['start']:
                 raise ValueError('Deadline timestamp and calendar day do not match.')
             proposal['due_at'] = due.isoformat()
-            label = 'do ' + due.strftime('%H:%M')
-            if label not in proposal['title']:
-                proposal['title'] += ' — ' + label
-            detail = 'Termin: ' + due.date().isoformat() + ' ' + label + ' (Europe/Warsaw).'
+            title = librus_title(without_deadline_title_label(str(data['title']).strip()))
+            label = deadline_label(due)
+            suffix = ' — ' + label
+            proposal['title'] = title if label in title else title[:250 - len(suffix)].rstrip() + suffix
+            detail = deadline_detail(due)
             if detail not in proposal['description']:
                 proposal['description'] = (proposal['description'].rstrip() + '\n' + detail).lstrip()
     elif proposal['due_at'] is not None:
@@ -178,7 +261,10 @@ def normalize_proposal(data, current=None, *, participation_preference=False):
         start = date.fromisoformat(str(proposal['start']))
         end = start + timedelta(days=1) if temporal_kind in ('deadline', 'reminder') or not proposal['end'] else date.fromisoformat(str(proposal['end']))
         proposal['start'], proposal['end'] = start.isoformat(), end.isoformat()
-        past = due <= current.astimezone(WARSAW) if due is not None else start < current.astimezone(WARSAW).date()
+        if due is not None:
+            past = due.astimezone(timezone.utc) <= current.astimezone(timezone.utc)
+        else:
+            past = start < current.astimezone(WARSAW).date()
     else:
         if len(str(proposal['start'])) <= 10:
             raise ValueError('A timed event requires an explicit time; choose all_day for date-only events.')
@@ -204,13 +290,14 @@ def normalize_proposal(data, current=None, *, participation_preference=False):
 
 def event_body(proposal, message, marker, synchronization_started_at=None):
     description = proposal['description'].strip()
-    kind_label={'announcement':'ogłoszenie','school_event':'terminarz szkolny','substitution':'zastępstwo'}.get(message.get('source_kind'),'wiadomość')
+    kind_label = SOURCE_LABELS.get(message.get('source_kind'), SOURCE_LABELS['message'])
     source = '\n\nŹródło: Librus, ' + kind_label + ' ' + message['id'] + '\n' + (message.get('subject') or '')
     source += '\nNadawca: ' + (message.get('sender') or '') + '\nWysłano: ' + (message.get('sent_at') or '')
     if proposal.get('source_quote'):
         source += '\nFragment: ' + proposal['source_quote']
     if proposal.get('default_duration'):
-        source += '\nCzas trwania 60 minut przyjęty automatycznie; wiadomość nie podaje końca.'
+        source += '\nCzas trwania 60 minut przyjęty automatycznie'
+        source += '.' if proposal.get('user_edited') else '; wiadomość nie podaje końca.'
     if proposal.get('preference_decision') and not proposal.get('user_approved'):
         source += '\nAutomatyczna akceptacja na podstawie wcześniejszych decyzji rodzica (' + str(len(proposal['preference_decision']['example_ids'])) + ' przykłady).'
     source += '\n' + marker
@@ -518,8 +605,10 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             self.db.execute('INSERT INTO messages(id,payload,payload_hash,status,sent_at,fetched_at,last_error,pending_since) VALUES (?,?,?,?,?,?,NULL,?) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload,payload_hash=excluded.payload_hash,status=excluded.status,sent_at=excluded.sent_at,fetched_at=excluded.fetched_at,last_error=NULL,pending_since=excluded.pending_since',
                             (message_id, json.dumps(clean, ensure_ascii=False), hashed, state, clean['sent_at'], utcnow(), pending_since if state == 'analysis_pending' else None))
             if changed and row and row['payload_hash']:
-                self.db.execute("UPDATE proposals SET status='ignored',updated_at=?,pending_since=NULL WHERE message_id=? AND status IN ('pending','review')", (utcnow(), message_id))
-                self.db.execute("UPDATE operations SET status='review',last_error='Source message changed; reanalysis required.',updated_at=? WHERE proposal_id IN (SELECT id FROM proposals WHERE message_id=?) AND status='pending'", (utcnow(), message_id))
+                for proposal in self.db.execute("SELECT * FROM proposals WHERE message_id=? AND status IN ('pending','review')", (message_id,)).fetchall():
+                    if not self._can_relink_pending_approval(self._proposal(proposal)):
+                        self.db.execute("UPDATE proposals SET status='ignored',updated_at=?,pending_since=NULL WHERE id=?", (utcnow(), proposal['id']))
+                self.db.execute("UPDATE operations SET status='review',last_error=?,updated_at=? WHERE proposal_id IN (SELECT id FROM proposals WHERE message_id=?) AND status='pending'", (MESSAGE_RELINK_REQUIRED, utcnow(), message_id))
             self._mirror_message_source(self.db.execute('SELECT * FROM messages WHERE id=?', (message_id,)).fetchone())
         return changed
 
@@ -653,11 +742,24 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
         data.update(id=row['id'], message_id=row['message_id'], status=row['status'])
         return data
 
-    def list_proposals(self, status=None, limit=100):
-        sql = 'SELECT * FROM proposals' + (' WHERE status=?' if status else '') + ' ORDER BY created_at DESC,id LIMIT ?'
-        params = (status, limit) if status else (limit,)
+    def get_proposal(self, proposal_id):
         with self.lock:
-            return [self._proposal(row) for row in self.db.execute(sql, params)]
+            row = self.db.execute('SELECT * FROM proposals WHERE id=?', (str(proposal_id),)).fetchone()
+            return self._proposal(row) if row else None
+
+    def list_proposals(self, status=None, limit=100, *, offset=0, exclude_grouped=False):
+        filters, params = [], []
+        if status:
+            filters.append('status=?')
+            params.append(status)
+        if exclude_grouped:
+            filters.append('NOT EXISTS (SELECT 1 FROM proposal_group_members m WHERE m.proposal_id=proposals.id)')
+        sql = 'SELECT * FROM proposals'
+        if filters:
+            sql += ' WHERE ' + ' AND '.join(filters)
+        sql += ' ORDER BY created_at DESC,id LIMIT ? OFFSET ?'
+        with self.lock:
+            return [self._proposal(row) for row in self.db.execute(sql, (*params, limit, offset))]
 
     def list_events(self, limit=100, include_cancelled=False):
         with self.lock:
@@ -691,6 +793,67 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
         self.db.execute('UPDATE events SET snapshot=?,fingerprint=?,updated_at=? WHERE id=? AND calendar_id=?',
                         (json.dumps(snapshot, ensure_ascii=False), fingerprint, utcnow(), target_id, self.calendar_id))
 
+    def _verified_create_snapshot(self, operation, result, event_id):
+        from .codex_runtime import event_fingerprint, marker_present
+        snapshot = result.get('snapshot')
+        if (operation['calendar_id'] == self.calendar_id and event_id and event_id == result.get('event_id')
+                and isinstance(snapshot, dict) and snapshot.get('id') == event_id and snapshot.get('status') != 'cancelled'
+                and marker_present(snapshot.get('description'), operation['marker'])
+                and not has_external_attendees(snapshot, self.config.calendar_owner) and not snapshot.get('recurrence')
+                and result.get('fingerprint') == event_fingerprint(snapshot, self.config.calendar_owner)):
+            return snapshot
+        return None
+
+    def _approve_reviewed_create(self, original, item):
+        """Rebase a confirmed creation as an update of its exact Calendar ID."""
+        row = self.db.execute("SELECT * FROM operations WHERE proposal_id=? AND status IN ('pending','review')",
+                              (item['id'],)).fetchone()
+        if not row or not row['result']:
+            return False
+        operation = json.loads(row['payload'])
+        result = json.loads(row['result'])
+        history = operation.get('reviewed_create')
+        if not history and not (operation['action'] == 'create' and result.get('error') in
+                                ('write_verification_mismatch', 'existing_event_changed', 'duplicate_marker')):
+            return False
+        if item['status'] != 'pending':
+            return True
+        from .codex_runtime import normalize_event
+        event_id = operation.get('event_id') or result.get('event_id')
+        marker = operation['marker']
+        snapshot = self._verified_create_snapshot(operation, result, event_id)
+        if not snapshot or result.get('error') not in ('write_verification_mismatch', 'existing_event_changed', 'manual_edit_conflict'):
+            raise ValueError('The reviewed create lacks safe evidence of an exact owned Calendar event.')
+        owned = self.db.execute('SELECT calendar_id,marker,state FROM events WHERE id=?', (event_id,)).fetchone()
+        if owned and (owned['calendar_id'], owned['marker'], owned['state']) != (self.calendar_id, marker, 'active'):
+            raise ValueError('The reviewed Calendar event conflicts with existing local ownership.')
+
+        writable = ('summary', 'description', 'start', 'end', 'location', 'reminders')
+        observed = normalize_event(snapshot, self.config.calendar_owner)
+        body = {**{field: observed[field] for field in writable}, 'description': snapshot['description']}
+        stamp = operation.get('synchronization_started_at') or utcnow()
+        source = self.get_message(item['message_id'])
+        # Approval also changes how learned provenance is rendered. That metadata
+        # transition is not a user edit to the Calendar description.
+        before = event_body({**original, 'user_approved': item['user_approved']}, source, marker, stamp)
+        after = event_body(item, source, marker, stamp)
+        fields = {field for field in ('summary', 'description', 'start', 'end') if before[field] != after[field]}
+        # Keep corrections already approved if a later remote edit interrupts the update.
+        fields.update(operation.get('approved_fields', ()))
+        body.update({field: after[field] for field in fields})
+        start, end = body['start'], body['end']
+        date_field = 'date' if 'date' in start else 'dateTime'
+        if date_field not in start or date_field not in end or as_datetime(end[date_field]) <= as_datetime(start[date_field]):
+            raise ValueError('The reviewed Calendar interval requires an explicit start and end correction.')
+        history = history or {'event': operation['event'], 'result': result}
+        operation.update(action='update', event_id=event_id, expected_fingerprint=result['fingerprint'],
+                         event=body, reviewed_create=history, approved_fields=sorted(fields),
+                         prior_snapshot={'start': observed['start'], 'end': observed['end']})
+        self.db.execute("UPDATE operations SET payload=?,status='pending',last_error=NULL,updated_at=? WHERE id=?",
+                        (json.dumps(operation, ensure_ascii=False), utcnow(), row['id']))
+        item.update(kind='update', event_id=event_id)
+        return True
+
     def resolve_proposal(self, proposal_id, decision, patch=None):
         if decision not in ('approve','ignore','confirm_cancel'):
             raise ValueError('Decision must be approve, ignore, or confirm_cancel.')
@@ -704,7 +867,7 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             if json.loads(row['payload']).get('blocked_by_offer_group') and decision != 'ignore':
                 raise ValueError('This option belongs to an existing offer; reconcile the complete membership before approval.')
             deferred = json.loads(row['payload']).get('deferred_unknown_operation')
-            if deferred and decision != 'ignore' and self.db.execute("SELECT 1 FROM operations WHERE id=? AND status IN ('unknown','inflight')", (deferred,)).fetchone():
+            if deferred and decision != 'ignore' and self.write_needs_reconciliation(deferred):
                 raise ValueError('Reconcile the prior write before approving this change.')
             if json.loads(row['payload']).get('blocked_by_group_decision') and decision != 'ignore':
                 raise ValueError('A prior group decision blocks this ambiguous replacement.')
@@ -722,19 +885,16 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             active = self.db.execute("SELECT status FROM operations WHERE proposal_id=? AND status IN ('inflight','unknown','applied')", (str(proposal_id),)).fetchone()
             if active:
                 raise ValueError('Resolve the existing operation before changing this proposal.')
-            item = self._proposal(row)
+            original = self._proposal(row)
             if decision == 'ignore':
-                item['status'] = 'ignored'
+                item = dict(original, status='ignored')
                 item['user_rejected'] = True
                 self.db.execute("UPDATE operations SET status='review',last_error='User ignored proposal.',updated_at=? WHERE proposal_id=? AND status='pending'", (utcnow(), str(proposal_id)))
             else:
-                patch = patch or {}
-                if set(patch) - {'title','description','start','end','all_day'}:
+                patch = dict(patch or {})
+                if set(patch) - {'title','description','start','end','all_day','due_time'}:
                     raise ValueError('Unsupported proposal edit.')
-                item.update(patch)
-                if 'end' in patch:
-                    item['default_duration'] = False
-                item['user_edited'] = item.get('user_edited') is True or bool(patch)
+                item = apply_proposal_edit(original, patch)
                 if item['kind'] == 'cancel' and decision != 'confirm_cancel':
                     raise ValueError('Cancellation requires explicit confirm_cancel.')
                 if decision == 'confirm_cancel':
@@ -745,17 +905,21 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                     item['deletion_approved'] = True
                 item.update(confidence='high', needs_review=False, review_reason='', user_approved=True)
                 item = {**normalize_proposal(item), 'id': row['id'], 'message_id': row['message_id']}
-                if item['kind'] == 'update' and not self.db.execute('SELECT 1 FROM events WHERE id=? AND calendar_id=?', (item.get('event_id'), self.calendar_id)).fetchone():
-                    raise ValueError('Target event is not app-owned.')
-                self._rebase_reviewed_conflict(item)
-                # An edited, definitely-unwritten operation can be rebuilt from the new proposal.
-                self.db.execute("DELETE FROM operations WHERE proposal_id=? AND status IN ('pending','review')", (row['id'],))
+                edited_fields = patch.keys() | {'default_duration'} if 'end' in patch else patch.keys()
+                item['user_edited'] = item['user_edited'] or any(
+                    item.get(field) != original.get(field) for field in edited_fields)
+                if not self._approve_reviewed_create(original, item):
+                    if item['kind'] == 'update' and not self.db.execute('SELECT 1 FROM events WHERE id=? AND calendar_id=?', (item.get('event_id'), self.calendar_id)).fetchone():
+                        raise ValueError('Target event is not app-owned.')
+                    self._rebase_reviewed_conflict(item)
+                    # Definitely unwritten work can be rebuilt from the new proposal.
+                    self.db.execute("DELETE FROM operations WHERE proposal_id=? AND status IN ('pending','review')", (row['id'],))
             stamp = utcnow()
             pending_since = ((row['pending_since'] or row['created_at']) if row['status'] == 'pending' else stamp) if item['status'] == 'pending' else None
             self.db.execute('UPDATE proposals SET payload=?,status=?,updated_at=?,pending_since=? WHERE id=?',
                             (json.dumps(item, ensure_ascii=False), item['status'], stamp, pending_since, row['id']))
             from .data_admin import remember_decision
-            remember_decision(self, row, item, original=self._proposal(row))
+            remember_decision(self, row, item, original=original)
             self.remember_canonical_decision(row['id'])
             from .preferences import remember_proposal_choice
             remember_proposal_choice(self, row, item, decision)
@@ -784,6 +948,31 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
         self.db.execute("UPDATE proposals SET payload=?,status='review',updated_at=?,pending_since=NULL WHERE id=?", (json.dumps(item, ensure_ascii=False), utcnow(), item['id']))
         self.db.execute("UPDATE operations SET status='review',last_error=?,updated_at=? WHERE proposal_id=? AND status='pending'", (reason, utcnow(), item['id']))
 
+    def _can_relink_pending_approval(self, item):
+        return (item['status'] == 'pending' and item.get('kind') in ('create', 'update')
+                and item.get('user_approved') is True and not item.get('user_rejected')
+                and bool(item.get('agenda_plan_id')) and bool(item.get('agenda_sources'))
+                and not (item.get('alternative_group') or item.get('alternative_group_id'))
+                and not self.db.execute("SELECT 1 FROM operations WHERE proposal_id=? AND (attempts>0 OR result IS NOT NULL)",
+                                        (item['id'],)).fetchone())
+
+    def changed_approved_message_refs(self, item):
+        if not self._can_relink_pending_approval(item):
+            return set()
+        changed = set()
+        for ref in item['agenda_sources']:
+            source = self.get_source(ref['source_id'])
+            if source and source['kind'] == 'message' and source['content_hash'] != ref['source_hash']:
+                changed.add((source['id'], source['content_hash']))
+        return changed
+
+    def _defer_changed_message_write(self, item):
+        if not self.changed_approved_message_refs(item):
+            return False
+        self.db.execute("UPDATE operations SET status='review',last_error=?,updated_at=? WHERE proposal_id=? AND status='pending'",
+                        (MESSAGE_RELINK_REQUIRED, utcnow(), item['id']))
+        return True
+
     def queue_operations(self, current=None):
         queued = []
         for listed in self.list_proposals('pending', 500):
@@ -797,7 +986,7 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                 if not row:
                     continue
                 item = self._proposal(row)
-                if self.source_mode_blocked(item) or self.source_write_deferred(item):
+                if self.source_mode_blocked(item) or self.source_write_deferred(item) or self._defer_changed_message_write(item):
                     continue
                 group_reason = self._source_write_reason(item) or self._group_write_reason(item['id'])
                 if group_reason:
@@ -860,6 +1049,12 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                              'synchronization_started_at': synchronization_started_at}
                 if item['kind'] == 'cancel':
                     operation.update(prior_snapshot=event['snapshot'], prior_fingerprint=event['fingerprint'], prior_marker=event['marker'])
+                if (existing and existing['status'] == 'review' and existing['last_error'] == MESSAGE_RELINK_REQUIRED
+                        and self._can_relink_pending_approval(item)):
+                    self.db.execute("UPDATE operations SET payload=?,status='pending',last_error=NULL,updated_at=? WHERE id=?",
+                                    (json.dumps(operation, ensure_ascii=False), utcnow(), existing['id']))
+                    queued.append(operation)
+                    continue
                 if existing and json.loads(existing['payload']) != operation:
                     if existing['status'] == 'pending' and existing['attempts'] == 0 and existing['result'] is None:
                         self.db.execute('UPDATE operations SET payload=?,updated_at=? WHERE id=?', (json.dumps(operation, ensure_ascii=False), utcnow(), existing['id']))
@@ -890,6 +1085,10 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
         with self.lock:
             return [json.loads(row[0]) for row in self.db.execute("SELECT o.payload FROM operations o JOIN proposals p ON p.id=o.proposal_id WHERE o.status='pending' AND p.status='pending' ORDER BY o.created_at,o.id LIMIT ?", (limit,))]
 
+    def write_needs_reconciliation(self, operation_id):
+        return self.db.execute(f"SELECT 1 FROM operations o WHERE id=? AND (o.status IN ('unknown','inflight') OR {REVIEWED_CREATE_WITH_TARGET})",
+                               (operation_id,)).fetchone() is not None
+
     def recover_interrupted(self):
         # Only call under the single worker lock, never from the web process.
         with self.lock, self.db:
@@ -911,7 +1110,7 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             if not proposal_row:
                 return False
             item = self._proposal(proposal_row)
-            if self.source_mode_blocked(item) or self.source_write_deferred(item):
+            if self.source_mode_blocked(item) or self.source_write_deferred(item) or self._defer_changed_message_write(item):
                 return False
             group_reason = self._source_write_reason(item) or self._group_write_reason(item['id'])
             if group_reason:
@@ -962,6 +1161,20 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                             (json.dumps(operation, ensure_ascii=False), utcnow(), operation_id))
             return operation
 
+    def _register_reviewed_create_target(self, operation, result):
+        """Keep the exact owned ID and the attempted baseline during review."""
+        from .codex_runtime import event_fingerprint
+        event_id = operation['event_id']
+        if (result.get('error') not in ('write_verification_mismatch', 'existing_event_changed')
+                or not self._verified_create_snapshot(operation, result, event_id)):
+            return False
+        baseline = dict(operation['event'], id=event_id)
+        inserted = self.db.execute("""INSERT INTO events(id,calendar_id,message_id,proposal_id,snapshot,fingerprint,marker,updated_at,state)
+            VALUES (?,?,?,?,?,?,?,?,'active') ON CONFLICT(id) DO NOTHING""",
+            (event_id, self.calendar_id, operation['message_id'], operation['proposal_id'], json.dumps(baseline, ensure_ascii=False),
+             event_fingerprint(baseline, self.config.calendar_owner), operation['marker'], utcnow()))
+        return bool(inserted.rowcount)
+
     def record_result(self, operation_id, result, *, agenda_calendar=None, current=None):
         if not isinstance(result, dict) or result.get('status') not in ('applied','review','unknown','failed'):
             result = {'status': 'unknown', 'error': 'Invalid execution result; possible external write.'}
@@ -991,8 +1204,14 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                 if has_external_attendees(snapshot, self.config.calendar_owner) or not contains_marker(snapshot.get('description'), owned_marker):
                     result = {'status': 'review', 'error': 'Returned event has attendees or lacks application ownership.'}
                     status = 'review'
+            if operation['action'] == 'create' and status in ('unknown', 'review') and result.get('event_id'):
+                # Definite identity survives a failed verification read and later approval.
+                operation['event_id'] = operation.get('event_id') or result['event_id']
+                operation.setdefault('reviewed_create', {'event': operation['event'], 'result': result})
+                if status == 'review' and self._register_reviewed_create_target(operation, result) and agenda_calendar is not None:
+                    agenda_calendar[operation['event_id']] = result['snapshot']
             state = 'pending' if status == 'failed' else status
-            self.db.execute('UPDATE operations SET status=?,result=?,last_error=?,updated_at=? WHERE id=?', (state, json.dumps(result, ensure_ascii=False), str(result.get('error') or '')[:500], utcnow(), operation_id))
+            self.db.execute('UPDATE operations SET payload=?,status=?,result=?,last_error=?,updated_at=? WHERE id=?', (json.dumps(operation, ensure_ascii=False), state, json.dumps(result, ensure_ascii=False), str(result.get('error') or '')[:500], utcnow(), operation_id))
             if status == 'applied':
                 snapshot = result['snapshot']
                 self.db.execute('INSERT INTO events(id,calendar_id,message_id,proposal_id,snapshot,fingerprint,marker,updated_at,state) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET proposal_id=excluded.proposal_id,snapshot=excluded.snapshot,fingerprint=excluded.fingerprint,marker=excluded.marker,updated_at=excluded.updated_at,state=excluded.state',

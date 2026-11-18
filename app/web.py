@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 from dataclasses import replace
 from urllib.parse import urlsplit
 from .config import AppConfig, ConfigurationError, load_config
+from .core import deadline_datetime, without_deadline_title_label
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -17,6 +18,7 @@ from fastapi.templating import Jinja2Templates
 
 ROOT = Path(__file__).parent
 WARSAW = ZoneInfo('Europe/Warsaw')
+REVIEW_PAGE_SIZE = 100
 SOURCE_KINDS = {'message': 'Wiadomości', 'announcement': 'Ogłoszenia',
                 'school_event': 'Terminarz', 'substitution': 'Zastępstwa'}
 SOURCE_OUTCOMES = {'added': 'Dodano', 'linked': 'Powiązano', 'enriched': 'Uzupełniono',
@@ -107,6 +109,14 @@ def human_date(value):
         return str(value)
 
 
+def deadline_form_time(value):
+    try:
+        hour = deadline_datetime(value).time()
+        return hour.isoformat(timespec='auto' if hour.second or hour.microsecond else 'minutes')
+    except ValueError:
+        return ''
+
+
 def event_date(snapshot):
     boundary = snapshot.get('start') or snapshot.get('start_time') or snapshot.get('start_date')
     if isinstance(boundary, dict):
@@ -164,6 +174,8 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
     application = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     templates = Jinja2Templates(directory=str(ROOT / 'templates'))
     templates.env.filters['human_date'] = human_date
+    templates.env.filters['deadline_form_time'] = deadline_form_time
+    templates.env.filters['deadline_base_title'] = without_deadline_title_label
     templates.env.filters['event_date'] = event_date
     templates.env.filters['calendar_probe_status'] = calendar_probe_status
     templates.env.filters['source_outcome'] = source_outcome
@@ -197,13 +209,20 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
 
     application.mount('/static', StaticFiles(directory=str(ROOT / 'static')), name='static')
 
-    def page(request, section='messages', selected=None, notice=None, extra=None):
+    def page(request, section='messages', selected=None, notice=None, extra=None, review_offset=0):
         csrf = request.cookies.get(cookie_name) or secrets.token_urlsafe(32)
         next_sync = (clock().astimezone(WARSAW).replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)).isoformat()
         events = store.list_events()
         groups = store.list_proposal_groups(current=clock())
-        grouped_ids = {member['id'] for group in groups for member in group['members']}
-        proposals = [item for item in store.list_proposals() if item['id'] not in grouped_ids]
+        review_more = False
+        if section == 'review':
+            proposals = store.list_proposals(status='review', limit=REVIEW_PAGE_SIZE + 1,
+                                             offset=review_offset, exclude_grouped=True)
+            review_more = len(proposals) > REVIEW_PAGE_SIZE
+            proposals = proposals[:REVIEW_PAGE_SIZE]
+        else:
+            grouped_ids = {member['id'] for group in groups for member in group['members']}
+            proposals = [item for item in store.list_proposals() if item['id'] not in grouped_ids]
         selected_reviews = [{**member, 'selected_for_offer': True} for group in groups
                             for member in group['members'] if group['status'] == 'selected'
                             and member['id'] == group['selected_proposal_id'] and member['status'] == 'review']
@@ -241,7 +260,8 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
                    'status': status, 'review_count': review_count, 'messages': store.list_messages(),
                    'events': events, 'proposals': proposals, 'proposal_groups': open_groups,
                    'selected_groups': selected_groups,
-                   'has_review': bool(open_groups) or any(p['status'] == 'review' for p in proposals),
+                   'review_previous': max(0, review_offset - REVIEW_PAGE_SIZE) if review_offset else None,
+                   'review_next': review_offset + REVIEW_PAGE_SIZE if review_more else None,
                    'selected': selected, 'notice': notice or request.query_params.get('notice'),
                    'demo_mode': demo_mode, 'demo_banner': 'Demo — dane fikcyjne / fictional data',
                    'calendar_label': 'calendar@example.test' if demo_mode else (config.calendar_id or 'Nie skonfigurowano'),
@@ -271,8 +291,8 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
         return page(request, section='events')
 
     @application.get('/review', response_class=HTMLResponse)
-    def review(request: Request):
-        return page(request, section='review')
+    def review(request: Request, offset: int = Query(0, ge=0, le=2**63 - 1)):
+        return page(request, section='review', review_offset=offset)
 
     def source_kind(kind):
         if kind == 'school_calendar':
@@ -426,19 +446,20 @@ def create_app(store=None, sync_request=None, *, config=None, owner=None, hosts=
         action = str(form.get('action', ''))
         if action not in {'approve', 'reject', 'confirm_cancel'}:
             raise HTTPException(400, 'Nieprawidłowa operacja.')
-        changes = {key: str(form[key]).strip() for key in ('title', 'start', 'end')
+        changes = {key: str(form[key]).strip() for key in ('title', 'start')
                    if key in form and str(form[key]).strip()}
+        if 'end' in form:
+            changes['end'] = str(form['end']).strip() or None
+        if 'due_time' in form:
+            changes['due_time'] = str(form['due_time']).strip()
         if 'edit_dates' in form:
             changes['all_day'] = form.get('all_day') == 'true'
         try:
-            proposal = next((item for item in store.list_proposals() if str(item['id']) == proposal_id), None)
-            if proposal is None:
-                group = store.get_proposal_group_for_proposal(proposal_id, current=clock())
-                proposal = next((member for member in group['members'] if str(member['id']) == proposal_id), None) if group else None
+            proposal = store.get_proposal(proposal_id)
             if not proposal or (proposal.get('kind') == 'cancel' and action == 'approve'):
                 raise ValueError('Cancellation requires explicit confirmation')
             store.resolve_proposal(proposal_id, 'ignore' if action == 'reject' else action, changes)
-        except (ValueError, KeyError) as error:
+        except (ValueError, KeyError, OverflowError):
             raise HTTPException(400, 'Nie można zapisać tej decyzji. Sprawdź daty i stan propozycji.') from None
         return RedirectResponse('/review?notice=resolved', status_code=303)
 

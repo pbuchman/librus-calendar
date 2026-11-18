@@ -2,6 +2,7 @@
 from pathlib import Path
 import json
 import os
+import py_compile
 import shutil
 import shlex
 import subprocess
@@ -22,31 +23,39 @@ class DeploymentTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
         self.release = deploy.release_path(self.home, SHA)
-        self.release.mkdir(parents=True)
-        shutil.copytree(ROOT / 'deploy', self.release / 'deploy')
+        deploy.private_mkdir(self.release)
+        self.copy_deploy(self.release)
         self.units = self.home / '.config/systemd/user'
         self.config = self.home / '.config/librus-calendar'
+
+    def copy_deploy(self, release):
+        target = release / 'deploy'
+        shutil.copytree(ROOT / 'deploy', target, ignore=shutil.ignore_patterns('__pycache__', '*.pyc'))
+        target.chmod(0o700)
+        for path in target.rglob('*'):
+            if path.is_dir():
+                path.chmod(0o700)
 
     def packaged_release(self, sha, resources, *, declared=False):
         """Install a fictional wheel into a real isolated interpreter, without pip/network."""
         release = deploy.release_path(self.home, sha)
-        release.mkdir(parents=True, exist_ok=True)
+        deploy.private_mkdir(release)
         if not (release / 'deploy').exists():
-            shutil.copytree(ROOT / 'deploy', release / 'deploy')
+            self.copy_deploy(release)
         subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(release / '.venv')],
-                       check=True, capture_output=True)
+                       check=True, capture_output=True, umask=0o077)
         app = next((release / '.venv/lib').glob('python*/site-packages')) / 'app'
-        app.mkdir()
+        deploy.private_mkdir(app)
         for name in ('__init__.py', 'web.py', 'codex_runtime.py', 'monitoring.py'):
             (app / name).write_text('import sys; assert sys.flags.isolated == 1\n')
         if 'schemas/agenda_plan.json' in resources:
             (app / 'agenda.py').write_text('import sys; assert sys.flags.isolated == 1\n')
         for name in resources:
             path = app / name
-            path.parent.mkdir(exist_ok=True)
+            deploy.private_mkdir(path.parent)
             path.write_text('fictional packaged resource\n')
         wheel = release / 'artifacts/librus_calendar-0.0.0-py3-none-any.whl'
-        wheel.parent.mkdir()
+        deploy.private_mkdir(wheel.parent)
         with zipfile.ZipFile(wheel, 'w') as archive:
             for path in app.rglob('*'):
                 if path.is_file():
@@ -60,6 +69,27 @@ class DeploymentTests(unittest.TestCase):
             manifest['resources'] = sorted(resources)
         (release / 'release.json').write_text(json.dumps(manifest))
         return release, app, manifest
+
+    def test_packaged_fixture_ignores_bytecode_under_group_writable_umask(self):
+        checkout = self.home / 'checkout'
+        shutil.copytree(ROOT / 'deploy', checkout / 'deploy')
+        collector = checkout / 'deploy/netdata/librus.chart.py'
+        previous = os.umask(0o002)
+        try:
+            cache = collector.parent / '__pycache__'
+            cache.mkdir(exist_ok=True)
+            cache.chmod(0o775)
+            py_compile.compile(str(collector), doraise=True)
+            with patch(f'{__name__}.ROOT', checkout):
+                release, _, manifest = self.packaged_release('b' * 40, deploy.RESOURCES, declared=True)
+            self.assertTrue(list(cache.glob('*.pyc')))
+            self.assertFalse(list((release / 'deploy').rglob('__pycache__')))
+            self.assertTrue(all('__pycache__' not in name for name in manifest['artifacts']))
+            self.assertEqual(deploy.validate_release(self.home, release.name), release)
+            self.assertTrue(all(path.stat().st_mode & 0o777 == 0o700
+                                for path in (release, *release.rglob('*')) if path.is_dir()))
+        finally:
+            os.umask(previous)
 
     def test_upgrade_validates_real_legacy_current_package_against_its_own_resources(self):
         previous, old_app, old_manifest = self.packaged_release('b' * 40, deploy.RESOURCES[:6])
@@ -187,7 +217,7 @@ class DeploymentTests(unittest.TestCase):
                              if mutation == 'second-wheel'
                              else '.venv/lib/python0.1/site-packages/app/__init__.py')
                     target = release / extra
-                    target.parent.mkdir(parents=True, exist_ok=True)
+                    deploy.private_mkdir(target.parent)
                     shutil.copyfile(wheel if mutation == 'second-wheel' else release / app_name, target)
                     invalid['artifacts'][extra] = deploy.digest(target)
                 invalid['artifacts'][wheel_name] = deploy.digest(wheel)
@@ -199,7 +229,7 @@ class DeploymentTests(unittest.TestCase):
                 wheel.write_bytes(original)
 
     def test_repeat_unit_install_preserves_secrets_and_never_starts_or_backs_up(self):
-        self.config.mkdir(parents=True, mode=0o700)
+        deploy.private_mkdir(self.config)
         private = self.config / 'web.env'
         private.write_text('SYNTHETIC=retained-value\n')
         private.chmod(0o600)
@@ -246,12 +276,12 @@ class DeploymentTests(unittest.TestCase):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as temp:
                 home = Path(temp)
                 units = home / '.config/systemd/user'
-                units.mkdir(parents=True)
+                deploy.private_mkdir(units)
                 if kind == 'unit':
                     (units / 'librus-monitor.timer').write_text('Unrelated admin unit')
                 elif kind == 'config':
                     config = home / '.config/librus-calendar'
-                    config.mkdir()
+                    deploy.private_mkdir(config)
                     (config / 'credentials.json').symlink_to(home / 'missing')
                 else:
                     shutil.rmtree(units)
@@ -261,7 +291,7 @@ class DeploymentTests(unittest.TestCase):
                 self.assertFalse((units / 'librus-web.service').exists())
 
     def test_legacy_replacement_requires_explicit_activation_and_exact_known_units(self):
-        self.units.mkdir(parents=True)
+        deploy.private_mkdir(self.units)
         for name in deploy.UNITS + deploy.BACKUP_UNITS:
             text = (self.release / 'deploy/legacy' / name).read_text().replace('%h/librus-calendar', '%h/librus-poc')
             (self.units / name).write_text(text)
@@ -321,7 +351,7 @@ class DeploymentTests(unittest.TestCase):
                                     'librus-web.service', 'librus-monitor.timer'])
 
     def test_failed_preflight_never_stops_live_services(self):
-        self.units.mkdir(parents=True)
+        deploy.private_mkdir(self.units)
         (self.units / 'librus-web.service').write_text('unrelated')
         with patch.object(deploy, 'validate_release', return_value=self.release), \
              patch.object(deploy, 'package_probe'), \
@@ -332,7 +362,7 @@ class DeploymentTests(unittest.TestCase):
 
     def test_dropin_override_refused_before_service_commands(self):
         dropins = self.units / 'librus-web.service.d'
-        dropins.mkdir(parents=True)
+        deploy.private_mkdir(dropins)
         (dropins / 'override.conf').write_text('[Service]\nExecStart=/bin/false\n')
         with patch.object(deploy, 'validate_release', return_value=self.release), \
              patch.object(deploy, 'package_probe'), \
@@ -350,7 +380,7 @@ class DeploymentTests(unittest.TestCase):
                 deploy.preflight_effective_units(self.home)
 
     def test_monitor_must_follow_configured_private_state_and_policy(self):
-        self.config.mkdir(parents=True, mode=0o700)
+        deploy.private_mkdir(self.config)
         config = json.loads((ROOT / 'deploy/config.json.example').read_text())
         config['state_path'] = str(self.home / 'new-state.sqlite3')
         path = self.config / 'config.json'
@@ -429,7 +459,7 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(probe.returncode, 0, probe.stderr)
         wheel = next(wheels.glob('*.whl'))
         artifact = self.release / 'artifacts' / wheel.name
-        artifact.parent.mkdir()
+        deploy.private_mkdir(artifact.parent)
         shutil.copyfile(wheel, artifact)
         artifacts = {path.relative_to(self.release).as_posix(): deploy.digest(path)
                      for path in (target / 'app').rglob('*')
