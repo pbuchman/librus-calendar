@@ -488,9 +488,10 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                     raise ValueError('Calendar probe attempt must start durably.')
                 if metadata['attempt_number'] == 2:
                     first = self.db.execute('SELECT * FROM calendar_probe_attempts WHERE sync_run_id=? AND attempt_number=1', (run_id,)).fetchone()
-                    if (not first or first['result'] != 'failed' or first['safe_code'] != 'unexpected_tool_count'
-                            or first['expected_tool_name'] != 1 or first['expected_tool_arguments'] != 1
-                            or any(first[key] != 0 for key in ('parse_error_count', 'unknown_event_count', 'incomplete_count'))):
+                    clean_count_failure = (first and first['safe_code'] == 'unexpected_tool_count'
+                        and first['expected_tool_name'] == 1 and first['expected_tool_arguments'] == 1
+                        and all(first[key] == 0 for key in ('parse_error_count', 'unknown_event_count', 'incomplete_count')))
+                    if not first or first['result'] != 'failed' or not (first['safe_code'] == 'codex_timeout' or clean_count_failure):
                         raise ValueError('Calendar probe retry evidence is missing.')
                 self.db.execute('INSERT INTO calendar_probe_attempts(sync_run_id,' + ','.join(PROBE_FIELDS) + ') VALUES (' + ','.join('?' for _ in range(len(PROBE_FIELDS) + 1)) + ')',
                     (run_id,) + tuple(metadata[key] for key in PROBE_FIELDS))

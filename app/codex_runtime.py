@@ -6,6 +6,7 @@ state comes from emitted MCP results, never from a model's claim that it succeed
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager, nullcontext
 import hashlib
 import json
 import os
@@ -32,6 +33,8 @@ MODEL = TOOL_MODEL
 EFFORT = TOOL_EFFORT
 SCHEMAS = Path(__file__).with_name("schemas")
 ZONE = ZoneInfo("Europe/Warsaw")
+RETRY_DELAY = 5
+TOOL_ACTIVITY = frozenset({'mcp_tool_call', 'command_execution', 'file_change', 'web_search', 'image_generation'})
 
 
 class RuntimeFailure(RuntimeError):
@@ -150,6 +153,7 @@ def _result(status, *, event=None, event_id=None, error=None, owner_email=""):
 
 class CodexRuntime:
     READ_TOOLS = frozenset({'list_calendars', 'search_events', 'list_events', 'read_event', 'batch_read_event', 'fetch'})
+    WRITE_TOOLS = frozenset({'create_event', 'update_event', 'delete_event'})
 
     def __init__(self, config=None, *, run_process=None, read_only=False):
         self.read_only = bool(read_only)
@@ -185,13 +189,15 @@ class CodexRuntime:
         self._version = None
         self._injected_runner = run_process is not None
         self._active_tool_request = None
+        self._tool_response_validator = None
         self.reset_batch_retry_budget()
 
     def reset_batch_retry_budget(self, *, deadline=None):
-        """One additional batch read per sync; standalone callers reset explicitly."""
+        """Reset invocation counters, the clean batch retry budget and the sync deadline."""
         self._batch_retry_used = False
         self._batch_index = 0
-        self._batch_retry_deadline = deadline
+        self._logical_call_index = 0
+        self._run_deadline = deadline
 
     def _args(self, directory, schema, tools):
         if self.read_only and set(tools) - self.READ_TOOLS:
@@ -223,7 +229,7 @@ class CodexRuntime:
         if tools:
             overrides[f"apps.{self.config.calendar_connector}.enabled"] = True
             overrides[f"apps.{self.config.calendar_connector}.default_tools_enabled"] = False
-            writing = bool(set(tools) & {'create_event', 'update_event', 'delete_event'})
+            writing = bool(self.WRITE_TOOLS.intersection(tools))
             overrides[f"apps.{self.config.calendar_connector}.destructive_enabled"] = writing
             overrides[f"apps.{self.config.calendar_connector}.open_world_enabled"] = writing
             overrides[f"apps.{self.config.calendar_connector}.default_tools_approval_mode"] = "approve"
@@ -249,7 +255,7 @@ class CodexRuntime:
             process = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                        env=env, start_new_session=True)
             observation.optional('process_started', process.pid)
-            stdout, stderr = self._pump_process(process, prompt, timeout, observation)
+            stdout, stderr = self._pump_process(process, prompt, self._process_timeout(timeout), observation)
         except BaseException as error:
             if process is None:
                 observation.optional('finish', None, 'unknown')
@@ -277,16 +283,16 @@ class CodexRuntime:
                 else 'sync_interruption' if not isinstance(error, Exception) else 'unknown')
             observation.optional('finish', process.returncode, cause)
             self.last_invocation_metadata['process_observation'] = observation.summary()
-            self._capture_interrupted_output(stdout.decode('utf-8', errors='replace'),
+            possible_write = self._capture_interrupted_output(stdout.decode('utf-8', errors='replace'),
                 stderr.decode('utf-8', errors='replace'), process.returncode)
             if isinstance(error, subprocess.TimeoutExpired):
-                raise RuntimeFailure("codex_timeout") from None
+                code = self.last_invocation_metadata.get('definitive_turn_failure') or 'codex_timeout'
+                raise RuntimeFailure(code, possible_write=possible_write) from None
             if isinstance(error, (OSError, subprocess.SubprocessError)):
                 # A child already started may have dispatched its Calendar
                 # write. Preserve that uncertainty; spawn failures above still
                 # take the unavailable-before-dispatch path.
-                raise RuntimeFailure('codex_unavailable', possible_write=bool(
-                    self._active_tool_request and self._active_tool_request[2])) from None
+                raise RuntimeFailure('codex_unavailable', possible_write=possible_write) from None
             raise
         finally:
             if process is not None:
@@ -363,15 +369,17 @@ class CodexRuntime:
         """Keep bounded technical evidence already emitted before termination."""
         if type(returncode) is int:
             self.last_invocation_metadata['process_code'] = returncode
-        if (self._active_tool_request is None or not isinstance(stdout, str) or not isinstance(stderr, str)
-                or type(returncode) is not int):
-            return
-        expected_tool, expected_args, write = self._active_tool_request
+        expected_tool, expected_args, write = self._active_tool_request or (None, None, False)
+        if not isinstance(stdout, str) or not isinstance(stderr, str) or type(returncode) is not int:
+            return write
         try:
             self._tool_records(stdout, stderr, returncode, expected_tool, expected_args, write)
+        except RuntimeFailure as error:
+            return write or error.possible_write
         except Exception:
             # The original timeout/interruption always wins over partial protocol.
             pass
+        return write
 
     def _tool_records(self, stdout, stderr, returncode, expected_tool, expected_args, write):
         """Fail closed on protocol ambiguity; retain only technical evidence counts."""
@@ -393,7 +401,7 @@ class CodexRuntime:
                 continue
             try:
                 record = json.loads(line)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, RecursionError):
                 metadata['parse_error_count'] += 1
                 protocol_invalid = True
                 continue
@@ -407,7 +415,10 @@ class CodexRuntime:
                 continue
             if kind in {'turn.failed', 'error'}:
                 protocol_failure = True
-                error_hints.append(str(record.get('message') or record.get('error') or ''))
+                hint = str(record.get('message') or record.get('error') or '')
+                error_hints.append(hint)
+                if kind == 'turn.failed' and not metadata.get('definitive_turn_failure'):
+                    metadata['definitive_turn_failure'] = _process_failure_code('', [hint])
                 continue
             if kind not in {'item.started', 'item.updated', 'item.completed'}:
                 metadata['unknown_event_count'] += 1
@@ -418,6 +429,8 @@ class CodexRuntime:
                 metadata['parse_error_count'] += 1
                 protocol_invalid = True
                 continue
+            if expected_tool is None and item['type'] in TOOL_ACTIVITY:
+                metadata['unexpected_tool_activity'] = True
             if item['type'] in {'reasoning', 'agent_message'}:
                 if item['type'] == 'agent_message' and kind == 'item.completed':
                     previous = metadata['final_answer_classification']
@@ -432,16 +445,19 @@ class CodexRuntime:
                 metadata['unknown_event_count'] += 1
                 protocol_invalid = True
                 continue
-            if (not isinstance(item.get('tool'), str) or not isinstance(item.get('arguments'), dict)
+            tool = item.get('tool')
+            if isinstance(tool, str):
+                namespace, _, name = tool.partition('.')
+                observed_write |= namespace == 'google_calendar' and name in self.WRITE_TOOLS
+            if (not isinstance(tool, str) or not isinstance(item.get('arguments'), dict)
                     or item.get('status') not in (None, 'in_progress', 'running', 'pending', 'completed', 'failed', 'cancelled')):
                 metadata['parse_error_count'] += 1
                 protocol_invalid = True
                 continue
-            name_ok = item.get('tool') == 'google_calendar.' + expected_tool
+            name_ok = expected_tool is not None and tool == 'google_calendar.' + expected_tool
             args_ok = isinstance(item.get('arguments'), dict) and item['arguments'] == expected_args
             metadata['expected_tool_name'] &= name_ok
             metadata['expected_tool_arguments'] &= args_ok
-            observed_write |= item.get('tool') in {'google_calendar.create_event', 'google_calendar.update_event', 'google_calendar.delete_event'}
             if item.get('error') is not None and not isinstance(item['error'], (dict, str)):
                 metadata['parse_error_count'] += 1
                 protocol_invalid = True
@@ -583,28 +599,62 @@ class CodexRuntime:
                 'parse_error_count', 'unknown_event_count', 'incomplete_count'))
             and evidence.get('expected_tool_name') is True and evidence.get('expected_tool_arguments') is True)
 
-    def _wait_batch_retry(self):
+    def _remaining_time(self):
+        return self._run_deadline - time.monotonic() if self._run_deadline is not None else None
+
+    def _process_timeout(self, limit):
         from .sync import SyncInterrupted
-        remaining = (self._batch_retry_deadline - time.monotonic()
-                     if self._batch_retry_deadline is not None else None)
+        remaining = self._remaining_time()
         if remaining is not None and remaining <= 0:
             raise SyncInterrupted('sync_timeout')
-        time.sleep(min(5, remaining) if remaining is not None else 5)
-        if self._batch_retry_deadline is not None and time.monotonic() >= self._batch_retry_deadline:
-            raise SyncInterrupted('sync_timeout')
+        return min(limit, remaining) if remaining is not None else limit
 
-    def _invoke(self, prompt, schema, tools=(), expected_tool=None, expected_args=None, *, validate=None):
+    def _wait_to_retry(self):
+        from .sync import SyncInterrupted
+        remaining = self._remaining_time()
+        if remaining is not None and remaining <= RETRY_DELAY:
+            if remaining > 0:
+                time.sleep(remaining)
+            raise SyncInterrupted('sync_timeout')
+        time.sleep(RETRY_DELAY)
+        self._process_timeout(RETRY_DELAY)
+
+    def _retry_reason(self, error, *, safe, probe, batch):
+        if not isinstance(error, Exception):
+            return 'interrupted'
+        if isinstance(error, RuntimeFailure):
+            if error.possible_write:
+                return 'possible_write'
+            if safe and error.code == 'codex_timeout' and not self.last_invocation_metadata.get('unexpected_tool_activity'):
+                return 'app_timeout'
+            if probe and error.code == 'unexpected_tool_count' and error.retryable_probe:
+                return 'probe_tool_count'
+            if batch and self._batch_retry_eligible(error):
+                return 'clean_batch_zero_calls'
+        return 'other_failure'
+
+    def _invoke(self, prompt, schema, tools=(), expected_tool=None, expected_args=None, *, validate=None, probe=False):
         batch = expected_tool == 'batch_read_event'
         if batch:
             self._batch_index += 1
+        self._logical_call_index += 1
+        if tools:
+            operation = expected_tool if expected_tool in self.READ_TOOLS | self.WRITE_TOOLS else 'other_tool'
+            safe = self.READ_TOOLS.issuperset(tools)
+        else:
+            operation = 'agenda_plan' if schema == 'agenda_plan.json' else 'tool_free'
+            safe = operation == 'agenda_plan'
         for attempt in (1, 2):
             started = time.monotonic()
+            started_at = datetime.now(timezone.utc)
             requested = len(expected_args['event_ids']) if batch else 1
             metadata = dict(state='running', requested_count=requested, received_count=0,
-                            duration_seconds=0.0, process_code=None, started_count=0, completed_count=0)
+                            duration_seconds=0.0, process_code=None, started_count=0, completed_count=0,
+                            logical_call_index=self._logical_call_index, operation_kind=operation,
+                            attempt_number=attempt, retry_decision='pending', retry_reason='none', recovered=False,
+                            attempt_started_at=started_at.isoformat())
             if batch:
-                metadata.update(batch_index=self._batch_index, attempt_number=attempt,
-                                retry_decision='pending', recovered=False)
+                metadata['batch_index'] = self._batch_index
             self.last_invocation_metadata = {}
             if self.invocation_sink:
                 self.invocation_sink(dict(metadata))
@@ -615,15 +665,15 @@ class CodexRuntime:
                                               process_observation=summary))
             self._observation_progress = progress
             self._process_observation = None
-            state, retry = 'failed', False
+            state = 'failed'
             try:
-                result = self._invoke_once(prompt, schema, tools, expected_tool, expected_args)
-                if validate is not None:
-                    validate(result)
+                with self._probe_attempt(attempt) if probe else nullcontext():
+                    result = self._invoke_once(prompt, schema, tools, expected_tool, expected_args)
+                    if validate is not None:
+                        validate(result)
                 metadata['received_count'] = (len(result.get('responses', []))
                     if batch and isinstance(result, dict) and isinstance(result.get('responses'), list) else 1)
-                if batch:
-                    metadata.update(retry_decision='not_needed', recovered=attempt == 2 and validate is not None)
+                metadata.update(retry_decision='not_needed', recovered=attempt == 2 and (not batch or validate is not None))
                 state = 'completed'
                 return result
             except BaseException as error:
@@ -631,14 +681,20 @@ class CodexRuntime:
                 metadata.update(failure_diagnostic(error))
                 if not isinstance(error, Exception):
                     state = 'interrupted'
-                if batch:
-                    eligible = self._batch_retry_eligible(error)
-                    retry = eligible and not self._batch_retry_used
-                    metadata['retry_decision'] = 'retry' if retry else 'exhausted' if eligible else 'not_eligible'
-                    if retry:
-                        self._batch_retry_used = True
+                reason = self._retry_reason(error, safe=safe, probe=probe, batch=batch)
+                metadata['retry_reason'] = reason
+                eligible = reason in {'app_timeout', 'probe_tool_count', 'clean_batch_zero_calls'}
+                retry = eligible and attempt == 1 and (reason != 'clean_batch_zero_calls' or not self._batch_retry_used)
+                metadata['retry_decision'] = 'exhausted' if eligible else 'not_eligible'
                 if not retry:
                     raise
+                remaining = self._remaining_time()
+                if remaining is not None and remaining <= RETRY_DELAY:
+                    metadata['retry_decision'] = 'deadline_exhausted'
+                else:
+                    metadata['retry_decision'] = 'retry'
+                    if reason == 'clean_batch_zero_calls':
+                        self._batch_retry_used = True
             finally:
                 self._observation_progress = None
                 if self._process_observation is not None:
@@ -648,6 +704,7 @@ class CodexRuntime:
                 if 'process_observation' in evidence:
                     metadata['process_observation'] = evidence['process_observation']
                 metadata.update(state=state, duration_seconds=min(time.monotonic()-started, 7*86400),
+                    attempt_finished_at=max(datetime.now(timezone.utc), started_at).isoformat(),
                     process_code=evidence.get('process_code'), started_count=evidence.get('started_count', 0),
                     completed_count=evidence.get('completed_count', 0))
                 if tools:
@@ -664,25 +721,29 @@ class CodexRuntime:
                             self.last_invocation_metadata['process_observation'] = self._process_observation.summary()
                         raise
             # A failed durable completion raises above and cannot reach this wait.
-            self._wait_batch_retry()
+            self._wait_to_retry()
 
     def _invoke_once(self, prompt, schema, tools=(), expected_tool=None, expected_args=None):
         with tempfile.TemporaryDirectory(prefix="librus-codex-") as directory:
             os.chmod(directory, 0o700)
             args = self._args(directory, schema, tools)
-            write = bool(set(tools) & {"create_event", "update_event", "delete_event"})
+            write = bool(self.WRITE_TOOLS.intersection(tools))
             self._invocation_model, self._invocation_effort = ((self.config.tool_model, self.config.tool_effort) if tools
                 else (self.config.analysis_model, self.config.analysis_effort))
             self._active_tool_request = (expected_tool, expected_args, write) if tools else None
             try:
-                returncode, stdout, stderr = self.run_process(args, prompt, self.timeout)
+                returncode, stdout, stderr = self.run_process(args, prompt, self._process_timeout(self.timeout))
             except RuntimeFailure as exc:
-                raise RuntimeFailure(exc.code, possible_write=write)
+                self._process_timeout(self.timeout)
+                if write and not exc.possible_write:
+                    raise RuntimeFailure(exc.code, possible_write=True) from None
+                raise
             except (OSError, subprocess.SubprocessError):
                 raise RuntimeFailure("codex_unavailable", possible_write=False)
             finally:
                 self._active_tool_request = None
             self.last_invocation_metadata['process_code'] = returncode
+            self._process_timeout(self.timeout)
             calls = self._tool_records(stdout, stderr, returncode, expected_tool, expected_args, write) if tools else []
             messages = []
             observed_write = False
@@ -710,7 +771,7 @@ class CodexRuntime:
                     messages.append(item.get("text", ""))
                 if item.get("type") == "mcp_tool_call" and record.get("type") == "item.completed":
                     calls.append(item)
-                if item.get("type") in {"command_execution", "file_change", "web_search", "image_generation"}:
+                if item.get("type") in TOOL_ACTIVITY - {'mcp_tool_call'}:
                     raise RuntimeFailure("unexpected_tool", possible_write=write)
             process_failure = _process_failure_code(stderr, error_hints) if not tools else None
             if returncode or protocol_failure or process_failure:
@@ -804,10 +865,11 @@ class CodexRuntime:
         except ConfigurationError as error:
             raise RuntimeFailure(str(error)) from None
 
-    def _tool(self, name, arguments):
+    def _tool(self, name, arguments, *, probe=False):
         if self.read_only and name not in self.READ_TOOLS:
             raise RuntimeFailure('calendar_read_only')
-        self._require_calendar()
+        if not probe:
+            self._require_calendar()
         prompt = (
             "Call exactly one Google Calendar tool with the exact arguments specified in JSON below. "
             "This operation is authorized by the user. If the application tool is exposed through Code Mode, "
@@ -819,48 +881,54 @@ class CodexRuntime:
             "returns output only {\"ok\":true}; if unavailable return {\"ok\":false}.\n"
             + json.dumps({"tool": name, "arguments": arguments}, ensure_ascii=False)
         )
+        validate = self._tool_response_validator
+        if validate is None and name == 'read_event' and 'event_id' in arguments:
+            def validate(data):
+                self._validate_read_identity(self._event_from(data), arguments['event_id'])
+        elif validate is None and name == 'search_events':
+            def validate(data):
+                self._search_page(data, arguments)
         return self._invoke(prompt, "tool.json", tools=(name,), expected_tool=name, expected_args=arguments,
-                            validate=getattr(self, '_batch_response_validator', None) if name == 'batch_read_event' else None)
+                            validate=validate, probe=probe)
 
     def probe(self):
-        """One read-only retry is permitted only on unambiguous tool-count failures."""
+        """Verify Calendar access with a durable record for each permitted attempt."""
         self.last_evidence = []
         self.last_probe_attempts = []
-        for number in (1, 2):
-            self.last_invocation_metadata = {}
-            attempt = dict(attempt_number=number, model=self.config.tool_model, effort=self.config.tool_effort,
-                cli_version=self._version, started_at=datetime.now(timezone.utc).isoformat(), completed_at=None,
-                result='running', safe_code=None, process_code=None, started_count=None, completed_count=None,
-                parse_error_count=None, unknown_event_count=None, incomplete_count=None,
-                expected_tool_name=None, expected_tool_arguments=None)
-            self.last_probe_attempts.append(attempt)
-            self._persist_probe_attempt(attempt)
-            try:
-                self._require_calendar()
-                attempt['cli_version'] = self._cli_version()
-                data = self._tool('list_calendars', {'max_results': 100})
-                target = self._probe_target(data)
-            except BaseException as error:
-                from .health_state import ERROR_CODES
-                interrupted = not isinstance(error, Exception)
-                safe_code = getattr(error, 'code', None)
-                if safe_code not in ERROR_CODES:
-                    safe_code = 'sync_interrupted' if interrupted else 'operation_failed'
-                attempt.update({key: value for key, value in self.last_invocation_metadata.items() if key in attempt})
-                attempt.update(completed_at=datetime.now(timezone.utc).isoformat(),
-                    result='interrupted' if interrupted else 'failed', safe_code=safe_code)
-                self._persist_probe_attempt(attempt)
-                if (number == 1 and isinstance(error, RuntimeFailure) and error.code == 'unexpected_tool_count'
-                        and error.retryable_probe):
-                    time.sleep(5)
-                    continue
-                raise
+        data = self._tool('list_calendars', {'max_results': 100}, probe=True)
+        target = self._probe_target(data)
+        number = len(self.last_probe_attempts)
+        return {'calendar_id': self.config.calendar_id, 'access_role': target.get('access_role', target.get('accessRole')),
+                'model': self.config.tool_model, 'effort': self.config.tool_effort, 'evidence': self.last_evidence,
+                'attempts': number, 'recovered': number == 2}
+
+    @contextmanager
+    def _probe_attempt(self, number):
+        from .health_state import ERROR_CODES
+        attempt = dict(attempt_number=number, model=self.config.tool_model, effort=self.config.tool_effort,
+            cli_version=self._version, started_at=datetime.now(timezone.utc).isoformat(), completed_at=None,
+            result='running', safe_code=None, process_code=None, started_count=None, completed_count=None,
+            parse_error_count=None, unknown_event_count=None, incomplete_count=None,
+            expected_tool_name=None, expected_tool_arguments=None)
+        self.last_probe_attempts.append(attempt)
+        self._persist_probe_attempt(attempt)
+        try:
+            self._require_calendar()
+            attempt['cli_version'] = self._cli_version()
+            yield
+        except BaseException as error:
+            interrupted = not isinstance(error, Exception)
+            safe_code = getattr(error, 'code', None)
+            if safe_code not in ERROR_CODES:
+                safe_code = 'sync_interrupted' if interrupted else 'operation_failed'
+            attempt.update(result='interrupted' if interrupted else 'failed', safe_code=safe_code)
+            raise
+        else:
+            attempt['result'] = 'ok'
+        finally:
             attempt.update({key: value for key, value in self.last_invocation_metadata.items() if key in attempt})
-            attempt.update(completed_at=datetime.now(timezone.utc).isoformat(), result='ok')
+            attempt['completed_at'] = datetime.now(timezone.utc).isoformat()
             self._persist_probe_attempt(attempt)
-            return {'calendar_id': self.config.calendar_id, 'access_role': target.get('access_role', target.get('accessRole')),
-                    'model': self.config.tool_model, 'effort': self.config.tool_effort, 'evidence': self.last_evidence,
-                    'attempts': number, 'recovered': number == 2}
 
     def _persist_probe_attempt(self, attempt):
         if self.probe_attempt_sink is not None:
@@ -874,7 +942,7 @@ class CodexRuntime:
             return self._version
         try:
             result = subprocess.run([self.binary, '--version'], capture_output=True, text=True,
-                timeout=5, env={key: os.environ[key] for key in ('HOME', 'PATH') if key in os.environ})
+                timeout=self._process_timeout(5), env={key: os.environ[key] for key in ('HOME', 'PATH') if key in os.environ})
         except (OSError, subprocess.SubprocessError):
             return None
         # Never persist arbitrary output from a binary, wrapper, or error page.
@@ -909,11 +977,11 @@ class CodexRuntime:
             def validate(data):
                 nonlocal validated
                 validated = self._validate_read_batch(data, requested, expected_events)
-            self._batch_response_validator = validate
+            self._tool_response_validator = validate
             try:
                 data = self._tool('batch_read_event', {'calendar_id': self.config.calendar_id, 'event_ids': requested})
             finally:
-                self._batch_response_validator = None
+                self._tool_response_validator = None
             # Custom tool adapters may return a payload without invoking validate.
             events.update(validated if validated is not None else self._validate_read_batch(data, requested, expected_events))
         return events
@@ -965,33 +1033,59 @@ class CodexRuntime:
                     and set(item) == {'domain','reason','message'}
                     and all(isinstance(field, str) for field in item.values()) for item in error['errors']))
 
+    @staticmethod
+    def _search_page(data, arguments, seen_tokens=(), *, last_page=False):
+        events = data.get('events', data.get('items')) if isinstance(data, dict) else None
+        if not isinstance(events, list) or any(not isinstance(event, dict) or
+                not isinstance(event.get('id'), str) or not event['id'] for event in events):
+            raise RuntimeFailure('calendar_search_incomplete')
+        fields = ('next_page_token', 'nextPageToken')
+        tokens = [data[key] for key in fields if key in data]
+        if not tokens:
+            # A full page without a continuation contract cannot prove that all
+            # matching ownership state was discovered.
+            if len(events) >= arguments.get('max_results', 100):
+                raise RuntimeFailure('calendar_search_incomplete')
+            return events, None
+        token = tokens[0]
+        if (token is not None and not isinstance(token, str)
+                or any(value != token for value in tokens)
+                or token and (last_page or token in seen_tokens or token == arguments.get('next_page_token'))):
+            raise RuntimeFailure('calendar_search_incomplete')
+        return events, token
+
+    def _search_pages(self, arguments, max_pages):
+        tokens = set()
+        for page in range(max_pages):
+            last_page = page == max_pages - 1
+            validated = None
+
+            def validate(data):
+                nonlocal validated
+                validated = self._search_page(data, arguments, tokens, last_page=last_page)
+
+            self._tool_response_validator = validate
+            try:
+                data = self._tool('search_events', arguments)
+            finally:
+                self._tool_response_validator = None
+            # Custom tool adapters may return a payload without invoking validate.
+            events, token = validated if validated is not None else self._search_page(data, arguments, tokens, last_page=last_page)
+            yield events
+            if not token:
+                return
+            tokens.add(token)
+            arguments = dict(arguments, next_page_token=token)
+
     def discover_events(self):
         """Search all dates by ownership metadata, consuming every verified page."""
         found = {}
         for query in ('librus-calendar:', 'Źródło: Librus'):
             args = {'calendar_id': self.config.calendar_id, 'query': query,
                     'timezone_str': 'Europe/Warsaw', 'max_results': 100}
-            tokens = set()
-            for _ in range(1000):
-                data = self._tool('search_events', args)
-                events = data.get('events', data.get('items')) if isinstance(data, dict) else None
-                if not isinstance(events, list) or any(not isinstance(event, dict) or not event.get('id') for event in events):
-                    raise RuntimeFailure('calendar_search_incomplete')
+            for events in self._search_pages(args, max_pages=1000):
                 for event in events:
-                    found[str(event['id'])] = event
-                token = data.get('next_page_token', data.get('nextPageToken'))
-                if not token:
-                    # A connector's full-size page without a continuation contract
-                    # cannot prove that all matching ownership state was discovered.
-                    if len(events) >= 100 and not any(key in data for key in ('next_page_token', 'nextPageToken')):
-                        raise RuntimeFailure('calendar_search_incomplete')
-                    break
-                if str(token) in tokens:
-                    raise RuntimeFailure('calendar_search_incomplete')
-                tokens.add(str(token))
-                args = dict(args, next_page_token=token)
-            else:
-                raise RuntimeFailure('calendar_search_incomplete')
+                    found[event['id']] = event
         return list(found.values())
 
     def _fetch(self, event_id, expected_event=None):
@@ -1000,11 +1094,15 @@ class CodexRuntime:
         data = self._tool("read_event", {"calendar_id": self.config.calendar_id, "event_id": event_id})
         return self._normalize_read_event(self._event_from(data), event_id, expected_event)
 
-    def _normalize_read_event(self, event, event_id, expected_event=None):
+    @staticmethod
+    def _validate_read_identity(event, event_id):
         if not event:
             raise RuntimeFailure("calendar_event_missing")
         if event.get("id") != event_id:
             raise RuntimeFailure("calendar_event_id_mismatch")
+
+    def _normalize_read_event(self, event, event_id, expected_event=None):
+        self._validate_read_identity(event, event_id)
         expected = normalize_event(expected_event, owner_email=self.config.calendar_owner) if expected_event else {}
         all_day_context = (event.get('all_day') is True or (expected_event and expected_event.get('all_day') is not False and
                            (expected_event.get('all_day') is True or
@@ -1033,19 +1131,13 @@ class CodexRuntime:
         args = {"calendar_id": self.config.calendar_id, "query": operation["marker"], "time_min": (first - timedelta(days=2)).isoformat(),
                 "time_max": (last + timedelta(days=2)).isoformat(), "timezone_str": "Europe/Warsaw", "max_results": 100}
         matches = []
-        for page in range(5):
-            data = self._tool("search_events", args)
-            events = data.get("events", data.get("items", []))
+        for events in self._search_pages(args, max_pages=5):
             for event in events:
                 if marker_present(event.get("description"), operation["marker"]):
                     full = self._fetch(event["id"], operation["event"])
                     if marker_present(full.get("description"), operation["marker"]):
                         matches.append(full)
-            token = data.get("next_page_token", data.get("nextPageToken"))
-            if not token:
-                return matches
-            args = dict(args, next_page_token=token)
-        raise RuntimeFailure("calendar_search_incomplete")
+        return matches
 
     def _validate_operation(self, operation):
         self._require_calendar()
