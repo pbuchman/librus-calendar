@@ -9,12 +9,15 @@ from __future__ import annotations
 from contextlib import nullcontext
 import copy
 from datetime import date, datetime, timedelta
+from itertools import zip_longest
 import json
 
 import jsonschema
 
 from .codex_runtime import SCHEMAS, CodexRuntime, RuntimeFailure, normalize_event, event_fingerprint
 from .core import REVIEWED_CREATE_WITH_TARGET, WARSAW, digest, normalize_proposal, utcnow
+from .incidents import active as incidents_active, checkpoint as incident_checkpoint, emit, observe
+from .planner_incidents import CAS_SECTIONS, INPUT_SECTIONS, SCHEMA_PATH_FIELDS, SCHEMA_VALIDATORS, json_type
 
 AGENDA_VERSION = 'simple-agenda-v9-school-reconfirmation'
 AGENDA_MODEL = 'gpt-6.1-sol'
@@ -25,7 +28,7 @@ MAX_INPUT_BYTES = 320_000
 MAX_ROWS = 5_000
 CATALOG_COLUMNS = ('id', 'kind', 'content_hash', 'deleted', 'retained', 'body_available')
 AGENDA_LINK_COLUMNS = ('source_id', 'source_hash', 'source_quote', 'relation')
-INPUT_SIZE_SECTIONS = ('sources', 'source_catalog', 'agenda', 'offer_groups', 'preferences', 'unsettled_operations')
+INPUT_SIZE_SECTIONS = INPUT_SECTIONS
 DECISION_FLAGS = ('user_approved', 'user_edited', 'user_rejected', 'deletion_approved')
 ACTION_FIELDS = ('kind', 'title', 'description', 'start', 'end', 'all_day', 'temporal_kind', 'due_at',
                  'activity_scope', 'optional', 'recipient', 'action_identity', 'offer_identity', 'event_id',
@@ -43,9 +46,7 @@ class AgendaContextOverflow(RuntimeFailure):
         super().__init__('agenda_context_overflow')
         self.input_bytes = input_bytes
         self.input_limit_bytes = MAX_INPUT_BYTES
-        self.section_bytes = {key: len(_input_json(wire[key]).encode('utf-8')) if key in wire else 0
-                              for key in INPUT_SIZE_SECTIONS}
-        self.section_bytes['envelope'] = input_bytes - sum(self.section_bytes.values())
+        self.section_bytes = _input_section_bytes(input_bytes, wire)
         self.source_count = len(wire.get('sources', []))
         self.catalog_count = len(wire.get('source_catalog', {}).get('rows', []))
         self.agenda_count = len(wire.get('agenda', []))
@@ -133,12 +134,15 @@ def _agenda(tables, calendar_events, owner_email):
         if decision is not None:
             authority = decision.get('proposal') or decision
             entry['current_decision'] = {flag: True for flag in DECISION_FLAGS if authority.get(flag) is True}
-    for row in tables['events']:
+    for row_position, row in enumerate(tables['events'], 1):
         eid = row['id']
         if row['state'] == 'active' and eid not in calendar_events:
+            emit('planner', 'snapshot', 'missing_calendar_row', 'blocked', row_position=row_position)
             raise RuntimeFailure('agenda_calendar_snapshot_incomplete')
         observed = calendar_events.get(eid)
         if observed is not None and (not isinstance(observed, dict) or observed.get('id') != eid):
+            emit('planner', 'snapshot', 'invalid_calendar_row', 'blocked', row_position=row_position,
+                 received_type=json_type(observed))
             raise RuntimeFailure('agenda_calendar_snapshot_invalid')
         entry = by_proposal.get(row['proposal_id']) or next(
             (candidate for candidate in entries.values() if candidate['action'].get('event_id') == eid), None)
@@ -170,6 +174,8 @@ def assemble_agenda_snapshot(database, calendar_events, *, current=None, owner_e
     """
     current = current or datetime.now(WARSAW)
     if current.tzinfo is None or not isinstance(calendar_events, dict):
+        emit('planner', 'snapshot', 'invalid_snapshot_input', 'blocked', timezone_present=current.tzinfo is not None,
+             calendar_map=isinstance(calendar_events, dict))
         raise RuntimeFailure('agenda_snapshot_invalid')
     db = getattr(database, 'db', database)
     lock = getattr(database, 'lock', None)
@@ -178,6 +184,8 @@ def assemble_agenda_snapshot(database, calendar_events, *, current=None, owner_e
         columns = [field[0] for field in cursor.description]
         found = [dict(zip(columns, row)) for row in cursor.fetchmany(MAX_ROWS + 1)]
         if len(found) > MAX_ROWS:
+            emit('planner', 'snapshot', 'row_limit', 'blocked', table=table,
+                 row_count=len(found), row_limit=MAX_ROWS)
             raise RuntimeFailure('agenda_snapshot_overflow')
         return found
     with lock if lock is not None else nullcontext():
@@ -190,10 +198,13 @@ def assemble_agenda_snapshot(database, calendar_events, *, current=None, owner_e
             context.update(pinned_id=settings.get('source_learner_id'),
                            verified=settings.get('source_learner_verified') == 'true')
             if not context.get('verified') or not context.get('id') or context['id'] != context['pinned_id']:
+                emit('planner', 'snapshot', 'learner_unverified', 'blocked', verified=context['verified'],
+                     learner_present=bool(context.get('id')), pin_matches=context.get('id') == context['pinned_id'])
                 raise RuntimeFailure('agenda_learner_unverified')
             sources = []
-            for row in rows('sources'):
+            for position, row in enumerate(rows('sources'), 1):
                 if row['learner_id'] != context['id']:
+                    emit('planner', 'snapshot', 'learner_mismatch', 'blocked', source_position=position)
                     raise RuntimeFailure('agenda_learner_mismatch')
                 payload = json.loads(row['payload'])
                 # Every row was checked against the verified snapshot learner;
@@ -246,27 +257,80 @@ def _input_json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'))
 
 
+def _input_section_bytes(input_bytes, wire):
+    sizes = {key: len(_input_json(wire[key]).encode('utf-8')) if key in wire else 0
+             for key in INPUT_SIZE_SECTIONS}
+    return {**sizes, 'envelope': input_bytes - sum(sizes.values())}
+
+
 def _agenda_wire_snapshot(snapshot):
     """Lossless tables on the wire only; internal snapshots remain dictionaries."""
     if not isinstance(snapshot, dict) or 'agenda_link_columns' in snapshot:
+        emit('planner', 'snapshot', 'snapshot_wire_shape', 'blocked', received_type=json_type(snapshot))
         raise RuntimeFailure('agenda_snapshot_invalid')
-    def rows(value, columns):
-        if not isinstance(value, list) or any(not isinstance(row, dict) or set(row) != set(columns) for row in value):
+
+    def rows(value, columns, reason, **positions):
+        keys = set(columns)
+        def invalid(actual, position):
+            key = 'ref_position' if 'row_position' in positions else 'row_position'
+            actual_keys = actual.keys() if type(actual) is dict else set()
+            emit('planner', 'snapshot', reason, 'blocked', **positions,
+                 **{key: position}, received_type=json_type(actual), missing_fields=sorted(keys - actual_keys),
+                 unexpected_field_count=len(actual_keys - keys))
             raise RuntimeFailure('agenda_snapshot_invalid')
-        return [[row[key] for key in columns] for row in value]
+
+        if not isinstance(value, list):
+            invalid(value, 0)
+        result = []
+        for position, row in enumerate(value, 1):
+            if not isinstance(row, dict) or set(row) != keys:
+                invalid(row, position)
+            result.append([row[key] for key in columns])
+        return result
+
     wire = dict(snapshot)
     if 'source_catalog' in snapshot:
-        wire['source_catalog'] = {'columns': list(CATALOG_COLUMNS), 'rows': rows(snapshot['source_catalog'], CATALOG_COLUMNS)}
+        wire['source_catalog'] = {'columns': list(CATALOG_COLUMNS),
+                                  'rows': rows(snapshot['source_catalog'], CATALOG_COLUMNS, 'catalog_wire_shape')}
     if 'agenda' in snapshot:
-        if not isinstance(snapshot['agenda'], list) or any(not isinstance(entry, dict) for entry in snapshot['agenda']):
+        if not isinstance(snapshot['agenda'], list):
+            emit('planner', 'snapshot', 'agenda_wire_shape', 'blocked', row_position=0,
+                 received_type=json_type(snapshot['agenda']))
             raise RuntimeFailure('agenda_snapshot_invalid')
         wire['agenda_link_columns'] = list(AGENDA_LINK_COLUMNS)
-        wire['agenda'] = [{**entry, **({'links': rows(entry['links'], AGENDA_LINK_COLUMNS)} if 'links' in entry else {})}
-                          for entry in snapshot['agenda']]
+        wire['agenda'] = []
+        for position, entry in enumerate(snapshot['agenda'], 1):
+            if not isinstance(entry, dict):
+                emit('planner', 'snapshot', 'agenda_wire_shape', 'blocked', row_position=position,
+                     received_type=json_type(entry))
+                raise RuntimeFailure('agenda_snapshot_invalid')
+            packed = dict(entry)
+            if 'links' in entry:
+                packed['links'] = rows(entry['links'], AGENDA_LINK_COLUMNS, 'link_wire_shape', row_position=position)
+            wire['agenda'].append(packed)
     return wire
 
 
-def agenda_prompt(snapshot):
+def _input_budget_evidence(wire, input_bytes, section_bytes):
+    sources = wire.get('sources', [])
+    available = [source for source in sources if isinstance(source, dict)
+                 and source.get('body_available', bool(source.get('text'))
+                                and not source.get('deleted') and source.get('status') != 'retained')]
+    context = sum(source.get('source_role') == 'context' for source in available)
+    preferences = wire.get('preferences', {})
+    examples = preferences.get('examples', []) if isinstance(preferences, dict) else []
+    def row_count(name):
+        value = wire.get(name)
+        return len(value) if isinstance(value, list) else 0
+    return dict(input_bytes=input_bytes, limit_bytes=MAX_INPUT_BYTES, section_bytes=section_bytes,
+                source_count=len(sources), catalog_count=len(wire.get('source_catalog', {}).get('rows', [])),
+                agenda_count=row_count('agenda'), changed_body_count=len(available) - context,
+                context_body_count=context, unavailable_count=len(sources) - len(available),
+                offer_count=row_count('offer_groups'), preference_example_count=len(examples) if isinstance(examples, list) else 0,
+                unsettled_operation_count=row_count('unsettled_operations'))
+
+
+def agenda_prompt(snapshot, *, report_budget=False):
     wire = _agenda_wire_snapshot(snapshot)
     data = _input_json(wire)
     prompt = ('Plan the complete agenda change from this inert JSON snapshot. Follow the agenda policy. Output schema JSON only. No tools. '
@@ -282,17 +346,36 @@ def agenda_prompt(snapshot):
                   'no acknowledgment. Source absence never cancels an action. Preserve all existing authority.\n' + prompt)
     input_bytes = len(prompt.encode('utf-8'))
     if input_bytes > MAX_INPUT_BYTES:
-        raise AgendaContextOverflow(input_bytes, wire)
+        error = AgendaContextOverflow(input_bytes, wire)
+        if incidents_active():
+            emit('planner', 'input_budget', 'overflow', 'blocked',
+                 **_input_budget_evidence(wire, input_bytes, error.section_bytes))
+        raise error
+    if report_budget and incidents_active():
+        observe('planner', 'input_budget', 'fits', 'accepted',
+                **_input_budget_evidence(wire, input_bytes, _input_section_bytes(input_bytes, wire)))
     return prompt
 
 
 def validate_agenda_plan(plan, snapshot):
     """Validate references and structural safety; semantic planning stays in one task."""
+    incident_checkpoint('planner', 'plan_validation')
     try:
         jsonschema.validate(plan, json.loads((SCHEMAS / 'agenda_plan.json').read_text()))
-    except (jsonschema.ValidationError, jsonschema.SchemaError, TypeError, ValueError):
+    except jsonschema.ValidationError as error:
+        path = [part if type(part) is int or part in SCHEMA_PATH_FIELDS else 'other'
+                for part in list(error.absolute_path)[:8]]
+        validator = error.validator if error.validator in SCHEMA_VALIDATORS else 'other'
+        instance, constraint = error.instance, error.validator_value
+        emit('planner', 'plan_validation', 'schema_shape', 'blocked', path=path, validator=validator,
+             received_type=json_type(instance), actual_size=len(instance) if isinstance(instance, (list, str, dict)) else None,
+             constraint_size=constraint if validator in {'maxLength', 'minLength', 'maxItems', 'minItems'} else None)
+        raise RuntimeFailure('agenda_plan_invalid') from None
+    except (jsonschema.SchemaError, TypeError, ValueError):
+        emit('planner', 'plan_validation', 'schema_definition', 'blocked')
         raise RuntimeFailure('agenda_plan_invalid') from None
     if plan['snapshot_hash'] != snapshot['snapshot_hash']:
+        emit('planner', 'plan_validation', 'output_snapshot_mismatch', 'blocked')
         raise RuntimeFailure('agenda_plan_stale')
     sources = {source['id']: source['content_hash'] for source in snapshot.get('source_catalog', snapshot['sources'])}
     supplied_bodies = {source['id'] for source in snapshot['sources']
@@ -300,64 +383,100 @@ def validate_agenda_plan(plan, snapshot):
                        and source.get('source_role', 'changed') == 'changed'}
     actions = {action['id']: action for action in snapshot['agenda']}
     groups = {group['id'] for group in snapshot['offer_groups']}
-    targets = set()
-    creates = set()
-    for item in plan['items']:
+    targets = {}
+    creates = {}
+    for position, item in enumerate(plan['items'], 1):
         operation, aid = item['operation'], item['action_id']
+        def invalid(code, reason, **evidence):
+            emit('planner', 'plan_validation', reason, 'blocked', item_position=position,
+                 item_operation=operation, **evidence)
+            raise RuntimeFailure(code)
+
         if aid is not None and aid not in actions:
-            raise RuntimeFailure('agenda_action_reference_invalid')
+            invalid('agenda_action_reference_invalid', 'unknown_action')
         if operation in {'link', 'update'} and aid is None or operation == 'create' and aid is not None:
-            raise RuntimeFailure('agenda_action_reference_invalid')
+            invalid('agenda_action_reference_invalid', 'wrong_target_presence')
         if aid is not None and operation != 'ignore':
             if aid in targets:
-                raise RuntimeFailure('agenda_conflicting_operations')
-            targets.add(aid)
-        candidates = item['candidate_action_ids']
-        if len(set(candidates)) != len(candidates) or any(candidate not in actions for candidate in candidates):
-            raise RuntimeFailure('agenda_action_reference_invalid')
+                invalid('agenda_conflicting_operations', 'duplicate_target', prior_position=targets[aid])
+            targets[aid] = position
+        candidates = set()
+        for ref_position, candidate in enumerate(item['candidate_action_ids'], 1):
+            if candidate not in actions:
+                invalid('agenda_action_reference_invalid', 'unknown_candidate', ref_position=ref_position)
+            if candidate in candidates:
+                invalid('agenda_action_reference_invalid', 'duplicate_candidate', ref_position=ref_position)
+            candidates.add(candidate)
         refs = item['sources']
-        if not refs or len({ref['source_id'] for ref in refs}) != len(refs) or any(sources.get(ref['source_id']) != ref['source_hash'] for ref in refs):
-            raise RuntimeFailure('agenda_source_reference_invalid')
+        if not refs:
+            invalid('agenda_source_reference_invalid', 'no_source_references')
+        seen_sources = set()
+        for ref_position, ref in enumerate(refs, 1):
+            ref_id = ref['source_id']
+            if ref_id in seen_sources:
+                invalid('agenda_source_reference_invalid', 'duplicate_source', ref_position=ref_position)
+            if ref_id not in sources:
+                invalid('agenda_source_reference_invalid', 'unknown_source', ref_position=ref_position)
+            if sources[ref_id] != ref['source_hash']:
+                invalid('agenda_source_reference_invalid', 'source_version_mismatch', ref_position=ref_position)
+            seen_sources.add(ref_id)
         if operation == 'create':
             if 'source_catalog' in snapshot and not any(ref['source_id'] in supplied_bodies for ref in refs):
-                raise RuntimeFailure('agenda_source_body_required')
+                invalid('agenda_source_body_required', 'available_changed_body_required', ref_count=len(refs))
             identity = digest([item['action'], sorted(refs, key=lambda ref: ref['source_id'])])
             if identity in creates:
-                raise RuntimeFailure('agenda_conflicting_operations')
-            creates.add(identity)
+                invalid('agenda_conflicting_operations', 'duplicate_create', prior_position=creates[identity])
+            creates[identity] = position
         if item['offer_group_id'] is not None and item['offer_group_id'] not in groups:
-            raise RuntimeFailure('agenda_group_reference_invalid')
+            invalid('agenda_group_reference_invalid', 'unknown_group')
         action = item['action']
-        if operation in {'create', 'update'} and action is None:
-            raise RuntimeFailure('agenda_plan_invalid')
-        if operation in {'link', 'ignore'} and action is not None:
-            raise RuntimeFailure('agenda_plan_invalid')
+        if (operation in {'create', 'update'} and action is None
+                or operation in {'link', 'ignore'} and action is not None):
+            invalid('agenda_plan_invalid', 'wrong_action_presence')
         if (operation != 'review' and item['review_change'] is not None
                 or operation == 'review' and item['review_change'] is None):
-            raise RuntimeFailure('agenda_plan_invalid')
+            invalid('agenda_plan_invalid', 'wrong_review_change_presence')
         if item['review_change'] in {'update', 'cancel'} and aid is None:
-            raise RuntimeFailure('agenda_action_reference_invalid')
+            invalid('agenda_action_reference_invalid', 'review_target_required')
         if action is not None:
-            CodexRuntime._validate_analysis_time(action)
+            try:
+                CodexRuntime._validate_analysis_time(action)
+            except RuntimeFailure:
+                emit('planner', 'plan_validation', 'invalid_temporal_fields', 'blocked', item_position=position,
+                     item_operation=operation, all_day=action['all_day'], temporal_kind=action['temporal_kind'],
+                     end_present=action['end'] is not None, due_present=action['due_at'] is not None)
+                raise
         from .preferences import basis_outcome
         preference = basis_outcome(snapshot.get('preferences', {}), item.get('preference_basis'))
         # Unknown applicability never gains authority from a participation choice.
         # Insufficient/conflicting supplied preference evidence becomes review.
         if operation == 'create' and (action['activity_scope'] == 'unknown'
                 or action['activity_scope'] != 'school' and preference is None):
-            raise RuntimeFailure('agenda_review_required')
+            invalid('agenda_review_required', 'review_required', activity_scope=action['activity_scope'])
     if 'source_catalog' in snapshot:
         handled = {ref['source_id'] for item in plan['items'] for ref in item['sources']}
-        if not {source['id'] for source in snapshot['sources']} <= handled:
+        unhandled = [position for position, source in enumerate(snapshot['sources'], 1) if source['id'] not in handled]
+        if unhandled:
+            emit('planner', 'plan_validation', 'selected_source_unhandled', 'blocked',
+                 source_position=unhandled[0], unhandled_count=len(unhandled))
             raise RuntimeFailure('agenda_sources_unprocessed')
     return copy.deepcopy(plan)
 
 
-def read_calendar(store, runtime):
+def read_calendar(store, runtime, *, incident_operation='calendar_snapshot'):
     """Current managed state only. Failed reads never masquerade as not-found."""
+    incident_checkpoint('planner', incident_operation)
     expected = {row['id']: json.loads(row['snapshot']) for row in
                 store.db.execute("SELECT id,snapshot FROM events WHERE state='active' ORDER BY id").fetchall()}
-    return runtime.read_events(expected)
+    observe('planner', incident_operation, 'read_started', 'reading', requested_count=len(expected))
+    observed = runtime.read_events(expected)
+    if incidents_active():
+        report = observed if type(observed) is dict else None
+        observe('planner', incident_operation, 'read_finished', 'returned', requested_count=len(expected),
+                observed_count=len(report) if report is not None else None,
+                not_found_count=sum(event is None for event in report.values()) if report is not None else None,
+                omitted_count=len(expected.keys() - report.keys()) if report is not None else None)
+    return observed
 
 
 def _message(store, source):
@@ -441,10 +560,14 @@ def _reconsideration_review(snapshot, entry, item):
 def _prepare_item(store, snapshot, item, plan_id, index, current):
     """Convert one validated semantic decision to existing proposal vocabulary."""
     item = copy.deepcopy(item)
+    def invalid(code, reason):
+        emit('planner', 'materialize', reason, 'blocked', item_position=index + 1, item_operation=item['operation'])
+        raise RuntimeFailure(code) from None
+
     entries = {entry['id']: entry for entry in snapshot['agenda']}
     entry = entries.get(item['action_id'])
     if entry and not store.db.execute('SELECT 1 FROM canonical_actions WHERE id=?', (entry['id'],)).fetchone():
-        raise RuntimeFailure('agenda_action_reference_invalid')
+        invalid('agenda_action_reference_invalid', 'target_not_canonical')
     if all(store.get_source(ref['source_id'])['kind'] == 'substitution' for ref in item['sources']):
         item.update(operation='ignore', action=None, review_change=None, proposal_id=None,
                     reason='Substitutions are informational and do not create personal Calendar actions.')
@@ -547,7 +670,7 @@ def _prepare_item(store, snapshot, item, plan_id, index, current):
         proposal = normalize_proposal(raw, current, participation_preference=learned_accept)
     except (ValueError, TypeError, OverflowError):
         if item['operation'] != 'review':
-            raise RuntimeFailure('agenda_plan_invalid') from None
+            invalid('agenda_plan_invalid', 'normalization_failed')
         proposal = {**raw, 'status': 'review', 'needs_review': True}
     # A valid undated review must stay review, including when its placeholder
     # date is absent/past. It becomes executable only through explicit UI input.
@@ -565,7 +688,7 @@ def _prepare_item(store, snapshot, item, plan_id, index, current):
                     and all(proposal.get(field) == prior.get(field) for field in fields)):
                 existing = entries.get(prior.get('canonical_action_id') or prior.get('id'))
                 if existing is None:
-                    raise RuntimeFailure('agenda_action_reference_invalid')
+                    invalid('agenda_action_reference_invalid', 'retained_target_missing')
                 item.update(operation='link', action=None, review_change=None, action_id=existing['id'],
                             proposal_id=existing['proposal_id'],
                             reason='Identical prior creation retained; reconcile its existing journal. ' + reason)
@@ -574,7 +697,7 @@ def _prepare_item(store, snapshot, item, plan_id, index, current):
     pid = digest(['agenda-proposal', plan_id, index])[:32]
     message = _message(store, sources[0])
     if not message:
-        raise RuntimeFailure('agenda_source_reference_invalid')
+        invalid('agenda_source_reference_invalid', 'source_message_missing')
     proposal.update(id=pid, message_id=message['id'], canonical_action_id=aid,
                     source_id=sources[0]['id'], source_hash=sources[0]['content_hash'], source_kind=sources[0]['kind'],
                     source_version_at=sources[0].get('updated_at') or sources[0].get('published_at'),
@@ -607,12 +730,25 @@ def _prepare_item(store, snapshot, item, plan_id, index, current):
     return item, proposal
 
 
+def reject_stale_agenda(*failed_checks, before=None, after=None, source_position=0):
+    if incidents_active():
+        changed = [key for key in CAS_SECTIONS if before is not None and after is not None
+                   and before.get(key) != after.get(key)]
+        if 'sources' in changed:
+            pairs = zip_longest(before['sources'], after['sources'])
+            source_position = next(position for position, (old, new) in enumerate(pairs, 1) if old != new)
+        emit('planner', 'materialization_cas', 'stale_snapshot', 'blocked', failed_checks=list(failed_checks),
+             changed_sections=changed, source_position=source_position)
+    raise RuntimeFailure('agenda_plan_stale')
+
+
 def materialize_plan(store, snapshot, plan, calendar, *, current, preview=False, metadata=None, checkpoint=None):
     """Persist plan + local materialization atomically, before existing queue code."""
     validate_agenda_plan(plan, snapshot)
     metadata = {key: value for key, value in (metadata or {}).items() if key in
                 ('model','effort','prompt_version','input_bytes','item_count','source_count','catalog_count','request_hash','source_collection_at','sources_refreshed_by_preview')}
     pid = digest(['agenda-preview' if preview else 'agenda-plan', snapshot['snapshot_hash']])[:32]
+    incident_checkpoint('planner', 'materialize')
     with store.lock, store.db:
         store.db.execute('BEGIN IMMEDIATE')
         incremental = 'source_catalog' in snapshot
@@ -621,12 +757,15 @@ def materialize_plan(store, snapshot, plan, calendar, *, current, preview=False,
             live, live_checkpoint = assemble_incremental_snapshot(store, calendar, current=current, owner_email=store.config.calendar_owner, enforce_budget=False)
             bound_fields = ('local_state_hash', 'processed_versions', 'bootstrap_versions', 'authority_versions',
                             'message_versions', 'catalog_count', 'source_count')
-            if checkpoint is None or any(checkpoint.get(key) != live_checkpoint.get(key) for key in bound_fields):
-                raise RuntimeFailure('agenda_plan_stale')
+            if checkpoint is None:
+                reject_stale_agenda('checkpoint_present')
+            failed = [key for key in bound_fields if checkpoint.get(key) != live_checkpoint.get(key)]
+            if failed:
+                reject_stale_agenda(*failed, before=snapshot, after=live)
         else:
             live = assemble_agenda_snapshot(store, calendar, current=current, owner_email=store.config.calendar_owner)
         if live['snapshot_hash'] != snapshot['snapshot_hash']:
-            raise RuntimeFailure('agenda_plan_stale')
+            reject_stale_agenda('snapshot_hash', before=snapshot, after=live)
         existing = store.db.execute('SELECT payload,status FROM agenda_plans WHERE id=?', (pid,)).fetchone()
         if existing:
             return {'status': existing['status'], 'plan_id': pid, 'items': json.loads(existing['payload'])['items'], 'reused': True}
@@ -639,9 +778,15 @@ def materialize_plan(store, snapshot, plan, calendar, *, current, preview=False,
         prepared = [_prepare_item(store, snapshot, item, pid, index, current) for index, item in enumerate(plan['items'])]
         # An exact unknown-intent retention can resolve a model create to an
         # existing ID. Recheck targets after that application-side resolution.
-        targets = [item['action_id'] for item, _ in prepared if item['operation'] != 'ignore']
-        if len(targets) != len(set(targets)):
-            raise RuntimeFailure('agenda_conflicting_operations')
+        targets = {}
+        for position, (item, _) in enumerate(prepared, 1):
+            if item['operation'] != 'ignore':
+                aid = item['action_id']
+                if aid in targets:
+                    emit('planner', 'materialize', 'resolved_target_conflict', 'blocked', item_position=position,
+                         item_operation=item['operation'], prior_position=targets[aid])
+                    raise RuntimeFailure('agenda_conflicting_operations')
+                targets[aid] = position
         # Save the application-assigned plan BEFORE materializing any proposal.
         payload = {**plan, 'items': [item for item, proposal in prepared]}
         store.db.execute('INSERT INTO agenda_plans VALUES (?,?,?,?,?,?,NULL)',
@@ -689,8 +834,11 @@ def materialize_plan(store, snapshot, plan, calendar, *, current, preview=False,
                 # plan's exact current supporting versions live in agenda_sources.
                 store.db.execute('INSERT OR IGNORE INTO action_sources VALUES (?,?,?,?,?,?)',
                                  (aid, ref['source_id'], ref['source_hash'], '', 'supports', stamp))
-        for key, members in groups.items():
-            if len(members) < 2 or len({proposal['message_id'] for item, proposal in members}) != 1:
+        for position, (key, members) in enumerate(groups.items(), 1):
+            origins = len({proposal['message_id'] for item, proposal in members})
+            if len(members) < 2 or origins != 1:
+                emit('planner', 'materialize', 'incomplete_offer', 'blocked', group_position=position,
+                     member_count=len(members), origin_count=origins)
                 raise RuntimeFailure('agenda_group_reference_invalid')
             gid = digest(['agenda-offer', pid, key])[:32]
             first = members[0][1]
@@ -726,47 +874,75 @@ class AgendaPlanner:
 
     def run(self, current=None, *, preview=False):
         current = current or datetime.now(WARSAW)
+        mode = 'preview' if preview else 'apply'
+        phase = 'collection_gate'
+        incident_checkpoint('planner', phase)
         try:
             health = {row['kind']: row['last_result'] for row in self.store.db.execute('SELECT * FROM source_health')}
             from .source_store import KINDS
-            if self.store._setting('source_last_collection_result') != 'ok' or any(health.get(kind) != 'ok' for kind in KINDS):
+            collection_ok = self.store._setting('source_last_collection_result') == 'ok'
+            incomplete_kinds = sorted(kind for kind in KINDS if health.get(kind) != 'ok')
+            if not collection_ok or incomplete_kinds:
+                emit('planner', phase, 'source_health', 'blocked', collection_ok=collection_ok,
+                     incomplete_kinds=incomplete_kinds)
                 raise RuntimeFailure('agenda_collection_incomplete')
-            if (self.store.config.analysis_model, self.store.config.analysis_effort) != (AGENDA_MODEL, AGENDA_EFFORT):
+            phase = 'configuration_gate'
+            model_matches = self.store.config.analysis_model == AGENDA_MODEL
+            effort_matches = self.store.config.analysis_effort == AGENDA_EFFORT
+            if not (model_matches and effort_matches):
+                emit('planner', phase, 'model_effort', 'blocked', model_matches=model_matches, effort_matches=effort_matches)
                 raise RuntimeFailure('agenda_model_configuration_required')
+            phase = 'calendar_snapshot'
             self.calendar = read_calendar(self.store, self.runtime)
+            phase = 'snapshot'
+            incident_checkpoint('planner', phase)
             from .agenda_incremental import assemble_incremental_snapshot
             snapshot, checkpoint = assemble_incremental_snapshot(self.store, self.calendar, current=current, owner_email=self.store.config.calendar_owner, enforce_budget=False)
             if not preview and not snapshot['sources'] and checkpoint['full_snapshot_hash'] == self.store._setting('agenda_baseline_hash'):
+                observe('planner', 'model', 'input_unchanged', 'skipped',
+                        catalog_count=checkpoint['catalog_count'], agenda_count=len(snapshot['agenda']))
                 return {'status': 'unchanged', 'items': [], 'reused': True, 'model_calls': 0}
-            prompt = agenda_prompt(snapshot)  # Always preflight before a provider adapter.
+            phase = 'input_budget'
+            incident_checkpoint('planner', phase)
+            prompt = agenda_prompt(snapshot, report_budget=True)  # Always preflight before a provider adapter.
             import hashlib
             checkpoint.update(request_hash=hashlib.sha256(prompt.encode('utf-8')).hexdigest(), input_bytes=len(prompt.encode('utf-8')))
+            phase = 'model'
+            incident_checkpoint('planner', phase)
             cached = self.store.db.execute("SELECT payload,metadata FROM agenda_plans WHERE input_hash=? AND status='preview' ORDER BY created_at DESC LIMIT 1", (snapshot['snapshot_hash'],)).fetchone()
             if cached:
                 plan, metadata = json.loads(cached['payload']), json.loads(cached['metadata'])
+                observe('planner', phase, 'preview_reused', 'skipped', item_count=_plan_item_count(plan))
                 fresh, calls = self.calendar, 0
             elif not snapshot['sources'] and not snapshot['agenda']:
                 plan = {'snapshot_hash': snapshot['snapshot_hash'], 'decision_reason': 'Empty verified school agenda.', 'items': []}
                 metadata, fresh, calls = {}, self.calendar, 0
+                observe('planner', phase, 'empty_agenda', 'skipped')
             else:
                 plan = self.runtime.plan_agenda(snapshot)
+                observe('planner', phase, 'plan_returned', 'returned', item_count=_plan_item_count(plan))
                 metadata = getattr(self.runtime, 'last_agenda_metadata', None) or {}
                 # A Calendar edit during inference invalidates the same input.
-                fresh, calls = read_calendar(self.store, self.runtime), 1
+                phase = 'calendar_recheck'
+                fresh, calls = read_calendar(self.store, self.runtime, incident_operation=phase), 1
             metadata = {**metadata, 'source_count': checkpoint['source_count'],
                         'catalog_count': checkpoint['catalog_count'],
                         'input_bytes': metadata.get('input_bytes', checkpoint['input_bytes']) if cached else checkpoint['input_bytes'],
                         'request_hash': metadata.get('request_hash', checkpoint['request_hash']) if cached else checkpoint['request_hash']}
+            phase = 'materialize'
             result = materialize_plan(self.store, snapshot, plan, fresh, current=current, preview=preview, checkpoint=checkpoint,
                                       metadata={**metadata,
                                                 'source_collection_at': snapshot['observation']['last_collection_at'],
                                                 'sources_refreshed_by_preview': False} if preview else metadata)
+            reason, decision = ('plan_reused', 'reused') if result['reused'] else ('plan_committed', 'committed')
+            observe('planner', phase, reason, decision, mode=mode, item_count=len(result['items']))
             self.calendar = fresh
             return {**result, 'reused': result['reused'] or bool(cached), 'model_calls': calls,
                     'source_count': checkpoint['source_count'], 'input_bytes': metadata['input_bytes']}
         except Exception as error:
             from .health_state import error_code
             code = error_code(error, 'analysis')
+            emit('planner', 'run', 'phase_failed', 'failed', phase=phase, error_code=code, mode=mode)
             # Safe aggregate diagnostics only: never persist the private input.
             failure_metadata = ({'input_bytes': error.input_bytes, 'input_limit_bytes': error.input_limit_bytes,
                                  'section_bytes': error.section_bytes, 'source_count': error.source_count,
@@ -777,6 +953,11 @@ class AgendaPlanner:
                 self.store.db.execute('INSERT INTO agenda_plans VALUES (?,?,?,?,?,?,?)',
                     (digest(['agenda-failed', stamp]), locals().get('snapshot', {}).get('snapshot_hash', ''), '{}', json.dumps(failure_metadata), 'preview_failed' if preview else 'failed', stamp, code))
             raise
+
+
+def _plan_item_count(plan):
+    items = plan.get('items') if isinstance(plan, dict) else None
+    return len(items) if isinstance(items, list) else 0
 
 
 def agenda_summary(result):

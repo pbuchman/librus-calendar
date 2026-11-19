@@ -116,6 +116,23 @@ Open the **Librus synchronization diagnostics** chart (`librus_local.diagnostics
 
 Five optional nullable fields extend the existing version-1 aggregate schema: `calendar_probe_result`, `calendar_probe_attempts`, `calendar_probe_recovered`, `calendar_probe_retries_24h` and `calendar_probe_recoveries_24h`. Older exporters/collectors can ignore these additions, and the updated collector accepts older snapshots. Missing or null evidence is **no data**, not success or zero retries. The new `librus_local.calendar_probe` chart shows absolute rolling 24-hour retry-start and successful-recovery counts; it is informational and adds no alarm rules. A successful second probe attempt does not increment sync failure state. Update the installed collector and restart its worker to see the new chart.
 
+## Diagnose a synchronization alert
+
+Read the report on the application host. An alert can refer to a run that has already recovered. Use the alert time with its UTC offset to select the run. The report includes the first subsequent fully successful synchronization, if recorded.
+
+```sh
+release_python="$HOME/.local/lib/librus-calendar/current/.venv/bin/python"
+"$release_python" -I -m app.cli sync-diagnostics
+"$release_python" -I -m app.cli sync-diagnostics --at '2030-04-09T09:37:00+02:00'
+"$release_python" -I -m app.cli sync-diagnostics --run "$run_id"
+```
+
+The default selects the latest run with an incident. `--at` selects the last run with an incident by that time and returns its complete available history. `--run` also accepts successful runs. Use the local run ID returned by the first two commands. An explicit global `--state PATH` before the subcommand also works when runtime configuration is broken. The reader opens SQLite in read-only mode. It does not initialize the application database or contact either provider.
+
+Read events in order. Each records the stage, operation, last checkpoint, predicate, decision and structural evidence. Observations supply context for the incidents, including retries, verification and local journal outcomes. For a Calendar request mismatch compare the lifecycle records, the method, calendar equality, field types and the synthetic event lists. To reproduce a reordered batch, construct the requested and observed lists from those aliases and call the runtime validator with a fake connector. For a changed Librus response, use the fictional fragment supplied for a supported shape and exercise the corresponding parser with a fake response. The absence of a reproducible fragment, a timeout with no later observed step or an unrecognized shape leaves the underlying cause open.
+
+The private SQLite table `sync_incidents` follows the existing 90-day synchronization retention. Each stored report is limited to 32 KiB. Repeated identical events have a count and first/last timestamps. When the report is full it preserves the first and latest incident and counts omissions. A checkpoint can survive an interrupted worker. Older runs report their original stage, result and error with `detail_status=unavailable`. Pre-database startup failures identify their stage in the sync unit's systemd journal. Reports are local diagnostic input for offline tests, outside the Netdata export and Calendar write decisions.
+
 ## Calendar probe and safe diagnostics
 
 Before ordinary synchronization proceeds, a real read-only calendar-list probe verifies owner/writer access to the exact configured calendar. It makes at most two attempts, with a five-second delay before the second. A retry is permitted only for the structured unexpected completed tool-call-count error (zero or multiple) when all observed calls are the expected `list_calendars` read with the expected arguments. Unfinished calls, unexpected calls or arguments, mutations, malformed protocol/results, timeout, permissions failures and missing/non-writable calendars do not qualify. The second attempt has fresh per-call runtime state.

@@ -360,6 +360,9 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             CREATE INDEX IF NOT EXISTS operations_status ON operations(status);
             CREATE TABLE IF NOT EXISTS sync_runs(id TEXT PRIMARY KEY,started_at TEXT NOT NULL,finished_at TEXT,stage TEXT NOT NULL,result TEXT NOT NULL,error_code TEXT,duration_seconds REAL);
             CREATE INDEX IF NOT EXISTS sync_runs_started ON sync_runs(started_at);
+            CREATE TABLE IF NOT EXISTS sync_incidents(
+                run_id TEXT PRIMARY KEY REFERENCES sync_runs(id) ON DELETE CASCADE,
+                first_at TEXT,last_at TEXT,report TEXT NOT NULL CHECK(length(CAST(report AS BLOB))<=32768));
             CREATE TABLE IF NOT EXISTS calendar_probe_attempts(
                 sync_run_id TEXT NOT NULL REFERENCES sync_runs(id) ON DELETE CASCADE,
                 attempt_number INTEGER NOT NULL CHECK(attempt_number IN (1,2)),
@@ -462,6 +465,7 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             failures = int(self._setting('consecutive_sync_failures', '0')) + len(abandoned)
             self.db.execute("INSERT OR REPLACE INTO settings VALUES ('consecutive_sync_failures',?)", (str(failures),))
             cutoff = (datetime.fromisoformat(stamp) - timedelta(days=90)).isoformat()
+            self.db.execute('DELETE FROM sync_incidents WHERE run_id IN (SELECT id FROM sync_runs WHERE started_at<? AND finished_at IS NOT NULL)', (cutoff,))
             self.db.execute('DELETE FROM calendar_probe_attempts WHERE sync_run_id IN (SELECT id FROM sync_runs WHERE started_at<? AND finished_at IS NOT NULL)', (cutoff,))
             self.db.execute('DELETE FROM sync_runs WHERE started_at<? AND finished_at IS NOT NULL', (cutoff,))
             run_id = uuid.uuid4().hex
@@ -1120,8 +1124,32 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             metadata = self.db.execute("UPDATE metadata_refresh SET status='unknown',last_error='Interrupted metadata update; read-only reconciliation required.',updated_at=? WHERE status='inflight'", (utcnow(),))
             return cursor.rowcount + metadata.rowcount
 
-    def claim_operation(self, operation_id, expected_operation=None):
-        with self.lock, self.db:
+    def claim_operation(self, operation_id, expected_operation=None, *, incident_position=0):
+        from contextlib import contextmanager
+        from .incidents import active, checkpoint, emit, observe
+        from .planner_incidents import incident_error_code, operation_action
+
+        outcome = None
+        action = operation_action(expected_operation)
+
+        def selected(reason, decision='skipped', *, incident=False, **evidence):
+            nonlocal outcome
+            outcome = (emit if incident else observe, reason, decision, evidence)
+
+        @contextmanager
+        def report_after_commit():
+            try:
+                yield
+            except Exception as error:
+                emit('planner', 'claim', 'claim_transaction_failed', 'failed', action=action,
+                     position=incident_position, error_code=incident_error_code(error))
+                raise
+            if outcome is not None:
+                report, reason, decision, evidence = outcome
+                report('planner', 'claim', reason, decision, action=action, position=incident_position, **evidence)
+
+        checkpoint('planner', 'claim')
+        with report_after_commit(), self.lock, self.db:
             # A web approval uses another connection. Reserve the write lock
             # before reading either intent so stale approval cannot authorize a
             # different target, and legacy queued AI changes cannot bypass review.
@@ -1129,40 +1157,75 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                 self.db.execute('BEGIN IMMEDIATE')
             operation_row = self.db.execute("SELECT * FROM operations WHERE id=? AND status='pending'", (operation_id,)).fetchone()
             if not operation_row:
+                selected('operation_not_pending', incident=True)
                 return False
             proposal_row = self.db.execute("SELECT * FROM proposals WHERE id=? AND status='pending'", (operation_row['proposal_id'],)).fetchone()
             if not proposal_row:
+                selected('proposal_not_pending', incident=True)
                 return False
             item = self._proposal(proposal_row)
-            if self.source_mode_blocked(item) or self.source_write_deferred(item) or self._defer_changed_message_write(item):
+            if expected_operation is None:
+                action = operation_action({'action': item.get('kind')})
+            if self.source_mode_blocked(item):
+                selected('source_mode_blocked', 'deferred')
                 return False
-            group_reason = self._source_write_reason(item) or self._group_write_reason(item['id'])
-            if group_reason:
-                self._review_unwritten_locked(item, group_reason)
+            if self.source_write_deferred(item):
+                selected('source_write_deferred', 'deferred')
+                return False
+            if self._defer_changed_message_write(item):
+                selected('source_version_changed', 'deferred', incident=True)
+                return False
+            reason = self._source_write_reason(item)
+            if reason:
+                self._review_unwritten_locked(item, reason)
+                selected('source_authority_review', 'review')
+                return False
+            reason = self._group_write_reason(item['id'])
+            if reason:
+                self._review_unwritten_locked(item, reason)
+                selected('offer_decision_review', 'review')
                 return False
             operation = json.loads(operation_row['payload'])
             if expected_operation is not None and operation != expected_operation:
                 # A newer explicit edit keeps its pending intent. The caller's
                 # stale cached body cannot be executed under the reused ID.
+                selected('payload_changed', incident=True)
                 return False
-            if (operation.get('operation_id') != operation_id or operation.get('proposal_id') != item['id']
-                    or operation.get('calendar_id') != self.calendar_id or operation.get('action') != item.get('kind')
-                    or operation.get('event_id') != item.get('event_id')):
+            binding = {'operation_id': operation_id, 'proposal_id': item['id'], 'calendar_id': self.calendar_id,
+                       'action': item.get('kind'), 'event_id': item.get('event_id')}
+            changed_binding = [key for key, expected in binding.items() if operation.get(key) != expected]
+            if changed_binding:
                 self._review_unwritten_locked(item, 'Queued operation no longer matches the current action and target; review required.')
+                selected('target_binding_changed', 'review', incident=True, binding_fields=changed_binding)
                 return False
             from .data_admin import human_event_review_reason
             reason = human_event_review_reason(self, item)
             if reason:
                 self._review_unwritten_locked(item, reason)
+                selected('human_authority_review', 'review')
                 return False
             if self._setting('writes_paused', 'true') == 'true':
+                selected('writes_paused')
                 return False
             cursor = self.db.execute("""UPDATE operations SET status='inflight',attempts=attempts+1,updated_at=?
                 WHERE id=? AND status='pending'
                 AND EXISTS (SELECT 1 FROM proposals p WHERE p.id=operations.proposal_id AND p.status='pending')
                 AND NOT EXISTS (SELECT 1 FROM settings WHERE key='rebuild_status' AND value IN ('required','running','partial','interrupted'))
                 AND NOT EXISTS (SELECT 1 FROM calendar_discovery_review WHERE blocking=1)""", (utcnow(), operation_id))
-            return bool(cursor.rowcount)
+            claimed = bool(cursor.rowcount)
+            if claimed:
+                selected('claimed', 'committed')
+            elif active():
+                checks = []
+                try:
+                    blockers = self.db.execute("""SELECT
+                        EXISTS (SELECT 1 FROM settings WHERE key='rebuild_status' AND value IN ('required','running','partial','interrupted')),
+                        EXISTS (SELECT 1 FROM calendar_discovery_review WHERE blocking=1)""").fetchone()
+                    checks = [check for check, blocked in zip(('rebuild_clear', 'calendar_discovery_clear'), blockers) if blocked]
+                except sqlite3.Error:
+                    pass
+                selected('conditional_update_missed', incident=True, claim_checks=checks)
+            return claimed
 
     def hydrate_cancel_operation(self, operation_id, snapshot):
         """Freeze the verified full pre-delete snapshot before claiming a write."""
@@ -1199,10 +1262,19 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
              event_fingerprint(baseline, self.config.calendar_owner), operation['marker'], utcnow()))
         return bool(inserted.rowcount)
 
-    def record_result(self, operation_id, result, *, agenda_calendar=None, current=None):
+    def record_result(self, operation_id, result, *, agenda_calendar=None, current=None, incident_position=0):
+        from .incidents import checkpoint, emit, observe
+        from .planner_incidents import execution_code, execution_status, operation_action
+
+        runtime_status = execution_status(result)
+        runtime_code = execution_code(result)
+        journal_reason = 'result_recorded'
+        failed_checks = []
         if not isinstance(result, dict) or result.get('status') not in ('applied','review','unknown','failed'):
             result = {'status': 'unknown', 'error': 'Invalid execution result; possible external write.'}
+            journal_reason = 'invalid_runtime_result'
         status = result['status']
+        checkpoint('planner', 'journal')
         with self.lock, self.db:
             from .agenda import checkpoint_before_result, checkpoint_after_result
             advance_agenda = checkpoint_before_result(self, agenda_calendar, current)
@@ -1213,21 +1285,32 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
             if row['status'] == 'unknown' and status == 'failed':
                 result = {'status': 'unknown', 'error': 'Reconciliation cannot authorize retry after an ambiguous external write.'}
                 status = 'unknown'
+                journal_reason = 'reconcile_retry_blocked'
             if status == 'applied' and (not result.get('event_id') or not isinstance(result.get('snapshot'), dict)):
+                failed_checks.append('event_id_present' if not result.get('event_id') else 'snapshot_object')
                 result = {'status': 'unknown', 'error': 'Applied result did not include verified event evidence.'}
                 status = 'unknown'
+                journal_reason = 'missing_verified_event'
             if status == 'applied':
                 snapshot = result['snapshot']
                 owned_marker = operation['marker']
                 if operation['action'] == 'cancel':
-                    if result.get('event_id') != operation.get('event_id') or snapshot.get('id') != operation.get('event_id') or snapshot.get('status') != 'cancelled':
+                    target_matches = result.get('event_id') == operation.get('event_id')
+                    snapshot_matches = target_matches and snapshot.get('id') == operation.get('event_id')
+                    if not snapshot_matches or snapshot.get('status') != 'cancelled':
                         result = {'status': 'review', 'error': 'Cancellation lacks an exact verified target tombstone.'}
                         status = 'review'
+                        journal_reason = 'cancel_tombstone_mismatch'
+                        failed_checks.append('result_target_matches' if not target_matches else
+                                             'snapshot_target_matches' if not snapshot_matches else 'cancelled_status')
                     prior_event = self.db.execute('SELECT marker FROM events WHERE id=? AND calendar_id=?', (operation.get('event_id'), self.calendar_id)).fetchone()
                     owned_marker = prior_event[0] if prior_event else ''
-                if has_external_attendees(snapshot, self.config.calendar_owner) or not contains_marker(snapshot.get('description'), owned_marker):
+                attendees = has_external_attendees(snapshot, self.config.calendar_owner)
+                if attendees or not contains_marker(snapshot.get('description'), owned_marker):
                     result = {'status': 'review', 'error': 'Returned event has attendees or lacks application ownership.'}
                     status = 'review'
+                    journal_reason = 'ownership_or_attendee_mismatch'
+                    failed_checks.append('attendees_absent' if attendees else 'ownership_marker_present')
             if operation['action'] == 'create' and status in ('unknown', 'review') and result.get('event_id'):
                 # Definite identity survives a failed verification read and later approval.
                 operation['event_id'] = operation.get('event_id') or result['event_id']
@@ -1265,6 +1348,17 @@ class AppStore(SourceStoreMixin, ProposalGroupsMixin):
                 current_item=self._proposal(current_proposal)
                 self.db.execute('UPDATE canonical_actions SET payload=?,status=?,updated_at=? WHERE proposal_id=?',(json.dumps(current_item,ensure_ascii=False),current_item['status'],utcnow(),operation['proposal_id']))
             checkpoint_after_result(self, agenda_calendar, current, advance_agenda, result)
+
+        if row['status'] == 'unknown' and status == 'applied':
+            journal_reason = 'reconciled'
+        elif row['status'] == 'unknown' and status == 'review' and journal_reason == 'result_recorded':
+            journal_reason = 'reconcile_requires_review'
+        report = emit if journal_reason not in ('result_recorded', 'reconciled') or status in ('unknown', 'failed') else observe
+        prior = row['status']
+        report('planner', 'journal', journal_reason, 'committed', action=operation_action(operation),
+               position=incident_position, prior_status=prior if prior in ('pending', 'inflight', 'unknown', 'applied', 'review', 'superseded') else 'other',
+               runtime_status=runtime_status, runtime_code=runtime_code, result_status=status, journal_status=state,
+               journal_checks=failed_checks, baseline_advanced=bool(advance_agenda and status == 'applied'))
 
     def backup(self, destination=None):
         self.set_setting('last_backup_attempt_at', utcnow())

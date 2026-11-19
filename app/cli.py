@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import sqlite3
 import sys
 from .core import AppStore
 from .config import ConfigurationError, load_config
@@ -15,6 +16,10 @@ def main(argv=None, *, config=None):
     parser.add_argument('--state', type=Path)
     sub = parser.add_subparsers(dest='command', required=True)
     sub.add_parser('status')
+    diagnostic = sub.add_parser('sync-diagnostics', help='Read a sanitized incident report from local sync history.')
+    selection = diagnostic.add_mutually_exclusive_group()
+    selection.add_argument('--run', help='Exact sync run ID.')
+    selection.add_argument('--at', help='Last incident at or before this ISO timestamp with UTC offset.')
     sub.add_parser('preferences-status', help='Report opt-in learning status and example counts only.')
     preference = sub.add_parser('preferences-enable', help='Enable future human-choice examples using an explicit protected administrative boundary receipt; no Calendar access.')
     preference.add_argument('--receipt-file', type=Path, required=True)
@@ -56,7 +61,23 @@ def main(argv=None, *, config=None):
     args = parser.parse_args(argv)
     os.umask(0o077)
     store = None
+    startup_stage = 'configuration'
     try:
+        if args.command == 'sync-diagnostics':
+            from .incidents import read_incident
+            path = args.state
+            if path is None:
+                path = (config or load_config(args.config)).state_path
+            try:
+                report = read_incident(path, run=args.run, at=args.at)
+            except sqlite3.Error:
+                print(json.dumps({'status': 'unavailable', 'stage': 'incident_read'}))
+                return 1
+            except (ValueError, TypeError, KeyError, RecursionError):
+                print(json.dumps({'status': 'invalid_diagnostic_request_or_evidence'}))
+                return 2
+            print(json.dumps(report, ensure_ascii=True, indent=2))
+            return 0
         config = config if config is not None else load_config(args.config)
         if args.command in ('reanalyze', 'metadata-refresh'):
             def initialize_runtime():
@@ -71,7 +92,9 @@ def main(argv=None, *, config=None):
                 result = refresh_metadata(state_path, args.event_id, apply=args.apply, runtime_factory=initialize_runtime, config=config)
             print(json.dumps(result, ensure_ascii=True, indent=2))
             return 1 if result.get('status') in ('partial', 'failed', 'interrupted', 'refused', 'already_running') else 0
+        startup_stage = 'state_open'
         store = AppStore(args.state, config=config)
+        startup_stage = 'worker'
         if args.command == 'status':
             result = store.status()
         elif args.command in ('preferences-enable', 'preferences-status'):
@@ -161,13 +184,13 @@ def main(argv=None, *, config=None):
         print(json.dumps(result, ensure_ascii=True, indent=2))
         return 1 if result.get('status') in ('partial', 'failed', 'interrupted', 'review', 'already_running') else 0
     except ConfigurationError:
-        print(json.dumps({'status': 'configuration_required', 'private_response_logged': False}))
+        print(json.dumps({'status': 'configuration_required', 'stage': startup_stage, 'private_response_logged': False}))
         return 2
     except FileNotFoundError:
-        print(json.dumps({'status': 'missing_required_private_file', 'credentials_logged': False}))
+        print(json.dumps({'status': 'missing_required_private_file', 'stage': startup_stage, 'credentials_logged': False}))
         return 2
     except Exception as error:
-        print(json.dumps({'status': 'failed', 'error_type': type(error).__name__, 'private_response_logged': False}))
+        print(json.dumps({'status': 'failed', 'stage': startup_stage, 'error_type': type(error).__name__ if type(error) in (ValueError, OSError, RuntimeError) else 'other', 'private_response_logged': False}))
         return 1
     finally:
         if store is not None:

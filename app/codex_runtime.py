@@ -23,7 +23,9 @@ from zoneinfo import ZoneInfo
 
 import jsonschema
 
+from . import calendar_incidents as incident
 from .config import AppConfig, ConfigurationError, load_config
+from .incidents import active, checkpoint, emit, observe
 ANALYSIS_MODEL = "gpt-6.1-sol"
 ANALYSIS_EFFORT = "high"
 TOOL_MODEL = "gpt-6.1-sol"
@@ -152,8 +154,8 @@ def _result(status, *, event=None, event_id=None, error=None, owner_email=""):
 
 
 class CodexRuntime:
-    READ_TOOLS = frozenset({'list_calendars', 'search_events', 'list_events', 'read_event', 'batch_read_event', 'fetch'})
-    WRITE_TOOLS = frozenset({'create_event', 'update_event', 'delete_event'})
+    READ_TOOLS = incident.READ_TOOLS
+    WRITE_TOOLS = incident.WRITE_TOOLS
 
     def __init__(self, config=None, *, run_process=None, read_only=False):
         self.read_only = bool(read_only)
@@ -384,6 +386,21 @@ class CodexRuntime:
     def _tool_records(self, stdout, stderr, returncode, expected_tool, expected_args, write):
         """Fail closed on protocol ambiguity; retain only technical evidence counts."""
         calls, observed_ids, started_ids, completed_ids = [], set(), set(), set()
+        operation = incident.invocation_operation(expected_tool, getattr(self, '_invocation_schema', None))
+        diagnosing = active()
+        aliases = {}
+        problems = set()
+        unexpected_activity = set()
+        mismatches = 0
+        last_mismatch = None
+        updated = 0
+
+        def report_mismatch(method, arguments, status, kind, name_ok, args_ok):
+            emit('calendar', operation, 'request_mismatch', 'rejected',
+                 call=incident.count(self._logical_call_index), attempt=getattr(self, '_incident_attempt', 1),
+                 **incident.request_evidence(expected_args, method, arguments, status,
+                                             kind.removeprefix('item.'), name_ok, args_ok, aliases))
+
         metadata = dict(started_count=0, completed_count=0,
             parse_error_count=0, unknown_event_count=0, incomplete_count=0,
             expected_tool_name=True, expected_tool_arguments=True, process_code=returncode,
@@ -402,10 +419,12 @@ class CodexRuntime:
             try:
                 record = json.loads(line)
             except (ValueError, TypeError, RecursionError):
+                problems.add('record_json')
                 metadata['parse_error_count'] += 1
                 protocol_invalid = True
                 continue
             if not isinstance(record, dict) or not isinstance(record.get('type'), str):
+                problems.add('record_shape')
                 metadata['parse_error_count'] += 1
                 protocol_invalid = True
                 continue
@@ -421,16 +440,19 @@ class CodexRuntime:
                     metadata['definitive_turn_failure'] = _process_failure_code('', [hint])
                 continue
             if kind not in {'item.started', 'item.updated', 'item.completed'}:
+                problems.add('unknown_event')
                 metadata['unknown_event_count'] += 1
                 protocol_invalid = True
                 continue
             item = record.get('item')
             if not isinstance(item, dict) or not isinstance(item.get('type'), str):
+                problems.add('item_shape')
                 metadata['parse_error_count'] += 1
                 protocol_invalid = True
                 continue
             if expected_tool is None and item['type'] in TOOL_ACTIVITY:
                 metadata['unexpected_tool_activity'] = True
+                unexpected_activity.add(item['type'])
             if item['type'] in {'reasoning', 'agent_message'}:
                 if item['type'] == 'agent_message' and kind == 'item.completed':
                     previous = metadata['final_answer_classification']
@@ -442,6 +464,7 @@ class CodexRuntime:
                 error_hints.append(str(item.get('message') or item.get('error') or ''))
                 continue
             if item['type'] != 'mcp_tool_call':
+                problems.add('unknown_item')
                 metadata['unknown_event_count'] += 1
                 protocol_invalid = True
                 continue
@@ -449,22 +472,38 @@ class CodexRuntime:
             if isinstance(tool, str):
                 namespace, _, name = tool.partition('.')
                 observed_write |= namespace == 'google_calendar' and name in self.WRITE_TOOLS
-            if (not isinstance(tool, str) or not isinstance(item.get('arguments'), dict)
-                    or item.get('status') not in (None, 'in_progress', 'running', 'pending', 'completed', 'failed', 'cancelled')):
+            arguments = item.get('arguments', incident.MISSING)
+            status = item.get('status')
+            well_formed = (isinstance(tool, str) and isinstance(arguments, dict)
+                and status in (None, 'in_progress', 'running', 'pending', 'completed', 'failed', 'cancelled'))
+            name_ok, args_ok = incident.request_matches(expected_tool, expected_args, tool,
+                                                       arguments if well_formed else incident.MISSING)
+            if diagnosing and expected_tool is not None and not (name_ok and args_ok and well_formed):
+                mismatch = item.get('tool', incident.MISSING), arguments, status, kind, name_ok, args_ok
+                mismatches += 1
+                if mismatches < incident.LIMIT:
+                    report_mismatch(*mismatch)
+                else:
+                    # Reserve the final slot for the last mismatch, which can be
+                    # the accepted tool's eventual completion record.
+                    last_mismatch = mismatch
+            updated += kind == 'item.updated'
+            if not well_formed:
+                problems.add('tool_record')
                 metadata['parse_error_count'] += 1
                 protocol_invalid = True
                 continue
-            name_ok = expected_tool is not None and tool == 'google_calendar.' + expected_tool
-            args_ok = isinstance(item.get('arguments'), dict) and item['arguments'] == expected_args
             metadata['expected_tool_name'] &= name_ok
             metadata['expected_tool_arguments'] &= args_ok
             if item.get('error') is not None and not isinstance(item['error'], (dict, str)):
+                problems.add('error_shape')
                 metadata['parse_error_count'] += 1
                 protocol_invalid = True
             if item.get('error') is not None or item.get('status') in {'failed', 'cancelled'}:
                 tool_failed = True
             lifecycle_result = item.get('result')
             if lifecycle_result is not None and not isinstance(lifecycle_result, dict):
+                problems.add('result_shape')
                 metadata['parse_error_count'] += 1
                 protocol_invalid = True
             if isinstance(lifecycle_result, dict) and (lifecycle_result.get('isError') or lifecycle_result.get('is_error')):
@@ -477,18 +516,21 @@ class CodexRuntime:
             if isinstance(identity, str) and identity:
                 observed_ids.add(identity)
             if identity is not None and (not isinstance(identity, str) or not identity):
+                problems.add('identity_shape')
                 metadata['parse_error_count'] += 1
                 protocol_invalid = True
             elif kind == 'item.started':
                 metadata['started_count'] += 1
                 if identity:
                     if identity in started_ids:
+                        problems.add('duplicate_lifecycle_id')
                         protocol_invalid = True
                     started_ids.add(identity)
             elif kind == 'item.completed':
                 metadata['completed_count'] += 1
                 if identity:
                     if identity in completed_ids:
+                        problems.add('duplicate_lifecycle_id')
                         protocol_invalid = True
                     completed_ids.add(identity)
                 calls.append(item)
@@ -509,7 +551,20 @@ class CodexRuntime:
                 metadata['incomplete_count'] += 1
         metadata['incomplete_count'] += max(len(observed_ids - completed_ids),
             max(0, metadata['started_count'] - metadata['completed_count']))
+        if last_mismatch is not None:
+            report_mismatch(*last_mismatch)
+        if mismatches > incident.LIMIT:
+            emit('calendar', operation, 'request_mismatch_limit', 'rejected', omitted=incident.count(mismatches - incident.LIMIT))
+        for activity in sorted(unexpected_activity):
+            emit('calendar', operation, 'analysis_tool_activity', 'rejected', activity=activity)
+        metadata['observed_calendar_write'] = observed_write
         if protocol_invalid:
+            emit('calendar', operation, 'protocol_invalid', 'rejected',
+                 parse_errors=incident.count(metadata['parse_error_count']),
+                 unknown_events=incident.count(metadata['unknown_event_count']),
+                 started=incident.count(metadata['started_count']), updated=incident.count(updated),
+                 completed=incident.count(metadata['completed_count']), problems=sorted(problems),
+                 possible_write=write or observed_write)
             raise RuntimeFailure('codex_protocol_invalid', possible_write=write or observed_write)
         # Tool results and agent messages can contain school/calendar text. Only
         # protocol error fields and process stderr may classify process failures.
@@ -523,29 +578,55 @@ class CodexRuntime:
             hint = json.dumps([item.get('error') or item.get('result') for item in calls
                 if item.get('error') or isinstance(item.get('result'), dict) and (item['result'].get('isError') or item['result'].get('is_error'))]).lower()
             code = 'calendar_event_not_found' if expected_tool in {'fetch', 'read_event'} and any(x in hint for x in ('not found', '404', '410', 'gone')) else 'calendar_tool_failed'
+            self._report_tool_result_failure(operation, 'lifecycle_error', code)
             raise RuntimeFailure(code, possible_write=write or observed_write)
         if metadata['incomplete_count']:
+            if expected_tool is not None:
+                self._report_protocol_count(operation, metadata, updated, write or observed_write)
             raise RuntimeFailure('calendar_tool_incomplete', possible_write=write or observed_write)
         for call in calls:
             data = self._tool_result(call, expected_tool, write or observed_write)
             if expected_tool == 'list_calendars' and expected_args == {'max_results': 100}:
                 self._probe_target(data)
         if len(calls) != 1:
+            if expected_tool is not None:
+                self._report_protocol_count(operation, metadata, updated, write or observed_write)
             raise RuntimeFailure('unexpected_tool_count', possible_write=write or observed_write,
                 retryable_probe=(expected_tool == 'list_calendars' and expected_args == {'max_results': 100}))
         return calls
 
+    @staticmethod
+    def _report_protocol_count(operation, metadata, updated, possible_write):
+        emit('calendar', operation, 'protocol_count', 'rejected',
+             started=incident.count(metadata['started_count']), updated=incident.count(updated),
+             completed=incident.count(metadata['completed_count']), incomplete=incident.count(metadata['incomplete_count']),
+             turn_completed=metadata['turn_completed'], possible_write=possible_write,
+             final_answer=metadata['final_answer_classification'])
+
+    @staticmethod
+    def _report_tool_result_failure(operation, shape, code, **details):
+        # A verified absent entry is a successful deletion read-back.
+        record = observe if code == 'calendar_event_not_found' else emit
+        record('calendar', operation, 'tool_result_rejected', 'rejected', shape=shape, code=code, **details)
+
     def _tool_result(self, call, expected_tool, write):
+        operation = incident.invocation_operation(expected_tool)
         raw = call.get('result')
         if not isinstance(raw, dict):
+            emit('calendar', operation, 'tool_result_rejected', 'rejected',
+                 shape='result_object', code='calendar_result_unreadable', payload_type=incident.value_type(raw))
             raise RuntimeFailure('calendar_result_unreadable', possible_write=write)
         data = raw.get('structured_content', raw.get('structuredContent'))
         if data is None:
             content = raw.get('content')
             if not isinstance(content, list) or any(not isinstance(part, dict) for part in content):
+                emit('calendar', operation, 'tool_result_rejected', 'rejected',
+                     shape='content_parts', code='calendar_result_unreadable', payload_type=incident.value_type(content))
                 raise RuntimeFailure('calendar_result_unreadable', possible_write=write)
             texts = [part.get('text', '') for part in content if part.get('type') == 'text']
             if any(not isinstance(text, str) for text in texts):
+                emit('calendar', operation, 'tool_result_rejected', 'rejected',
+                     shape='text_part', code='calendar_result_unreadable')
                 raise RuntimeFailure('calendar_result_unreadable', possible_write=write)
             try:
                 data = json.loads('\n'.join(texts))
@@ -555,19 +636,29 @@ class CodexRuntime:
                     data = {'result': None}
                 else:
                     code = 'calendar_event_not_found' if expected_tool in {'fetch', 'read_event'} and re.search(r'\b(?:404|410)\b|not found|\bgone\b', '\n'.join(texts).lower()) else 'calendar_result_unreadable'
+                    shape = 'text_status_error' if code == 'calendar_event_not_found' else 'text_invalid_json'
+                    self._report_tool_result_failure(operation, shape, code)
                     raise RuntimeFailure(code, possible_write=write) from None
         if isinstance(data, dict) and (data.get('error') or data.get('errors')):
             hint = json.dumps(data).lower()
             code = 'calendar_event_not_found' if expected_tool in {'fetch', 'read_event'} and any(x in hint for x in ('not found', '404', '410', 'gone')) else 'calendar_tool_failed'
+            self._report_tool_result_failure(operation, 'structured_error', code,
+                                             fields=incident.field_types(data, incident.RESPONSE_FIELDS))
             raise RuntimeFailure(code, possible_write=write)
         return data
 
     def _probe_target(self, data):
         calendars = data.get('calendars') if isinstance(data, dict) else None
         if not isinstance(calendars, list) or any(not isinstance(item, dict) for item in calendars):
+            emit('calendar', 'list_calendars', 'tool_result_rejected', 'rejected',
+                 shape='calendar_list_shape', code='calendar_result_unreadable',
+                 fields=incident.field_types(data, incident.RESPONSE_FIELDS))
             raise RuntimeFailure('calendar_result_unreadable')
         target = next((item for item in calendars if item.get('id') == self.config.calendar_id), None)
         if not target or target.get('access_role', target.get('accessRole')) not in {'owner', 'writer'}:
+            emit('calendar', 'list_calendars', 'tool_result_rejected', 'rejected',
+                 shape='access_missing', code='calendar_write_access_missing',
+                 fields=incident.field_types(target, incident.RESPONSE_FIELDS))
             raise RuntimeFailure('calendar_write_access_missing')
         return target
 
@@ -642,9 +733,11 @@ class CodexRuntime:
             operation = expected_tool if expected_tool in self.READ_TOOLS | self.WRITE_TOOLS else 'other_tool'
             safe = self.READ_TOOLS.issuperset(tools)
         else:
-            operation = 'agenda_plan' if schema == 'agenda_plan.json' else 'tool_free'
+            operation = incident.invocation_operation(None, schema)
             safe = operation == 'agenda_plan'
+        prior_failure = None
         for attempt in (1, 2):
+            self._incident_attempt = attempt
             started = time.monotonic()
             started_at = datetime.now(timezone.utc)
             requested = len(expected_args['event_ids']) if batch else 1
@@ -668,6 +761,7 @@ class CodexRuntime:
             state = 'failed'
             try:
                 with self._probe_attempt(attempt) if probe else nullcontext():
+                    checkpoint('calendar', operation)
                     result = self._invoke_once(prompt, schema, tools, expected_tool, expected_args)
                     if validate is not None:
                         validate(result)
@@ -720,7 +814,21 @@ class CodexRuntime:
                             self._process_observation.optional('finalize', 'audit_failed')
                             self.last_invocation_metadata['process_observation'] = self._process_observation.summary()
                         raise
+                recovery = prior_failure if state == 'completed' else None
+                if state != 'completed' or recovery is not None:
+                    trigger, code = recovery or (metadata['retry_reason'], metadata.get('error_code'))
+                    decision = ('recovered' if metadata['recovered'] else 'completed_after_retry') if recovery else metadata['retry_decision']
+                    record = observe if recovery or code == 'calendar_event_not_found' else emit
+                    record('calendar', operation, 'invocation', decision, trigger=trigger,
+                           attempt=attempt, call=incident.count(self._logical_call_index),
+                           code=incident.failure_code(code), started=incident.count(metadata['started_count']),
+                           completed=incident.count(metadata['completed_count']),
+                           observed_write=bool(evidence.get('observed_calendar_write')),
+                           possible_write=(trigger == 'possible_write' or
+                                           state == 'interrupted' and (not safe or bool(evidence.get('observed_calendar_write')))))
             # A failed durable completion raises above and cannot reach this wait.
+            prior_failure = metadata['retry_reason'], metadata.get('error_code')
+            checkpoint('calendar', operation)
             self._wait_to_retry()
 
     def _invoke_once(self, prompt, schema, tools=(), expected_tool=None, expected_args=None):
@@ -730,6 +838,7 @@ class CodexRuntime:
             write = bool(self.WRITE_TOOLS.intersection(tools))
             self._invocation_model, self._invocation_effort = ((self.config.tool_model, self.config.tool_effort) if tools
                 else (self.config.analysis_model, self.config.analysis_effort))
+            self._invocation_schema = schema
             self._active_tool_request = (expected_tool, expected_args, write) if tools else None
             try:
                 returncode, stdout, stderr = self.run_process(args, prompt, self._process_timeout(self.timeout))
@@ -746,6 +855,7 @@ class CodexRuntime:
             self._process_timeout(self.timeout)
             calls = self._tool_records(stdout, stderr, returncode, expected_tool, expected_args, write) if tools else []
             messages = []
+            operation = incident.invocation_operation(expected_tool, schema)
             observed_write = False
             protocol_failure, error_hints = False, []
             for line in (() if tools else stdout.splitlines()):
@@ -772,17 +882,19 @@ class CodexRuntime:
                 if item.get("type") == "mcp_tool_call" and record.get("type") == "item.completed":
                     calls.append(item)
                 if item.get("type") in TOOL_ACTIVITY - {'mcp_tool_call'}:
+                    emit('calendar', operation, 'analysis_tool_activity', 'rejected', activity=item['type'])
                     raise RuntimeFailure("unexpected_tool", possible_write=write)
             process_failure = _process_failure_code(stderr, error_hints) if not tools else None
             if returncode or protocol_failure or process_failure:
                 raise RuntimeFailure(process_failure or 'codex_failed', possible_write=observed_write)
             if not tools and calls:
+                emit('calendar', operation, 'analysis_tool_activity', 'rejected', activity='mcp_tool_call')
                 raise RuntimeFailure("analysis_tool_forbidden")
             if tools:
                 if len(calls) != 1:
                     raise RuntimeFailure("unexpected_tool_count", possible_write=write)
                 call = calls[0]
-                if call.get("tool") != "google_calendar." + expected_tool or call.get("arguments") != expected_args:
+                if not all(incident.request_matches(expected_tool, expected_args, call.get("tool"), call.get("arguments"))):
                     raise RuntimeFailure("unexpected_tool_arguments", possible_write=write)
                 if call.get("error"):
                     hint = json.dumps(call["error"]).lower()
@@ -791,10 +903,22 @@ class CodexRuntime:
                 data = self._tool_result(call, expected_tool, write)
                 self.last_evidence.append({"tool": call["tool"], "calendar_id": expected_args.get("calendar_id"), "verified": True})
                 return data
+            if not messages:
+                emit('calendar', operation, 'analysis_missing', 'rejected')
+                raise RuntimeFailure("invalid_analysis_json")
             try:
                 result = json.loads(messages[-1])
+            except ValueError:
+                emit('calendar', operation, 'analysis_json', 'rejected', output_type=incident.value_type(messages[-1]))
+                raise RuntimeFailure("invalid_analysis_json")
+            except (TypeError, RecursionError):
+                emit('calendar', operation, 'analysis_json', 'rejected', output_type=incident.value_type(messages[-1]))
+                raise
+            try:
                 jsonschema.validate(result, json.loads((SCHEMAS / schema).read_text()))
-            except (ValueError, IndexError, jsonschema.ValidationError, jsonschema.SchemaError):
+            except (ValueError, jsonschema.ValidationError, jsonschema.SchemaError) as error:
+                if active():
+                    emit('calendar', operation, 'analysis_schema', 'rejected', **incident.schema_error(error))
                 raise RuntimeFailure("invalid_analysis_json")
             return result
 
@@ -884,7 +1008,7 @@ class CodexRuntime:
         validate = self._tool_response_validator
         if validate is None and name == 'read_event' and 'event_id' in arguments:
             def validate(data):
-                self._validate_read_identity(self._event_from(data), arguments['event_id'])
+                self._validate_read_identity(self._event_from(data), arguments['event_id'], data=data)
         elif validate is None and name == 'search_events':
             def validate(data):
                 self._search_page(data, arguments)
@@ -941,6 +1065,7 @@ class CodexRuntime:
         if self._version is not None or self._injected_runner:
             return self._version
         try:
+            checkpoint('calendar', 'list_calendars')
             result = subprocess.run([self.binary, '--version'], capture_output=True, text=True,
                 timeout=self._process_timeout(5), env={key: os.environ[key] for key in ('HOME', 'PATH') if key in os.environ})
         except (OSError, subprocess.SubprocessError):
@@ -989,6 +1114,7 @@ class CodexRuntime:
     def _validate_read_batch(self, data, requested, expected_events):
         responses = data.get('responses') if isinstance(data, dict) else None
         if not isinstance(responses, list) or len(responses) != len(requested):
+            self._report_batch_rejection(data, responses, requested, 'response_count')
             raise RuntimeFailure('agenda_calendar_snapshot_incomplete')
         batch = {}
         anonymous_errors = any(isinstance(event, dict) and 'error' in event for event in responses)
@@ -999,13 +1125,40 @@ class CodexRuntime:
             if (not isinstance(event, dict) or not isinstance(event.get('id'), str)
                     or event['id'] not in requested or event['id'] in batch
                     or anonymous_errors and event['id'] != requested[position]):
+                if active():
+                    error_id = event.get('id') if isinstance(event, dict) else None
+                    rule = ('id_shape' if not isinstance(error_id, str)
+                            else 'unknown_id' if error_id not in requested
+                            else 'duplicate_id' if error_id in batch else 'anonymous_order')
+                    self._report_batch_rejection(data, responses, requested, rule, position)
                 raise RuntimeFailure('agenda_calendar_snapshot_invalid')
             if event.get('error') or event.get('errors') or not self._event_from(event):
+                self._report_batch_rejection(data, responses, requested, 'unreadable_dto', position)
                 raise RuntimeFailure('calendar_result_unreadable')
             batch[event['id']] = self._normalize_read_event(event, event['id'], expected_events[event['id']])
         if set(batch) != set(requested):
+            self._report_batch_rejection(data, responses, requested, 'coverage')
             raise RuntimeFailure('agenda_calendar_snapshot_incomplete')
         return batch
+
+    def _report_batch_rejection(self, data, responses, requested, rule, position=None):
+        if not active():
+            return
+        response_type = incident.value_type(data.get('responses', incident.MISSING) if isinstance(data, dict) else incident.MISSING)
+        observed = responses if isinstance(responses, list) else []
+        forms = [self._batch_error_shape(row, reporting=True) for row in observed[:incident.LIMIT]]
+        shapes = [shape for shape, _, _ in forms]
+        bindings = {index: shape for index, shape in enumerate(shapes) if shape in incident.NOT_FOUND}
+        ids = [row.get('id', incident.MISSING) if isinstance(row, dict) else None for row in observed[:incident.LIMIT]]
+        relation = incident.id_relationship(requested, ids, observed_type=response_type, bindings=bindings,
+                                            observed_count=len(observed))
+        row = observed[position] if position is not None else None
+        emit('calendar', 'batch_read_event', 'batch_rejected', 'rejected', rule=rule,
+             event_ids=relation, fields=incident.field_types(row, incident.RESPONSE_FIELDS), anonymous_shapes=shapes,
+             position=0 if position is None else incident.count(position + 1),
+             payload_type=incident.value_type(data), response_type=response_type,
+             not_found_statuses=[dict(position=index, envelope=outer, body=body)
+                                 for index, (_, outer, body) in enumerate(forms, 1) if outer is not None])
 
     @staticmethod
     def _batch_not_found(value):
@@ -1015,29 +1168,51 @@ class CodexRuntime:
         association is admitted only when all successful siblings verify that
         ordering; a reordered mixed batch is rejected by read_events.
         """
-        if (not isinstance(value, dict) or set(value) != {'error', 'detail'}
-                or value['error'] != 'Failed to read event' or not isinstance(value['detail'], str)):
-            return False
+        shape, _, _ = CodexRuntime._batch_error_shape(value)
+        return shape in incident.NOT_FOUND
+
+    @staticmethod
+    def _batch_error_shape(value, *, reporting=False):
+        if not isinstance(value, dict) or 'error' not in value:
+            return 'none', None, None
+        if (value.keys() != {'error', 'detail'} or value['error'] != 'Failed to read event'
+                or not isinstance(value['detail'], str)):
+            return 'unrecognized_fields', None, None
+        if reporting and len(value['detail']) > 32768:
+            return 'detail_oversize', None, None
         match = re.fullmatch(r'(404|410): HTTP request failed \(Response:\s*(\{.*\})\s*\)', value['detail'], re.S)
         if not match:
-            return False
+            return 'unrecognized_detail', None, None
+        outer = match.group(1)
         try:
             payload = json.loads(match.group(2))
         except (ValueError, TypeError):
-            return False
+            return 'invalid_body_json', outer, 'missing'
+        except RecursionError:
+            if reporting:
+                return 'invalid_body_json', outer, 'missing'
+            raise
         error = payload.get('error') if isinstance(payload, dict) and set(payload) == {'error'} else None
-        return (isinstance(error, dict) and set(error) == {'errors','code','message'}
-                and type(error['code']) is int and error['code'] == int(match.group(1))
-                and isinstance(error['message'], str) and isinstance(error['errors'], list)
-                and bool(error['errors']) and all(isinstance(item, dict)
+        code = error.get('code', incident.MISSING) if isinstance(error, dict) else incident.MISSING
+        body = (str(code) if type(code) is int and code in {404, 410} else
+                'other' if type(code) is int else 'missing' if code is incident.MISSING else 'wrong_type')
+        if not (isinstance(error, dict) and set(error) == {'errors','code','message'}
+                and type(code) is int and isinstance(error['message'], str)
+                and isinstance(error['errors'], list) and bool(error['errors'])
+                and all(isinstance(item, dict)
                     and set(item) == {'domain','reason','message'}
-                    and all(isinstance(field, str) for field in item.values()) for item in error['errors']))
+                    and all(isinstance(field, str) for field in item.values()) for item in error['errors'])):
+            return 'invalid_body_shape', outer, body
+        if code != int(outer):
+            return 'code_mismatch', outer, body
+        return 'not_found_' + outer, outer, body
 
     @staticmethod
     def _search_page(data, arguments, seen_tokens=(), *, last_page=False):
         events = data.get('events', data.get('items')) if isinstance(data, dict) else None
         if not isinstance(events, list) or any(not isinstance(event, dict) or
                 not isinstance(event.get('id'), str) or not event['id'] for event in events):
+            CodexRuntime._report_search_rejection(data, 'search_event_shape')
             raise RuntimeFailure('calendar_search_incomplete')
         fields = ('next_page_token', 'nextPageToken')
         tokens = [data[key] for key in fields if key in data]
@@ -1045,14 +1220,21 @@ class CodexRuntime:
             # A full page without a continuation contract cannot prove that all
             # matching ownership state was discovered.
             if len(events) >= arguments.get('max_results', 100):
+                CodexRuntime._report_search_rejection(data, 'search_page_unproven')
                 raise RuntimeFailure('calendar_search_incomplete')
             return events, None
         token = tokens[0]
         if (token is not None and not isinstance(token, str)
                 or any(value != token for value in tokens)
                 or token and (last_page or token in seen_tokens or token == arguments.get('next_page_token'))):
+            CodexRuntime._report_search_rejection(data, 'search_token_invalid')
             raise RuntimeFailure('calendar_search_incomplete')
         return events, token
+
+    @staticmethod
+    def _report_search_rejection(data, shape):
+        emit('calendar', 'search_events', 'tool_result_rejected', 'rejected',
+             shape=shape, code='calendar_search_incomplete', fields=incident.field_types(data, incident.RESPONSE_FIELDS))
 
     def _search_pages(self, arguments, max_pages):
         tokens = set()
@@ -1092,17 +1274,24 @@ class CodexRuntime:
         # fetch's current all-day projection loses dates. read_event preserves
         # them as naive midnight strings; interpret those only with all-day context.
         data = self._tool("read_event", {"calendar_id": self.config.calendar_id, "event_id": event_id})
-        return self._normalize_read_event(self._event_from(data), event_id, expected_event)
+        event = self._event_from(data)
+        return self._normalize_read_event(event, event_id, expected_event, data=data)
 
     @staticmethod
-    def _validate_read_identity(event, event_id):
+    def _validate_read_identity(event, event_id, *, data=None):
         if not event:
+            emit('calendar', 'read_event', 'tool_result_rejected', 'rejected',
+                 shape='read_dto', code='calendar_event_missing',
+                 fields=incident.field_types(data, incident.RESPONSE_FIELDS), payload_type=incident.value_type(data))
             raise RuntimeFailure("calendar_event_missing")
         if event.get("id") != event_id:
+            emit('calendar', 'read_event', 'tool_result_rejected', 'rejected',
+                 shape='read_identity', code='calendar_event_id_mismatch',
+                 event_ids=incident.id_relationship([event_id], [event.get('id', incident.MISSING)]))
             raise RuntimeFailure("calendar_event_id_mismatch")
 
-    def _normalize_read_event(self, event, event_id, expected_event=None):
-        self._validate_read_identity(event, event_id)
+    def _normalize_read_event(self, event, event_id, expected_event=None, *, data=None):
+        self._validate_read_identity(event, event_id, data=data)
         expected = normalize_event(expected_event, owner_email=self.config.calendar_owner) if expected_event else {}
         all_day_context = (event.get('all_day') is True or (expected_event and expected_event.get('all_day') is not False and
                            (expected_event.get('all_day') is True or
@@ -1226,8 +1415,15 @@ class CodexRuntime:
             return _result("failed", error=exc.code if isinstance(exc, RuntimeFailure) else "invalid_operation", owner_email=self.config.calendar_owner)
         written = False
         event_id = operation.get("event_id")
+        action = operation["action"]
+        method = {"create": "create_event", "update": "update_event", "cancel": "delete_event"}[action]
+
+        def verified_write(status, check, *, details=None, **result):
+            record = observe if status == 'applied' else emit
+            record('calendar', method, 'write_verification', status, check=check, **(details or {}))
+            return _result(status, owner_email=self.config.calendar_owner, **result)
+
         try:
-            action = operation["action"]
             desired = operation["event"]
             if action == "create":
                 if event_id:
@@ -1284,34 +1480,43 @@ class CodexRuntime:
                 if operation.get("reviewed_create") and current_fingerprint == event_fingerprint(desired, owner_email=self.config.calendar_owner):
                     return {**_result("applied", event=current, owner_email=self.config.calendar_owner), "reconciled": True}
             if action == "cancel":
-                self._tool("delete_event", {"calendar_id": self.config.calendar_id, "event_id": operation["event_id"]})
+                self._tool(method, {"calendar_id": self.config.calendar_id, "event_id": operation["event_id"]})
                 written = True
+                observe('calendar', method, 'write_dispatch', 'acknowledged')
+                check = 'cancelled'
                 try:
                     after = self._fetch(operation["event_id"], operation.get("prior_snapshot") or desired)
                 except RuntimeFailure as exc:
                     if exc.code != "calendar_event_not_found":
                         raise
+                    check = 'not_found'
                     after = dict(current, status="cancelled")
                 if after.get("status") != "cancelled":
-                    return _result("unknown", event=after, error="delete_verification_failed", owner_email=self.config.calendar_owner)
+                    return verified_write("unknown", "delete_still_present", event=after, error="delete_verification_failed")
                 after = dict(current, status="cancelled")
-                return _result("applied", event=after, owner_email=self.config.calendar_owner)
-            result = self._tool("create_event" if action == "create" else "update_event", self._write_args(operation))
+                return verified_write("applied", check, event=after)
+            result = self._tool(method, self._write_args(operation))
             written = True
+            observe('calendar', method, 'write_dispatch', 'acknowledged')
             event = self._event_from(result)
             returned_id = (event or {}).get("id")
             if event_id and returned_id and returned_id != event_id:
-                return _result("unknown", event_id=event_id, error="calendar_event_id_mismatch", owner_email=self.config.calendar_owner)
+                return verified_write("unknown", "returned_id_mismatch", event_id=event_id, error="calendar_event_id_mismatch",
+                                      details={'event_ids': incident.id_relationship([event_id], [returned_id])})
             event_id = event_id or returned_id
             if not event_id:
-                return _result("unknown", error="write_id_missing", owner_email=self.config.calendar_owner)
+                return verified_write("unknown", "missing_id", error="write_id_missing")
             fetched = self._fetch(event_id, desired)
             if not marker_present(fetched.get("description"), operation["marker"]):
-                return _result("unknown", event=fetched, error="write_marker_missing", owner_email=self.config.calendar_owner)
+                return verified_write("unknown", "marker_missing", event=fetched, error="write_marker_missing")
             if fetched.get("status") == "cancelled":
-                return _result("review", event=fetched, error="event_deleted_or_unavailable", owner_email=self.config.calendar_owner)
+                return verified_write("review", "event_cancelled", event=fetched, error="event_deleted_or_unavailable")
             if event_fingerprint(fetched, owner_email=self.config.calendar_owner) != event_fingerprint(desired, owner_email=self.config.calendar_owner):
-                return _result("review", event=fetched, error="write_verification_mismatch", owner_email=self.config.calendar_owner)
-            return _result("applied", event=fetched, owner_email=self.config.calendar_owner)
+                return verified_write("review", "fingerprint_mismatch", event=fetched, error="write_verification_mismatch")
+            return verified_write("applied", "read_back", event=fetched)
         except RuntimeFailure as exc:
-            return _result("unknown" if written or exc.possible_write or operation.get("reconcile_only") else "failed", event_id=event_id, error=exc.code, owner_email=self.config.calendar_owner)
+            if written or exc.possible_write:
+                return verified_write("unknown", "read_failed" if written else "dispatch_uncertain", event_id=event_id,
+                                      error=exc.code, details={'code': incident.failure_code(exc.code)})
+            return _result("unknown" if operation.get("reconcile_only") else "failed",
+                           event_id=event_id, error=exc.code, owner_email=self.config.calendar_owner)

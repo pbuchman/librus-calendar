@@ -13,7 +13,7 @@ import json
 from datetime import datetime
 from contextlib import nullcontext
 
-from .agenda import assemble_agenda_snapshot, agenda_prompt
+from .agenda import assemble_agenda_snapshot, agenda_prompt, reject_stale_agenda
 from .core import digest
 
 INCREMENTAL_VERSION = 'simple-agenda-v9-school-reconfirmation'
@@ -178,16 +178,19 @@ def commit_processed_sources(store, snapshot, contract, plan_id, stamp):
     """Called only inside materialization's checked write transaction."""
     versions = {source['source_id']: source for source in contract['processed_versions']}
     selected = {source['id']: source_version(source) for source in snapshot['sources']}
-    if versions != selected or contract['local_state_hash'] != snapshot['snapshot_hash']:
-        from .codex_runtime import RuntimeFailure
-        raise RuntimeFailure('agenda_plan_stale')
+    failed = []
+    if versions != selected:
+        failed.append('ledger_contract_versions')
+    if contract['local_state_hash'] != snapshot['snapshot_hash']:
+        failed.append('ledger_contract_hash')
+    if failed:
+        reject_stale_agenda(*failed)
     records = {sid: {'version': version, 'plan_id': plan_id} for sid, version in versions.items()}
     records.update({sid: value for sid, value in contract['bootstrap_versions'].items() if sid not in records})
-    for sid, record in records.items():
+    for position, (sid, record) in enumerate(records.items(), 1):
         source = store.get_source(sid)
         if not source or source_version(source) != record['version']:
-            from .codex_runtime import RuntimeFailure
-            raise RuntimeFailure('agenda_plan_stale')
+            reject_stale_agenda('ledger_source_version' if source else 'ledger_source_present', source_position=position)
         version = record['version']
         store.db.execute('INSERT OR REPLACE INTO agenda_processed_sources VALUES (?,?,?,?,?)',
             (sid, digest(version), json.dumps(version, sort_keys=True), record['plan_id'], stamp))

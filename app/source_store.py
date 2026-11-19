@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import re
 import uuid
+from .source_incidents import classified, shape, source_step
 from .source_preview import (SOURCE_PREVIEW_PLANNER_VERSION, PREVIEW_RETRY_SETTINGS,
                              current_preview_sql, preview_is_current, preview_queue_sql)
 
@@ -178,16 +179,30 @@ class SourceStoreMixin:
 
     def ingest_sources(self, batch, current=None):
         """Accept only the selected learner; incomplete collection never deletes rows."""
+        with source_step('source_ingest', 'reject_batch'):
+            return self._ingest_sources(batch, current)
+
+    def _ingest_sources(self, batch, current):
         from .core import digest, utcnow
         if not isinstance(batch,dict) or not isinstance(batch.get('sources'),list) or len(batch['sources'])>5000:
-            raise ValueError('Invalid bounded source collection.')
+            rows = batch.get('sources') if isinstance(batch, dict) else batch
+            actual = 'above_limit' if isinstance(rows, list) and len(rows) > 5000 else shape(rows)
+            raise classified(ValueError('Invalid bounded source collection.'), 'source_batch_shape',
+                             expected='bounded_batch', actual=actual)
         learner = batch.get('learner') or {}
         learner_id = str(learner.get('id') or '')
         class_id = str(learner.get('class_id') or '')
         expected = self.config.learner_id or self._setting('source_learner_id')
         expected_class = self.config.class_id
         if not learner_id or (expected and learner_id != expected) or (expected_class and class_id != expected_class):
-            raise ValueError('Selected learner context could not be verified.')
+            if not learner_id:
+                expected_binding, actual = 'bound_learner', 'missing_identity'
+            elif expected and learner_id != expected:
+                expected_binding, actual = 'bound_learner', 'other_learner'
+            else:
+                expected_binding, actual = 'bound_class', 'other_class'
+            raise classified(ValueError('Selected learner context could not be verified.'), 'source_context_mismatch',
+                             expected=expected_binding, actual=actual)
         # Validate every row before persisting any source. Observed context is a
         # pin, never permission to switch to a different learner on a later run.
         clean = []
@@ -195,21 +210,35 @@ class SourceStoreMixin:
         for data in batch['sources']:
             kind = data.get('kind') if isinstance(data,dict) else None
             if kind not in KINDS-{'message'} or str(data.get('learner_id') or '') != learner_id:
-                raise ValueError('Source learner or kind mismatch.')
+                if not isinstance(data, dict):
+                    expected_row, actual = 'source_row', shape(data)
+                elif kind not in KINDS-{'message'}:
+                    expected_row, actual = 'source_kind', 'unknown_kind'
+                else:
+                    expected_row = 'bound_learner'
+                    actual = 'other_learner' if data.get('learner_id') else 'missing_identity'
+                raise classified(ValueError('Source learner or kind mismatch.'), 'source_row_shape',
+                                 expected=expected_row, actual=actual)
             upstream = str(data.get('upstream_id') or '').strip()
-            sid = source_identity(kind,upstream,learner_id)
+            try:
+                sid = source_identity(kind,upstream,learner_id)
+            except ValueError as error:
+                raise classified(error, 'source_identity_invalid', expected='stable_identity', actual='missing_identity')
             if sid in seen:
-                raise ValueError('Duplicate source identity.')
+                raise classified(ValueError('Duplicate source identity.'), 'source_identity_duplicate',
+                                 expected='stable_identity', actual='duplicate_identity')
             seen.add(sid)
             payload = {key:data.get(key) for key in ('title','sender','published_at','updated_at','text','url','metadata')}
             payload.update(id=sid,kind=kind,upstream_id=upstream,learner_id=learner_id,deleted=data.get('deleted') is True)
             for field in ('title','sender','text','url'):
                 payload[field] = str(payload.get(field) or '')
             if len(payload['text'])>100000 or not isinstance(payload['metadata'],dict):
-                raise ValueError('Invalid source body.')
+                actual = 'above_limit' if len(payload['text']) > 100000 else shape(payload['metadata'])
+                raise classified(ValueError('Invalid source body.'), 'source_body_shape', expected='source_body', actual=actual)
             from .source_audience import AUDIENCE_KEY,valid_calendar_audience
             if AUDIENCE_KEY in payload['metadata']and not valid_calendar_audience(payload,learner):
-                raise ValueError('Invalid observed calendar audience proof.')
+                raise classified(ValueError('Invalid observed calendar audience proof.'), 'source_audience_invalid',
+                                 expected='valid_audience', actual='invalid_audience')
             # Fetch timestamps / pagination positions are observation metadata,
             # not a content edit that warrants another model invocation.
             hashed_payload = {k:v for k,v in payload.items() if k!='metadata'}
