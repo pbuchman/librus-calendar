@@ -19,6 +19,7 @@ from urllib.parse import urljoin, urlsplit
 from zoneinfo import ZoneInfo
 
 from .librus_client import MAX_BODY, PocError, TextOnly, clean_text, html_to_text
+from .source_incidents import classified, note_http_request, note_http_response, shape, source_step
 
 ORIGIN = 'https://synergia.librus.pl'
 WARSAW = ZoneInfo('Europe/Warsaw')
@@ -45,6 +46,10 @@ class SourceCollectionError(PocError):
 
 
 from .health_state import SOURCE_ERROR_CODES
+
+
+def _structural_error(code, expected, actual, **evidence):
+    return classified(SourceCollectionError(code), code, expected=expected, actual=actual, **evidence)
 
 
 class Node:
@@ -88,11 +93,12 @@ class Document(HTMLParser):
         self.root, self.closed_html = Node(), False
         self.current = self.root
         if not isinstance(html, str) or len(html.encode('utf-8')) > MAX_BODY:
-            raise SourceCollectionError('source_response_limit')
+            raise _structural_error('source_response_limit', 'complete_html_document',
+                                    'above_limit' if isinstance(html, str) else shape(html))
         self.feed(html)
         self.close()
         if not self.closed_html or len(list(self.root.walk('html'))) != 1 or len(list(self.root.walk('body'))) != 1:
-            raise SourceCollectionError('source_markup_invalid')
+            raise _structural_error('source_markup_invalid', 'complete_html_document', 'other')
 
     def handle_starttag(self, tag, attrs):
         node = Node(tag, attrs, self.current)
@@ -145,7 +151,7 @@ def _fields(table):
         if len(cells) == 2:
             key = _label(cells[0].text())
             if key in fields:
-                raise SourceCollectionError('source_fields_ambiguous')
+                raise _structural_error('source_fields_ambiguous', 'single_field_value', 'conflicting_values')
             fields[key] = cells[1]
     return fields
 
@@ -154,23 +160,23 @@ def _date(value, *, with_time=False):
     value = _norm(value)
     pattern = r'\d{4}-\d{2}-\d{2}(?: \d{2}:\d{2}(?::\d{2})?)?' if with_time else r'\d{4}-\d{2}-\d{2}'
     if not re.fullmatch(pattern, value):
-        raise SourceCollectionError('source_date_invalid')
+        raise _structural_error('source_date_invalid', 'valid_date', 'invalid_date')
     try:
         if ' ' in value:
             return datetime.fromisoformat(value).replace(tzinfo=WARSAW).isoformat()
         return date.fromisoformat(value).isoformat()
     except ValueError:
-        raise SourceCollectionError('source_date_invalid') from None
+        raise _structural_error('source_date_invalid', 'valid_date', 'invalid_date') from None
 
 
 def _no_pagination(document, path):
     for node in document.root.walk():
         if node.has_class('pagination') or node.has_class('pager') or node.attrs.get('rel') == 'next':
-            raise SourceCollectionError('source_pagination_unsupported')
+            raise _structural_error('source_pagination_unsupported', 'unpaginated_view', 'pagination_detected')
         href = node.attrs.get('href', '')
         parsed = urlsplit(urljoin(ORIGIN, href))
         if parsed.path.rstrip('/') == path and parsed.query:
-            raise SourceCollectionError('source_pagination_unsupported')
+            raise _structural_error('source_pagination_unsupported', 'unpaginated_view', 'pagination_detected')
 
 
 def _unprocessed_media_counts(node):
@@ -194,27 +200,35 @@ def parse_announcements(html, *, learner_id, fetched_at):
     if not tables:
         if _norm(next(doc.root.walk('body')).text()).casefold() == 'brak ogłoszeń':
             return []
-        raise SourceCollectionError('announcement_markup_invalid')
+        raise _structural_error('announcement_markup_invalid', 'announcement_table', 'missing')
     if len(tables) > MAX_ANNOUNCEMENTS:
-        raise SourceCollectionError('announcement_limit')
+        raise classified(SourceCollectionError('announcement_limit'), 'announcement_limit',
+                         limit=MAX_ANNOUNCEMENTS, observed_count=len(tables))
+    expected_fields = {'dodał': 'announcement_sender', 'data publikacji': 'announcement_publication',
+                       'treść': 'announcement_body'}
     result, seen = [], set()
     for table in tables:
         fields = _fields(table)
-        if not {'dodał', 'data publikacji', 'treść'} <= fields.keys():
-            raise SourceCollectionError('announcement_markup_invalid')
+        missing = expected_fields.keys() - fields.keys()
+        if missing:
+            raise _structural_error('announcement_markup_invalid', 'announcement_table', 'missing_fields',
+                                    expected_fields=list(expected_fields.values()),
+                                    missing_fields=sorted(expected_fields[key] for key in missing),
+                                    unknown_count=len(fields.keys() - expected_fields.keys()))
         titles = [cells[0].text() for cells in _rows(table)
                   if len(cells) == 1 and cells[0].attrs.get('colspan') == '2' and cells[0].text()]
         if len(titles) != 1:
-            raise SourceCollectionError('announcement_markup_invalid')
+            raise classified(SourceCollectionError('announcement_markup_invalid'), 'announcement_markup_invalid',
+                             expected='one_title', expected_count=1, observed_count=len(titles))
         title, sender = _norm(titles[0]), _norm(fields['dodał'].text())
         published = _date(fields['data publikacji'].text())
         if not title or not sender:
-            raise SourceCollectionError('announcement_markup_invalid')
+            raise _structural_error('announcement_markup_invalid', 'title_and_sender', 'empty')
         upstream_id = 'metadata:' + _digest([title, sender, published])
         if upstream_id in seen:
             # A duplicate metadata identity can represent two independent
             # announcements. Neither duplicate nor collision is safe to merge.
-            raise SourceCollectionError('announcement_identity_ambiguous')
+            raise _structural_error('announcement_identity_ambiguous', 'stable_identity', 'duplicate_identity')
         seen.add(upstream_id)
         body = fields['treść'].text()
         result.append({'id': 'announcement:' + upstream_id, 'kind': 'announcement',
@@ -242,16 +256,18 @@ def parse_learner_context(html):
                 continue
             value = _norm(cells[1].text())
             if key in observed and observed[key] != value:
-                raise SourceCollectionError('learner_context_ambiguous')
+                raise _structural_error('learner_context_ambiguous', 'single_profile_value', 'conflicting_values')
             observed[key] = value
     name = observed.get('imię i nazwisko ucznia') or observed.get('imię i nazwisko') or _norm(observed.get('imię', '') + ' ' + observed.get('nazwisko', ''))
     class_name = observed.get('klasa') or observed.get('oddział')
     school = observed.get('szkoła') or observed.get('nazwa szkoły')
     provider_id = observed.get('identyfikator ucznia') or observed.get('id ucznia')
     if not name or not class_name or (not provider_id and not school):
-        raise SourceCollectionError('learner_context_unverified')
+        fields = {'learner_name': name, 'learner_class': class_name, 'learner_identity_basis': provider_id or school}
+        raise _structural_error('learner_context_unverified', 'learner_profile', 'missing_fields',
+                                expected_fields=list(fields), missing_fields=[key for key, value in fields.items() if not value])
     if provider_id and not re.fullmatch(r'[A-Za-z0-9_-]{1,100}', provider_id):
-        raise SourceCollectionError('learner_context_unverified')
+        raise _structural_error('learner_context_unverified', 'valid_provider_identity', 'other')
     learner_id = 'synergia:student:' + provider_id if provider_id else 'synergia:profile:' + _digest([name, school])
     class_match = re.search(r'(?<!\d)(1[0-3]|[1-9])\s*([a-z])\b', class_name, re.I)
     class_id = (class_match.group(1) + class_match.group(2)).lower() if class_match else _norm(class_name).casefold()
@@ -259,6 +275,16 @@ def parse_learner_context(html):
             'name': name, 'school': school,
             'identity_basis': 'provider_id' if provider_id else 'profile_name_school',
             'selected_only': True}
+
+
+def _verify_observed_learner(expected, observed):
+    if observed == expected:
+        return
+    roles = {'id': 'learner_identity', 'name': 'learner_name', 'class_id': 'learner_class',
+             'class_name': 'learner_class', 'school': 'learner_school', 'identity_basis': 'learner_identity_basis'}
+    changed = {role for key, role in roles.items() if observed.get(key) != expected.get(key)} if isinstance(expected, dict) else set()
+    actual = 'other_learner' if 'learner_identity' in changed else 'context_changed'
+    raise _structural_error('learner_context_changed', 'bound_learner', actual, changed_fields=sorted(changed))
 
 
 def _form_action_category(form):
@@ -323,6 +349,11 @@ def _calendar_form(doc, private_form_sink=None):
         return _validated_calendar_form(doc)
     except SourceCollectionError as error:
         if error.diagnostic_code.startswith('calendar_form_'):
+            try:
+                structure = error.evidence or _calendar_forms_evidence(list(doc.root.walk('form')))
+                classified(error, error.diagnostic_code, expected='calendar_form', structure=structure)
+            except Exception:
+                pass
             error.private_capture_status = 'not_configured'
             if private_form_sink is not None:
                 try:
@@ -468,20 +499,21 @@ def parse_calendar_month(html, *, start, end, private_form_sink=None):
     form = _calendar_form(doc, private_form_sink)
     tables = [node for node in doc.root.walk('table') if node.has_class('kalendarz')]
     if len(tables) != 1:
-        raise SourceCollectionError('calendar_markup_invalid')
+        raise classified(SourceCollectionError('calendar_markup_invalid'), 'calendar_markup_invalid',
+                         expected='one_calendar_table', expected_count=1, observed_count=len(tables))
     days, entries = set(), []
     for day in tables[0].walk('div'):
         if not day.has_class('kalendarz-dzien'):
             continue
         match = re.match(r'\s*(\d{1,2})(?:\D|$)', day.text())
         if not match:
-            raise SourceCollectionError('calendar_markup_invalid')
+            raise _structural_error('calendar_markup_invalid', 'valid_calendar_day', 'missing')
         try:
             when = date(form['year'], form['month'], int(match.group(1)))
         except ValueError:
-            raise SourceCollectionError('calendar_date_invalid') from None
+            raise _structural_error('calendar_date_invalid', 'valid_calendar_day', 'invalid_date') from None
         if when.day in days:
-            raise SourceCollectionError('calendar_markup_invalid')
+            raise _structural_error('calendar_markup_invalid', 'unique_calendar_day', 'duplicate_calendar_day')
         days.add(when.day)
         for cell in day.walk('td'):
             title = _norm(cell.text())
@@ -496,13 +528,19 @@ def parse_calendar_month(html, *, start, end, private_form_sink=None):
             # type label inside a validated calendar event cell, not prose.
             is_substitution = bool(re.search(r'zastępstwo', title, re.I)) or _is_cancellation_notice(cell, day)
             if onclick and not match:
-                raise SourceCollectionError('calendar_detail_route_invalid', evidence=_calendar_cell_evidence(cell, day))
+                structure = _calendar_cell_evidence(cell, day)
+                raise classified(SourceCollectionError('calendar_detail_route_invalid', evidence=structure),
+                                 'calendar_detail_route_invalid', expected='calendar_detail_action',
+                                 actual='unexpected_detail_action', structure=structure)
             # Historical calendar entries can remain visible after their detail
             # action disappears. Accept only their observed event-cell shape,
             # retaining an explicitly ambiguous metadata identity for review.
             is_unlinked_event = (cell.has_class('no-border-left') and cell.has_class('no-border-right'))
             if not match and not is_substitution and not is_unlinked_event:
-                raise SourceCollectionError('calendar_identity_unverified', evidence=_calendar_cell_evidence(cell, day))
+                structure = _calendar_cell_evidence(cell, day)
+                raise classified(SourceCollectionError('calendar_identity_unverified', evidence=structure),
+                                 'calendar_identity_unverified', expected='calendar_event_cell',
+                                 actual='unknown_event_cell', structure=structure)
             tooltip = html_to_text(cell.attrs.get('title', ''))
             published = re.search(r'Data dodania:\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?)', tooltip, re.I)
             published = _date(published.group(1), with_time=True) if published else None
@@ -513,14 +551,18 @@ def parse_calendar_month(html, *, start, end, private_form_sink=None):
                             'published_at': published, 'detail_path': match.group(1) if match else None})
             if len(entries) > MAX_CALENDAR_ITEMS:
                 raise SourceCollectionError('calendar_limit')
-    if days != set(range(1, monthrange(form['year'], form['month'])[1] + 1)):
-        raise SourceCollectionError('calendar_month_incomplete')
+    expected_days = monthrange(form['year'], form['month'])[1]
+    if days != set(range(1, expected_days + 1)):
+        raise _structural_error('calendar_month_incomplete', 'full_month', 'incomplete_month',
+                                expected_count=expected_days, observed_count=len(days))
     return form, entries
 
 
 def parse_calendar_detail(html, *, holiday=False):
     doc = Document(html)
-    allowed = {'data', 'data dodania', 'nauczyciel', 'nr lekcji', 'opis', 'przedmiot', 'rodzaj', 'zakres'}
+    roles = {'data': 'detail_date', 'data dodania': 'detail_publication', 'nauczyciel': 'detail_teacher',
+             'nr lekcji': 'detail_lesson', 'opis': 'detail_description', 'przedmiot': 'detail_subject',
+             'rodzaj': 'detail_type', 'zakres': 'detail_scope'}
     candidates = []
     for table in doc.root.walk('table'):
         fields = _fields(table)
@@ -528,13 +570,16 @@ def parse_calendar_detail(html, *, holiday=False):
         if recognized:
             candidates.append(fields)
     if len(candidates) != 1:
-        raise SourceCollectionError('calendar_detail_markup_invalid')
+        raise classified(SourceCollectionError('calendar_detail_markup_invalid'), 'calendar_detail_markup_invalid',
+                         expected='one_detail_table', expected_count=1, observed_count=len(candidates))
     fields = candidates[0]
-    if any(key not in allowed for key in fields):
-        raise SourceCollectionError('calendar_detail_markup_invalid')
+    if not fields.keys() <= roles.keys():
+        raise _structural_error('calendar_detail_markup_invalid', 'one_detail_table', 'unknown_fields',
+                                observed_fields=sorted(roles[key] for key in fields if key in roles))
     result = {key: node.text() for key, node in fields.items()}
     if not holiday and not result['data']:
-        raise SourceCollectionError('calendar_detail_markup_invalid')
+        raise _structural_error('calendar_detail_markup_invalid', 'one_detail_table', 'empty',
+                                missing_fields=['detail_date'])
     if 'data dodania' in result:
         result['published_at'] = _date(result['data dodania'], with_time=True)
     return result
@@ -550,27 +595,39 @@ def _trusted_view_url(value,path):
 
 
 def _checked_response(response,path):
-    if (getattr(response,'status_code',None)!=200 or getattr(response,'is_redirect',False)
-            or not _trusted_view_url(getattr(response,'url',''),path)):
-        raise SourceCollectionError('source_session_invalid', http_status=getattr(response, 'status_code', None))
+    status = getattr(response, 'status_code', None)
+    if (status != 200 or (redirected := getattr(response, 'is_redirect', False))
+            or not _trusted_view_url(getattr(response, 'url', ''), path)):
+        evidence = {}
+        if type(status) is int and 100 <= status <= 599:
+            evidence['http_status'] = status
+        actual = 'unexpected_status' if status != 200 else 'redirect_response' if redirected else 'unexpected_destination'
+        raise classified(SourceCollectionError('source_session_invalid', http_status=status), 'source_session_invalid',
+                         expected='trusted_response', actual=actual, **evidence)
     return response.text
 
 
 def _read(client, path):
-    return _checked_response(client.follow(ORIGIN + path),path)
+    note_http_request('GET')
+    response = client.follow(ORIGIN + path)
+    note_http_response(response, 'GET')
+    return _checked_response(response, path)
 
 
 def _select_month(client, form, year, month):
     try:
         if str(month) not in form['choices']['miesiac'] or str(year) not in form['choices']['rok']:
-            raise SourceCollectionError('calendar_window_unsupported')
+            raise _structural_error('calendar_window_unsupported', 'available_selection', 'unsupported_selection')
         data = dict(form['hidden'], miesiac=str(month), rok=str(year))
+        note_http_request('POST')
         response = client.request('POST', ORIGIN + '/terminarz', data=data)
+        note_http_response(response, 'POST')
         html=_checked_response(response,'/terminarz')
         # A successful POST is not proof that the view changed. Parse and verify it.
         selected = _calendar_form(Document(html), getattr(client, 'private_form_diagnostic_sink', None))
         if (selected['year'], selected['month']) != (year, month):
-            raise SourceCollectionError('calendar_selection_failed')
+            raise _structural_error('calendar_selection_failed', 'selected_month', 'different_selection',
+                                    year_matches=selected['year'] == year, month_matches=selected['month'] == month)
         return html, selected
     except Exception as error:
         error.collection_step = 'calendar_select'
@@ -608,41 +665,48 @@ def collect_calendar(client, *, learner_id, fetched_at, start, end, learner=None
     sink = getattr(client, 'collection_diagnostic_sink', None)
     private_sink = getattr(client, 'private_form_diagnostic_sink', None)
     with collection_attempt(sink, collection_step='calendar_initial'):
-        html = _read(client, '/terminarz')
-        form, unused = parse_calendar_month(html, start=start, end=end, private_form_sink=private_sink)
+        with source_step('calendar_initial', 'skip_kind', step='read_calendar'):
+            html = _read(client, '/terminarz')
+            form, unused = parse_calendar_month(html, start=start, end=end, private_form_sink=private_sink)
     original = (form['year'], form['month'])
     moved = False
     result, seen, holidays = [], set(), {}
     primary_error = None
     try:
-        with collection_attempt(sink, collection_step='calendar_collect'):
+        with collection_attempt(sink, collection_step='calendar_collect'), source_step('calendar_scan', 'skip_kind'):
             for year, month in _months(start, end):
                 selected = False
                 if (form['year'], form['month']) != (year, month):
                     # A failed POST may still change the session view. Restore in
                     # finally even when parsing/verifying its response failed.
                     moved = True
-                    html, form = _select_month(client, form, year, month)
+                    with source_step('calendar_select', 'skip_kind', step='select_month'):
+                        html, form = _select_month(client, form, year, month)
                     selected = True
                 try:
-                    form, entries = parse_calendar_month(html, start=start, end=end, private_form_sink=private_sink)
+                    operation = 'calendar_select' if selected else 'calendar_scan'
+                    with source_step(operation, 'skip_kind', step='read_calendar'):
+                        form, entries = parse_calendar_month(html, start=start, end=end, private_form_sink=private_sink)
                 except SourceCollectionError as error:
                     if selected:
                         error.collection_step = 'calendar_select'
                     raise
-                if learner is not None and parse_learner_context(_read(client,'/informacja'))!=learner:
-                    raise SourceCollectionError('learner_context_changed')
+                if learner is not None:
+                    with source_step('calendar_scan', 'skip_kind', step='verify_learner'):
+                        _verify_observed_learner(learner, parse_learner_context(_read(client, '/informacja')))
                 for entry in entries:
                     identity = entry['kind'] + ':' + entry['upstream_id']
                     holiday = entry['detail_path'] is not None and entry['upstream_id'].startswith('holiday:')
                     if identity in seen and not holiday:
-                        raise SourceCollectionError('calendar_identity_ambiguous')
+                        raise _structural_error('calendar_identity_ambiguous', 'stable_identity', 'duplicate_identity')
                     seen.add(identity)
-                    detail = parse_calendar_detail(_read(client, entry['detail_path']),
-                        holiday=entry['upstream_id'].startswith('holiday:')) if entry['detail_path'] else {}
+                    detail = {}
+                    if entry['detail_path']:
+                        with source_step('calendar_detail', 'skip_kind', step='read_detail'):
+                            detail = parse_calendar_detail(_read(client, entry['detail_path']), holiday=holiday)
+                            if detail.get('published_at') and entry['published_at'] and detail['published_at'] != entry['published_at']:
+                                raise _structural_error('calendar_publication_ambiguous', 'matching_publication', 'different_publication')
                     publication = detail.get('published_at') or entry['published_at']
-                    if detail.get('published_at') and entry['published_at'] and detail['published_at'] != entry['published_at']:
-                        raise SourceCollectionError('calendar_publication_ambiguous')
                     body = '\n'.join(f'{key}: {value}' for key, value in detail.items() if key != 'published_at') or entry['tooltip'] or entry['title']
                     metadata = {'identity_basis': 'provider_id' if entry['detail_path'] else 'metadata_key',
                                 'identity_ambiguous': not bool(entry['detail_path']),
@@ -661,7 +725,7 @@ def collect_calendar(client, *, learner_id, fetched_at, start, end, learner=None
                             previous, previous_signature = holidays[identity]
                             if (previous_signature != signature
                                     or entry['event_start'] in previous['metadata']['event_dates']):
-                                raise SourceCollectionError('calendar_identity_ambiguous')
+                                raise _structural_error('calendar_identity_ambiguous', 'stable_identity', 'duplicate_identity')
                             _set_holiday_dates(previous, previous['metadata']['event_dates'] + [entry['event_start']], body)
                             continue
                         _set_holiday_dates(source, [entry['event_start']], body)
@@ -678,11 +742,14 @@ def collect_calendar(client, *, learner_id, fetched_at, start, end, learner=None
                 with collection_attempt(sink, collection_step='calendar_restore'):
                     # Obtain fresh form state after a failed request; never replay an
                     # earlier requestkey. Restore only this temporary session's view.
-                    latest_html = _read(client, '/terminarz')
-                    latest = _calendar_form(Document(latest_html), private_sink)
+                    primary_failed = primary_error is not None
+                    with source_step('calendar_restore', 'restore_failed', step='restore_view', primary_failed=primary_failed):
+                        latest_html = _read(client, '/terminarz')
+                        latest = _calendar_form(Document(latest_html), private_sink)
                     if (latest['year'], latest['month']) != original:
                         try:
-                            _select_month(client, latest, *original)
+                            with source_step('calendar_restore', 'restore_failed', step='select_month', primary_failed=primary_failed):
+                                _select_month(client, latest, *original)
                         except Exception as error:
                             raise SourceCollectionError('calendar_restore_failed',
                                 diagnostic_code=getattr(error, 'diagnostic_code', 'calendar_restore_failed'),
@@ -690,8 +757,9 @@ def collect_calendar(client, *, learner_id, fetched_at, start, end, learner=None
                                 evidence=failure_diagnostic(error).get('evidence'),
                                 private_capture_status=getattr(error, 'private_capture_status', None),
                                 private_capture_id=getattr(error, 'private_capture_id', None)) from None
-                    if learner is not None and parse_learner_context(_read(client,'/informacja'))!=learner:
-                        raise SourceCollectionError('learner_context_changed')
+                    if learner is not None:
+                        with source_step('calendar_restore', 'restore_failed', step='verify_learner', primary_failed=primary_failed):
+                            _verify_observed_learner(learner, parse_learner_context(_read(client, '/informacja')))
             except Exception:
                 if primary_error is None:
                     raise
@@ -715,8 +783,10 @@ def collect_sources(client, *, current=None, past_days=30, future_days=60):
     sink = getattr(client, 'collection_diagnostic_sink', None)
     try:
         with collection_attempt(sink, collection_step='learner'):
-            _read(client, '/rodzic/index')
-            learner = parse_learner_context(_read(client, '/informacja'))
+            with source_step('learner_profile', 'abort_collection', step='open_view'):
+                _read(client, '/rodzic/index')
+            with source_step('learner_profile', 'abort_collection', step='read_profile'):
+                learner = parse_learner_context(_read(client, '/informacja'))
             result['learner'] = learner
     except Exception as error:
         code = error.code if isinstance(error, SourceCollectionError) else 'learner_collection_failed'
@@ -731,7 +801,8 @@ def collect_sources(client, *, current=None, past_days=30, future_days=60):
         try:
             if kinds == ('announcement',):
                 with collection_attempt(sink, source_kind='announcement', collection_step='announcement'):
-                    sources = collect()
+                    with source_step('announcement', 'skip_kind', step='read_announcement'):
+                        sources = collect()
             else:
                 sources = collect()
             result['sources'].extend(sources)
@@ -742,9 +813,10 @@ def collect_sources(client, *, current=None, past_days=30, future_days=60):
             result['kind_errors'].update({kind: code for kind in kinds})
     try:
         with collection_attempt(sink, collection_step='learner_check'):
-            _read(client,'/rodzic/index')
-            if parse_learner_context(_read(client, '/informacja')) != learner:
-                raise SourceCollectionError('learner_context_changed')
+            with source_step('learner_recheck', 'discard_batch', step='open_view'):
+                _read(client, '/rodzic/index')
+            with source_step('learner_recheck', 'discard_batch', step='verify_learner'):
+                _verify_observed_learner(learner, parse_learner_context(_read(client, '/informacja')))
     except Exception as error:
         result['sources'], result['complete_kinds'] = [], []
         code = error.code if isinstance(error, SourceCollectionError) else 'learner_collection_failed'

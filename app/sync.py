@@ -4,10 +4,12 @@ from contextlib import contextmanager
 import fcntl
 import os
 import signal
+import sqlite3
 import threading
 import time
 from pathlib import Path
 from .core import AppStore, WARSAW, analysis_metadata, as_datetime, digest, utcnow
+from . import incidents
 from .health_state import ERROR_CODES, error_code, collection_attempt
 
 DISCOVERY_CURSOR_VERSION = '3'
@@ -90,9 +92,20 @@ class SyncController:
     def _stage(self, stage):
         self.stage = stage
         self.store.sync_stage(self.run_id, stage)
+        if stage != 'complete':
+            incidents.checkpoint('sync', stage)
 
-    def _collection_diagnostic(self, item):
+    def _record_attempt(self, item):
         self.store.record_sync_diagnostic(self.run_id, dict(item, phase=self.stage))
+        code = item.get('error_code')
+        if item['state'] in ('failed', 'interrupted') and code:
+            counts = {k: item[k] for k in ('attempt_number', 'logical_call_index', 'batch_index') if k in item}
+            decision = 'retry' if item.get('retry_decision') == 'retry' else 'rejected'
+            record = incidents.observe if code == 'calendar_event_not_found' else incidents.emit
+            record('sync', self.stage, code, decision, **counts)
+        elif item.get('recovered'):
+            incidents.observe('sync', self.stage, 'retry_succeeded', 'recovered',
+                              logical_call_index=item['logical_call_index'], attempt_number=item['attempt_number'])
 
     def _in_window(self, value, cutoff):
         if not value:
@@ -132,15 +145,23 @@ class SyncController:
 
         def get_page(number):
             nonlocal list_failed
+            incidents.checkpoint('sync', 'message_page')
             try:
-                with collection_attempt(self._collection_diagnostic, source_kind='message', collection_step='message_list'):
+                with collection_attempt(self._record_attempt, source_kind='message', collection_step='message_list'):
                     snippets, total = self.client.messages(limit=page_size, page=number)
                     if not isinstance(snippets, list) or len(snippets) > page_size or any(not isinstance(s, dict) for s in snippets):
+                        actual = ('not_array' if not isinstance(snippets, list) else
+                                  'above_limit' if len(snippets) > page_size else 'item_not_object')
+                        incidents.emit('source', 'message_discovery', 'message_page_shape', 'abort_page',
+                                       expected='array_of_objects', actual=actual, limit=page_size)
                         raise DiscoveryParsingError('Unexpected inbox page schema.')
             except Exception as error:
                 result.update(status='partial', error_code=error_code(error, 'discovery'), error_stage='discovery')
+                incidents.emit('sync', 'message_page', result['error_code'], 'rejected', page=number, limit=page_size, offset=offset)
                 list_failed = True
                 return None, None
+            incidents.observe('sync', 'message_page', 'page_observed', 'continue',
+                              page=number, limit=page_size, offset=offset, returned=len(snippets))
             result['listed'] += len(snippets)
             return snippets, total
 
@@ -148,6 +169,8 @@ class SyncController:
             try:
                 message_id = self.store.note_discovered(snippet)
             except ValueError:
+                incidents.emit('source', 'message_discovery', 'message_identity_missing', 'skip_row',
+                               expected='stable_identity', actual='missing_identity')
                 result['fetch_failures'] += 1
                 result.update(error_code='fetch_failed', error_stage='discovery')
                 return None
@@ -174,6 +197,8 @@ class SyncController:
                     # With no shared ID, the old page number cannot anchor a resume.
                     known = set(preceding)
                     if known.isdisjoint(current_boundary):
+                        incidents.observe('sync', 'message_scan', 'page_boundary_changed', 'restart_scan',
+                                          page=page, expected_count=len(preceding), observed_count=len(current_boundary))
                         page, offset, prefix, preceding = 1, 0, '', []
                         boundary_lost = True
                     else:
@@ -196,6 +221,8 @@ class SyncController:
             ids = [snippet_id(snippet) for snippet in snippets]
             if offset and (offset > len(snippets) or digest(ids[:offset]) != prefix):
                 # A shifted page can put unseen messages before the old offset.
+                incidents.observe('sync', 'message_scan', 'page_prefix_changed', 'restart_page',
+                                  page=page, offset=offset, returned=len(snippets))
                 offset = 0
             eligible = [self._in_window(snippet.get('sendDate'), cutoff) for snippet in snippets]
             while offset < len(snippets):
@@ -226,6 +253,8 @@ class SyncController:
                 (('discovery_page', str(page)), ('discovery_page_offset', str(offset)),
                  ('discovery_page_prefix', prefix), ('discovery_preceding_page', ' '.join(preceding)),
                  ('discovery_retry_turn', next_turn)))
+        incidents.observe('sync', 'message_scan', 'scan_complete' if finished else 'scan_budget' if not list_failed else 'discovery_failed',
+                          'continue', page=page, offset=offset, selected=len(selected))
         return selected, snippets_by_id, finished, list_failed
 
     def _source_collection(self, current):
@@ -236,7 +265,7 @@ class SyncController:
         try:
             from .calendar_form_diagnostics import PrivateFormCapture
             self.client.private_form_diagnostic_sink = PrivateFormCapture(self.store.path)
-            self.client.collection_diagnostic_sink = self._collection_diagnostic if getattr(self, 'run_id', None) else previous_sink
+            self.client.collection_diagnostic_sink = self._record_attempt if getattr(self, 'run_id', None) else previous_sink
             batch = self.client.collect_sources(current=current, past_days=30, future_days=60)
             return self.store.ingest_sources(batch, current)
         except Exception as error:
@@ -246,6 +275,7 @@ class SyncController:
             failures = batch.get('kind_errors', {}) if isinstance(batch, dict) else {}
             code = getattr(error, 'code', None)
             fallback = code if isinstance(code, str) and code in SOURCE_ERROR_CODES else 'source_collection_failed'
+            incidents.emit('sync', 'analysis', fallback, 'rejected')
             safe = {kind: value for kind, value in failures.items()
                     if kind in KINDS and isinstance(value, str) and value in SOURCE_ERROR_CODES} if isinstance(failures, dict) else {}
             with self.store.lock, self.store.db:
@@ -282,85 +312,130 @@ class SyncController:
             self.stage = 'starting'
             started = time.monotonic()
             self._run_deadline = started + self.timeout_seconds
-            result = {}
-            try:
-                with execution_deadline(self.timeout_seconds):
-                    if not dry_run:
-                        self.store.recover_interrupted()
-                    if not dry_run and self.client_factory is not None:
-                        self._stage('credentials')
-                        self.client = self.client_factory(self._stage)
-                    if self.runtime_factory is not None:
-                        self._stage('runtime')
-                        self.runtime = self.runtime_factory()
-                    reset_batch_retry = getattr(self.runtime, 'reset_batch_retry_budget', None)
-                    if reset_batch_retry is not None:
-                        reset_batch_retry(deadline=self._run_deadline)
-                    from .codex_diagnostics import PrivateCodexCapture
-                    self.runtime.private_diagnostic_capture = PrivateCodexCapture(self.store.path)
-                    self.runtime.invocation_sink = lambda item: self.store.record_sync_diagnostic(self.run_id, dict(item, phase=self.stage))
-                    self._stage('calendar_probe')
-                    self.runtime.probe_attempt_sink = lambda attempt: self.store.record_probe_attempt(self.run_id, attempt)
-                    probe = self.runtime.probe()
-                    if not isinstance(probe, dict) or probe.get('calendar_id') != self.store.calendar_id or probe.get('access_role') not in ('owner', 'writer'):
-                        raise ValueError('Calendar write access was not verified.')
-                    result = self._run(dry_run, current)
-                    from .data_admin import prune_state
-                    if not dry_run:
-                        result['retention'] = prune_state(self.store, days=self.history_days, apply=True, current=current)
-            except SyncInterrupted as error:
-                result = {'status': 'interrupted', 'error_code': error.code}
-                if not dry_run:
-                    self.store.recover_interrupted()
-            except (KeyboardInterrupt, SystemExit):
-                result = {'status': 'interrupted', 'error_code': 'sync_interrupted'}
-                if not dry_run:
-                    self.store.recover_interrupted()
-            except Exception as error:
-                result = {'status': 'failed', 'error_code': error_code(error, self.stage)}
-                if not dry_run:
-                    self.store.recover_interrupted()
-            if result.get('error_stage'):
-                self._stage(result.pop('error_stage'))
-            elif result['status'] in ('ok', 'paused', 'dry_run'):
-                self._stage('complete')
-            self.store.finish_sync_run(self.run_id, result['status'], result.get('error_code'), time.monotonic() - started)
-            result['run_id'] = self.run_id
-            result['state'] = self.store.status()
-            result['state'].pop('calendar_id', None)
-            return result
+            with incidents.recording(self.store, self.run_id, lambda: self.stage):
+                return self._run_locked(dry_run, current, started)
         finally:
             os.close(fd)
+
+    def _run_locked(self, dry_run, current, started):
+        try:
+            with execution_deadline(self.timeout_seconds):
+                incidents.checkpoint('sync', 'recovery' if not dry_run else 'starting')
+                if not dry_run:
+                    self.store.recover_interrupted()
+                if not dry_run and self.client_factory is not None:
+                    self._stage('credentials')
+                    self.client = self.client_factory(self._stage)
+                if self.runtime_factory is not None:
+                    self._stage('runtime')
+                    self.runtime = self.runtime_factory()
+                reset_batch_retry = getattr(self.runtime, 'reset_batch_retry_budget', None)
+                if reset_batch_retry is not None:
+                    reset_batch_retry(deadline=self._run_deadline)
+                from .codex_diagnostics import PrivateCodexCapture
+                self.runtime.private_diagnostic_capture = PrivateCodexCapture(self.store.path)
+                self.runtime.invocation_sink = self._record_attempt
+                self._stage('calendar_probe')
+                self.runtime.probe_attempt_sink = lambda attempt: self.store.record_probe_attempt(self.run_id, attempt)
+                probe = self.runtime.probe()
+                if not isinstance(probe, dict) or probe.get('calendar_id') != self.store.calendar_id or probe.get('access_role') not in ('owner', 'writer'):
+                    raise ValueError('Calendar write access was not verified.')
+                result = self._run(dry_run, current)
+                from .data_admin import prune_state
+                if not dry_run:
+                    incidents.checkpoint('sync', 'retention')
+                    result['retention'] = prune_state(self.store, days=self.history_days, apply=True, current=current)
+        except SyncInterrupted as error:
+            result = {'status': 'interrupted', 'error_code': error.code}
+            if not dry_run:
+                self.store.recover_interrupted()
+        except (KeyboardInterrupt, SystemExit):
+            result = {'status': 'interrupted', 'error_code': 'sync_interrupted'}
+            if not dry_run:
+                self.store.recover_interrupted()
+        except Exception as error:
+            result = {'status': 'failed', 'error_code': error_code(error, self.stage)}
+            if not dry_run:
+                self.store.recover_interrupted()
+        if result.get('error_stage'):
+            # The stored run stage follows the reported error, while the incident
+            # checkpoint keeps the last actual operation.
+            self.stage = result.pop('error_stage')
+            self.store.sync_stage(self.run_id, self.stage)
+        elif result['status'] in ('ok', 'paused', 'dry_run'):
+            self._stage('complete')
+        if result['status'] in ('failed', 'partial', 'interrupted'):
+            code = result.get('error_code') or 'operation_failed'
+            incidents.emit('sync', self.stage, code, 'stopped')
+        self.store.finish_sync_run(self.run_id, result['status'], result.get('error_code'), time.monotonic() - started)
+        result['run_id'] = self.run_id
+        result['state'] = self.store.status()
+        result['state'].pop('calendar_id', None)
+        return result
 
     def _run(self, dry_run, current):
         result = {'status': 'ok', 'listed': 0, 'fetched': 0, 'changed': 0, 'fetch_failures': 0,
                   'analyzed': 0, 'analysis_failures': 0, 'operations_applied': 0, 'operations_review': 0,
                   'operations_unknown': 0, 'dry_run': bool(dry_run), 'calendar_writes': 0}
         from .agenda import AgendaPlanner, read_calendar, agenda_summary
+        from .planner_incidents import execution_status, incident_error_code, operation_action
         planner = AgendaPlanner(self.store, self.runtime)
         if dry_run:
             result.update(status='dry_run', agenda=agenda_summary(planner.run(current, preview=True)))
             return result
+
+        def record(operation, outcome, position, **kwargs):
+            try:
+                self.store.record_result(operation['operation_id'], outcome, incident_position=position, **kwargs)
+            except Exception as error:
+                incidents.emit('planner', 'journal', 'commit_failed', 'failed', action=operation_action(operation),
+                               position=position, error_code=incident_error_code(error))
+                raise
+
+        def dispatch(operation, position, mode, fallback):
+            # An adapter invocation can do read-only checks and return without
+            # dispatching a write. Wire-level evidence belongs to the runtime.
+            fields = dict(action=operation_action(operation), position=position, dispatch_mode=mode)
+            incidents.checkpoint('planner', 'dispatch')
+            try:
+                outcome = self.runtime.execute(operation)
+            except Exception as error:
+                incidents.emit('planner', 'dispatch', 'runtime_exception', 'unknown',
+                               error_code=incident_error_code(error), **fields)
+                return {'status': 'unknown', 'error': fallback}
+            incidents.observe('planner', 'dispatch', 'runtime_returned', 'returned',
+                              runtime_status=execution_status(outcome), **fields)
+            return outcome
+
         # Unknown writes are resolved read-only BEFORE collecting/planning. A
         # recovered own success may advance the existing baseline safely.
         self._stage('reconcile')
         calendar = read_calendar(self.store, self.runtime)
-        for operation in self.store.reconcile_operations(self.max_messages):
-            try:
-                outcome = self.runtime.execute(operation)
-            except Exception:
-                outcome = {'status': 'unknown', 'error': 'Reconciliation failed; no new write permitted.'}
-            self.store.record_result(operation['operation_id'], outcome, agenda_calendar=calendar, current=current)
+        incidents.checkpoint('planner', 'reconcile')
+        unknown = self.store.reconcile_operations(self.max_messages)
+        incidents.observe('planner', 'reconcile', 'unknown_selected', 'selected',
+                          operation_count=len(unknown), limit=self.max_messages)
+        for position, operation in enumerate(unknown, 1):
+            outcome = dispatch(operation, position, 'read_only', 'Reconciliation failed; no new write permitted.')
+            record(operation, outcome, position, agenda_calendar=calendar, current=current)
         cutoff = current - timedelta(days=self.history_days)
         self._stage('discovery')
         selected, snippets_by_id, finished, list_failed = self._discover_messages(cutoff, result)
         self._stage('fetch')
+        from .source_incidents import source_step
         unread_probe = None
         for message_id in selected:
             try:
-                with collection_attempt(self._collection_diagnostic, source_kind='message', collection_step='message_body'):
-                    data = self.client.message(message_id)
-                    changed = self.store.save_message(data)
+                with collection_attempt(self._record_attempt, source_kind='message', collection_step='message_body'):
+                    with source_step('message_body', 'continue_fetch'):
+                        data = self.client.message(message_id)
+                    incidents.checkpoint('source', 'message_ingest')
+                    try:
+                        changed = self.store.save_message(data)
+                    except Exception as error:
+                        incidents.emit('source', 'message_ingest', 'message_ingest_failed', 'continue_fetch',
+                                       actual='sqlite_error' if isinstance(error, sqlite3.Error) else 'other')
+                        raise
                 result['fetched'] += 1
                 result['changed'] += int(changed)
                 snippet = snippets_by_id.get(message_id)
@@ -373,8 +448,9 @@ class SyncController:
         if unread_probe:
             # Observe the normal read's effect without changing the server read state.
             try:
-                with collection_attempt(self._collection_diagnostic, source_kind='message', collection_step='message_observation'):
-                    after = self.client.message(unread_probe['message_id'])
+                with collection_attempt(self._record_attempt, source_kind='message', collection_step='message_observation'):
+                    with source_step('message_observation', 'unverified'):
+                        after = self.client.message(unread_probe['message_id'])
                 unread_probe['after_read_date'] = after.get('read_date_returned')
                 unread_probe['observation'] = 'unread_before_read_after' if unread_probe['after_read_date'] else 'no_read_date_observed'
                 self.store.set_setting('read_marking_observation', __import__('json').dumps(unread_probe))
@@ -407,38 +483,60 @@ class SyncController:
                           error_stage=result.get('error_stage') or 'analysis')
             return result
         self._stage('queue')
-        self.store.queue_operations(current)
+        incidents.checkpoint('planner', 'queue')
+        try:
+            queued = self.store.queue_operations(current)
+        except Exception as error:
+            incidents.emit('planner', 'queue', 'queue_failed', 'failed', error_code=incident_error_code(error))
+            raise
+        incidents.observe('planner', 'queue', 'queue_committed', 'committed', queued_count=len(queued))
         if not dry_run:
             if not self.store.status()['writes_paused']:
                 self._stage('write')
-                for operation in self.store.pending_operations(self.max_messages):
+                pending = self.store.pending_operations(self.max_messages)
+                incidents.observe('planner', 'queue', 'pending_selected', 'selected',
+                                  operation_count=len(pending), limit=self.max_messages)
+                for position, operation in enumerate(pending, 1):
                     if operation.get('action') == 'cancel' and (operation.get('prior_snapshot') or {}).get('_content_pruned'):
                         from .codex_runtime import event_fingerprint
+                        incidents.checkpoint('planner', 'cancel_preflight')
+                        preflight_step = 'read'
                         try:
                             snapshot = self.runtime.read_event(operation['event_id'], operation['prior_snapshot'])
-                            if event_fingerprint(snapshot, self.store.config.calendar_owner) != operation.get('expected_fingerprint'):
-                                self.store.record_result(operation['operation_id'], {'status': 'review', 'error': 'manual_edit_conflict',
+                            preflight_step = 'fingerprint'
+                            fingerprint = event_fingerprint(snapshot, self.store.config.calendar_owner)
+                            if fingerprint != operation.get('expected_fingerprint'):
+                                incidents.observe('planner', 'cancel_preflight', 'baseline_changed', 'review',
+                                                  action='cancel', position=position)
+                                preflight_step = 'review_commit'
+                                record(operation, {'status': 'review', 'error': 'manual_edit_conflict',
                                     'event_id': snapshot.get('id'), 'snapshot': snapshot,
-                                    'fingerprint': event_fingerprint(snapshot, self.store.config.calendar_owner)})
+                                    'fingerprint': fingerprint}, position)
                                 result['operations_review'] += 1
                                 continue
+                            preflight_step = 'hydrate'
                             operation = self.store.hydrate_cancel_operation(operation['operation_id'], snapshot)
-                        except Exception:
-                            self.store.record_result(operation['operation_id'], {'status': 'failed', 'error': 'Cancellation baseline could not be verified; no write attempted.'})
+                        except Exception as error:
+                            incidents.emit('planner', 'cancel_preflight', 'baseline_unverified', 'blocked',
+                                           action='cancel', position=position, error_code=incident_error_code(error),
+                                           preflight_step=preflight_step)
+                            record(operation, {'status': 'failed', 'error': 'Cancellation baseline could not be verified; no write attempted.'}, position)
                             continue
-                    if not self.store.claim_operation(operation['operation_id'], expected_operation=operation):
+                        incidents.observe('planner', 'cancel_preflight', 'baseline_hydrated', 'ready',
+                                          action='cancel', position=position)
+                    if not self.store.claim_operation(operation['operation_id'], expected_operation=operation,
+                                                      incident_position=position):
                         continue
-                    try:
-                        outcome = self.runtime.execute(operation)
-                    except Exception:
-                        outcome = {'status': 'unknown', 'error': 'Execution interrupted; reconcile before retry.'}
-                    self.store.record_result(operation['operation_id'], outcome, agenda_calendar=planner.calendar, current=current)
+                    outcome = dispatch(operation, position, 'write_intent', 'Execution interrupted; reconcile before retry.')
+                    record(operation, outcome, position, agenda_calendar=planner.calendar, current=current)
                     status = outcome.get('status') if isinstance(outcome, dict) else 'unknown'
                     if isinstance(outcome, dict) and status in ('failed', 'unknown') and outcome.get('error') in ERROR_CODES:
                         result.update(error_code=outcome['error'], error_stage='write')
                     if status in ('applied','review','unknown'):
                         result['operations_' + status] += 1
                     result['calendar_writes'] += int(status == 'applied' and not outcome.get('reconciled', False))
+            else:
+                incidents.observe('planner', 'queue', 'writes_paused', 'skipped')
         if result['fetch_failures'] or result['analysis_failures']:
             result['status'] = 'partial'
         state = self.store.status()
