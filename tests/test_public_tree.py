@@ -2,14 +2,19 @@
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import struct
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 import zlib
 
-from scripts.check_public_tree import MAX_BYTES, Scanner, main
+from scripts.check_public_tree import MAX_BYTES, PROJECT_COMMIT_EMAIL, main
+
+
+LEGACY_EMAIL = '368465+pbuchman@users.noreply.github.com'
 
 
 def synthetic_token():
@@ -200,6 +205,77 @@ class PublicTreeTests(unittest.TestCase):
         self.assertIn('commit:', output)
         self.assertIn('contact-address', output)
         self.assertNotIn(address, output)
+
+    def test_project_address_is_allowed_in_commit_identity_headers(self):
+        self.init_git()
+        self.git('config', 'user.email', PROJECT_COMMIT_EMAIL)
+        self.write('README.md', 'clean')
+        self.commit()
+        code, output = self.run_scan('--all-history')
+        self.assertEqual(code, 0, output)
+
+    def test_project_address_outside_identity_headers_is_rejected(self):
+        self.init_git()
+        self.git('config', 'user.name', PROJECT_COMMIT_EMAIL)
+        self.git('config', 'user.email', PROJECT_COMMIT_EMAIL)
+        self.write('README.md', PROJECT_COMMIT_EMAIL)
+        commit = self.commit('author Synthetic Author <' + PROJECT_COMMIT_EMAIL + '> 1234567890 +0000')
+        code, output = self.run_scan('--all-history')
+        self.assertEqual(code, 1)
+        self.assertIn('working-tree:README.md:1: contact-address', output)
+        for line in (2, 3, 5):
+            self.assertIn(f'commit:{commit[:12]}:{line}: contact-address', output)
+        self.assertNotIn(PROJECT_COMMIT_EMAIL, output)
+
+    def test_identity_policy_checks_detached_merge_and_new_side_commits(self):
+        self.init_git()
+        self.git('config', 'user.email', LEGACY_EMAIL)
+        self.write('README.md', 'clean')
+        old_main = self.commit()
+        self.git('checkout', '-qb', 'old-side')
+        self.write('side.txt', 'clean')
+        old_side = self.commit()
+        self.git('checkout', '--detach', 'main')
+        self.git('config', 'user.email', PROJECT_COMMIT_EMAIL)
+        with patch('scripts.check_public_tree.LEGACY_COMMIT_TIPS', (old_main, old_side)):
+            self.git('merge', '-q', '--no-ff', '--no-edit', 'old-side',
+                     env={**os.environ, 'GIT_COMMITTER_EMAIL': LEGACY_EMAIL})
+            invalid = self.git('rev-parse', 'HEAD')
+            code, output = self.run_scan('--all-history', '--check-commit-identity')
+            self.assertEqual(code, 1)
+            self.assertIn(f'commit:{invalid[:12]}: commit-identity', output)
+
+            self.git('checkout', '--detach', old_main)
+            self.git('merge', '-q', '--no-ff', '--no-edit', 'old-side')
+            code, output = self.run_scan('--all-history', '--check-commit-identity')
+            self.assertEqual(code, 0, output)
+            self.assertIn('3 commits', output)
+
+            self.git('checkout', '-qb', 'new-side')
+            self.write('new.txt', 'clean')
+            side = self.git('rev-parse', 'HEAD')
+            self.git('add', 'new.txt')
+            self.git('commit', '-qm', 'New side commit', env={**os.environ, 'GIT_COMMITTER_EMAIL': LEGACY_EMAIL})
+            invalid = self.git('rev-parse', 'HEAD')
+            self.git('checkout', '--detach', side)
+            self.git('merge', '-q', '--no-ff', '--no-edit', 'new-side')
+            code, output = self.run_scan('--all-history', '--check-commit-identity')
+            self.assertEqual(code, 1)
+            self.assertIn(f'commit:{invalid[:12]}: commit-identity', output)
+
+    def test_identity_policy_rejects_legacy_email_in_either_role(self):
+        self.init_git()
+        self.write('README.md', 'clean')
+        legacy = self.commit()
+        self.git('config', 'user.email', PROJECT_COMMIT_EMAIL)
+        for role in ('AUTHOR', 'COMMITTER'):
+            self.git('commit', '-qm', 'Wrong ' + role, '--allow-empty',
+                     env={**os.environ, f'GIT_{role}_EMAIL': LEGACY_EMAIL})
+            invalid = self.git('rev-parse', 'HEAD')
+            with patch('scripts.check_public_tree.LEGACY_COMMIT_TIPS', (legacy,)):
+                code, output = self.run_scan('--all-history', '--check-commit-identity')
+            self.assertEqual(code, 1)
+            self.assertIn(f'commit:{invalid[:12]}: commit-identity', output)
 
     def test_annotated_tag_metadata_and_ref_names_are_checked_and_redacted(self):
         self.init_git()

@@ -31,8 +31,8 @@ jobs:
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.12'
-      - name: Scan intended source, staged content, and full reachable history
-        run: python scripts/check_public_tree.py --working-tree --all-history
+      - name: Scan source and history and verify new commit identities
+        run: python scripts/check_public_tree.py --working-tree --all-history --check-commit-identity
       - name: Test privacy guard without external services
         run: python -m unittest discover -s tests -p test_public_tree.py -v
       - name: Install pinned application dependencies

@@ -248,3 +248,13 @@ The planner sees the latest50 human examples, with total/used/omitted counts; al
 At least two independent, consistent examples from different sources are required for learned standalone acceptance or decline. The same SOL/high task judges similarity and must consider every relevant opposing example in the supplied window. The application validates cited IDs, outcomes and source independence; these structural checks cannot prove semantic similarity or detect a contradiction the model fails to identify. A similar title alone does not authorize participation. Uncertain applicability/dates, material human edits, cancellations, duplicate/unknown-write conflicts and one-of-many offer selection still require review. Clear ordinary school duties retain their existing automatic behavior.
 
 Learned creates carry the cited IDs, action/context hashes and applied-plan binding, without `user_approved`. Queueing and claiming recheck that proof; changed example context or action content refuses execution and requires review. An applied plan stores the reason for acceptance/decline, and Calendar descriptions identify learned acceptance. No automatically applied action creates another learning example. Compact human-choice ledger content is retained independently of the ordinary 30-day source-text pruning window.
+
+## Project commit identity
+
+Set this checkout's email with `git config --local user.email ADDRESS`, using the public address defined by `PROJECT_COMMIT_EMAIL`. Check that `git var GIT_AUTHOR_IDENT` and `git var GIT_COMMITTER_IDENT` both resolve to that address. [Project privacy scanner](../scripts/check_public_tree.py)
+
+Create merge commits locally with that identity. Run the CI privacy and identity check from the commit you intend to push.
+
+```sh
+python3 scripts/check_public_tree.py --working-tree --all-history --check-commit-identity
+```

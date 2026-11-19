@@ -4,6 +4,7 @@
 Default: tracked and intended untracked working files (or a pre-Git source tree).
 --all-history additionally inspects every locally reachable ref, commit/tag metadata,
 historical path and blob, including deleted files. A shallow clone is rejected.
+--check-commit-identity additionally verifies new commits reachable from HEAD.
 Ignored untracked runtime files are outside the intended source tree; tracked and
 historical files never receive that exemption. Images still require visual review.
 
@@ -38,6 +39,14 @@ MAX_BYTES = 8 * 1024 * 1024
 PNG_DIRS = ('docs/screenshots/', 'docs/assets/')
 EMAIL = re.compile(r'(?<![\w.+-])[\w.+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![\w.-])')
 NOREPLY = re.compile(r'(?:\d+\+)?[A-Za-z0-9-]+@users\.noreply\.github\.com\Z', re.I)
+PROJECT_COMMIT_EMAIL = 'kontakt' '@buchman.com'
+COMMIT_IDENTITY = re.compile(r'^(author|committer) [^<>\r\n]* <(?P<email>[^<>\r\n]+)> -?\d+ [+-]\d{4}$', re.M)
+# The repaired merge is the first commit subject to the identity policy. Its
+# parents pin the two lines of history that precede it.
+LEGACY_COMMIT_TIPS = (
+    '95aeb36524bfd0c193dfdd5925b94173c4f4ae5f',
+    '351f7c2e683859b1484d5a62875462345352572d',
+)
 IPV4 = re.compile(r'(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])')
 HOME_PATH = re.compile(r'(?:/Use' + r'rs/|/ho' + r'me/|[A-Za-z]:\\Users\\)'
                        r'(?!USER\b|example\b|runner\b)[^\s/\\"\'<>]+', re.I)
@@ -106,7 +115,7 @@ class Scanner:
         self.refs = 0
         self._scanned_blobs: set[str] = set()
 
-    def text_categories(self, text: str):
+    def text_categories(self, text: str, project_email_offsets: frozenset[int] = frozenset()):
         for pattern in self.patterns:
             start = text.casefold().find(pattern)
             if start >= 0:
@@ -120,6 +129,8 @@ class Scanner:
             if not SYNTHETIC.match(value) and not value.startswith(('$', '${', '{{', '<')):
                 yield 'credential-assignment', match.start()
         for match in EMAIL.finditer(text):
+            if match.start() in project_email_offsets and match.group() == PROJECT_COMMIT_EMAIL:
+                continue
             address = match.group().lower()
             domain = address.rsplit('@', 1)[1]
             if not (domain in {'example.com', 'example.org', 'example.net', 'example.invalid'}
@@ -149,9 +160,22 @@ class Scanner:
     def add(self, location: str, category: str, line: int = 0):
         self.findings.add(Finding(self.safe_location(location), category, line))
 
-    def scan_text(self, location: str, text: str):
-        for category, offset in self.text_categories(text):
+    def scan_text(self, location: str, text: str, project_email_offsets: frozenset[int] = frozenset()):
+        for category, offset in self.text_categories(text, project_email_offsets):
             self.add(location, category, text.count('\n', 0, offset) + 1)
+
+    def scan_commit(self, commit: str, require_identity: bool):
+        location = 'commit:' + commit[:12]
+        text = git(self.root, 'cat-file', 'commit', commit).decode('utf-8', errors='replace')
+        headers, _, _ = text.partition('\n\n')
+        identities = list(COMMIT_IDENTITY.finditer(headers))
+        project_email_offsets = frozenset(match.start('email') for match in identities
+                                          if match['email'] == PROJECT_COMMIT_EMAIL)
+        self.scan_text(location, text, project_email_offsets)
+        if require_identity and [match.groups() for match in identities] != [
+            ('author', PROJECT_COMMIT_EMAIL), ('committer', PROJECT_COMMIT_EMAIL),
+        ]:
+            self.add(location, 'commit-identity')
 
     def scan_path(self, location: str, path: str):
         self.scan_text(location, path)
@@ -269,11 +293,14 @@ class Scanner:
                 raise ScanError('A Git blob exceeds the scan size limit; coverage is incomplete.')
             self.scan_content(location, path, git(self.root, 'cat-file', 'blob', oid))
 
-    def all_history(self):
+    def all_history(self, check_commit_identity: bool = False):
         if not self.is_repository():
             raise ScanError('--all-history requires a Git repository.')
         if git(self.root, 'rev-parse', '--is-shallow-repository').strip() != b'false':
             raise ScanError('A shallow Git clone cannot provide full-history coverage.')
+        identity_commits = set()
+        if check_commit_identity:
+            identity_commits.update(git(self.root, 'rev-list', 'HEAD', '--not', *LEGACY_COMMIT_TIPS).splitlines())
         for entry in git(self.root, 'for-each-ref', '--format=%(refname) %(objecttype) %(objectname)').splitlines():
             ref, kind, oid = entry.decode('utf-8', errors='surrogateescape').rsplit(' ', 2)
             self.refs += 1
@@ -283,7 +310,7 @@ class Scanner:
         for raw_commit in git(self.root, 'rev-list', '--all').splitlines():
             commit = raw_commit.decode('ascii')
             self.commits += 1
-            self.scan_text('commit:' + commit[:12], git(self.root, 'cat-file', 'commit', commit).decode('utf-8', errors='replace'))
+            self.scan_commit(commit, raw_commit in identity_commits)
             for entry in git(self.root, 'ls-tree', '-r', '--full-tree', '-z', commit).split(b'\0'):
                 if not entry:
                     continue
@@ -310,6 +337,8 @@ def main(argv=None):
     parser.add_argument('--root', type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument('--working-tree', action='store_true', help='Scan working files and staged content (the default).')
     parser.add_argument('--all-history', action='store_true', help='Also inspect all locally reachable Git history and metadata.')
+    parser.add_argument('--check-commit-identity', action='store_true',
+                        help='Inspect full history and require the project author and committer email on new commits reachable from HEAD.')
     parser.add_argument('--denylist', default=os.environ.get('PUBLIC_TREE_DENYLIST'), help='External JSON file of private literal patterns.')
     args = parser.parse_args(argv)
     try:
@@ -317,8 +346,8 @@ def main(argv=None):
             raise ScanError('The scan root is not a directory.')
         scanner = Scanner(args.root, load_patterns(args.root, args.denylist))
         scanner.working_tree()
-        if args.all_history:
-            scanner.all_history()
+        if args.all_history or args.check_commit_identity:
+            scanner.all_history(args.check_commit_identity)
         for finding in sorted(scanner.findings):
             line = ':' + str(finding.line) if finding.line else ''
             print(f'{finding.location}{line}: {finding.category}')
